@@ -198,12 +198,14 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg generation throughput: %.1f tokens/s",
             "Running: %d reqs",
             "Waiting: %d reqs",
+            "Free KV blocks: %d",
         ]
         log_args = [
             self.last_prompt_throughput,
             self.last_generation_throughput,
             self.last_scheduler_stats.num_running_reqs,
             self.last_scheduler_stats.num_waiting_reqs,
+            self.last_scheduler_stats.free_kv_blocks,
         ]
 
         if self.num_preemptions > 0:
@@ -299,6 +301,9 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
             )
             self.last_scheduler_stats.kv_cache_usage += (
                 last_scheduler_stats.kv_cache_usage
+            )
+            self.last_scheduler_stats.free_kv_blocks += (
+                last_scheduler_stats.free_kv_blocks
             )
         self.last_scheduler_stats.kv_cache_usage /= len(self.last_scheduler_stats_dict)
 

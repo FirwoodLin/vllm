@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import copy
 import multiprocessing
 import time
 import weakref
@@ -107,6 +106,7 @@ class DPCoordinator:
 class EngineState:
     def __init__(self):
         self.request_counts = [0, 0]  # [waiting, running]
+        self.free_kv_blocks = 0
 
 
 class DPCoordinatorProc:
@@ -296,7 +296,8 @@ class DPCoordinatorProc:
                     if scheduler_stats:
                         # 1. Updated request load stats - update our local
                         # state with these.
-                        stats = self.engines[eng_index].request_counts
+                        engine_state = self.engines[eng_index]
+                        stats = engine_state.request_counts
                         stats_step = scheduler_stats.step_counter
                         stats_wave = scheduler_stats.current_wave
                         if (
@@ -305,7 +306,7 @@ class DPCoordinatorProc:
                             and stats_step > last_stats_step
                         ):
                             if stats_changed:
-                                last_step_counts = self._get_engine_counts(do_copy=True)
+                                last_step_counts = self._get_engine_counts()
                             last_stats_step = stats_step
                             last_stats_wave = stats_wave
                         elif stats_wave != last_stats_wave or (
@@ -323,6 +324,7 @@ class DPCoordinatorProc:
                             )
                         stats[0] = scheduler_stats.num_waiting_reqs
                         stats[1] = scheduler_stats.num_running_reqs
+                        engine_state.free_kv_blocks = scheduler_stats.free_kv_blocks
                         stats_changed = True
 
                     if (wave := outputs.wave_complete) is not None:
@@ -370,8 +372,13 @@ class DPCoordinatorProc:
         wave_encoded = msgspec.msgpack.encode((wave, exclude_engine_index))
         socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
 
-    def _get_engine_counts(self, do_copy=False) -> list[list[int]]:
-        """Return list of [waiting, running] count lists for each engine."""
-        if do_copy:
-            return [copy.copy(e.request_counts) for e in self.engines]
-        return [e.request_counts for e in self.engines]
+    def _get_engine_counts(self) -> list[list[int]]:
+        """Return list of [waiting, running, free_kv_blocks] tuples for each engine."""
+        return [
+            [
+                engine_state.request_counts[0],
+                engine_state.request_counts[1],
+                engine_state.free_kv_blocks,
+            ]
+            for engine_state in self.engines
+        ]

@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import multiprocessing
+import os
 import queue
 import sys
 import uuid
@@ -1023,9 +1024,9 @@ class DPAsyncMPClient(AsyncMPClient):
             client_index,
         )
 
-        # List of [waiting, running] pair per engine.
-        # Used only by DPLBAsyncMPClient subclass.
-        self.lb_engines: list[list[int]] = [[0, 0] for _ in self.core_engines]
+        # List of [waiting, running, free_kv_blocks] per engine.
+            # Used only by DPLBAsyncMPClient subclass.
+        self.lb_engines: list[list[int]] = [[0, 0, 0] for _ in self.core_engines]
 
         self.first_req_sock_addr = get_open_zmq_inproc_path()
         self.first_req_send_socket = self.resources.first_req_send_socket = (
@@ -1182,6 +1183,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             client_index,
         )
 
+        self.lb_strategy = os.getenv("VLLM_DP_LB_STRATEGY", "weighted_least_connections")
+        logger.info("DP Load balancing strategy: %s", self.lb_strategy)
+
         assert len(self.core_engines) > 1
 
         self.eng_start_index = (
@@ -1194,20 +1198,53 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
-            min_score = sys.maxsize
-            eng_index = 0
-            for i in range(num_engines):
-                # Start from client_index to help with balancing when engines
-                # are empty.
-                idx = (self.eng_start_index + i) % num_engines
-                waiting, running = current_counts[idx]
-                score = waiting * 4 + running
-                if score < min_score:
-                    min_score = score
-                    eng_index = idx
-            # Increment local waiting count for better balancing between stats
-            # updates from the coordinator (which happen every 100ms).
-            current_counts[eng_index][0] += self.client_count
+
+            if self.lb_strategy == "least_cache":
+                max_free_blocks = -float("inf")
+                eng_index = 0
+                for i in range(num_engines):
+                    idx = (self.eng_start_index + i) % num_engines
+                    free_blocks = current_counts[idx][2]
+                    if free_blocks > max_free_blocks:
+                        max_free_blocks = free_blocks
+                        eng_index = idx
+
+                # Update local estimate
+                if request.prompt_token_ids:
+                    num_tokens = len(request.prompt_token_ids)
+                    block_size = self.vllm_config.cache_config.block_size
+                    num_blocks = (num_tokens + block_size - 1) // block_size
+                    current_counts[eng_index][2] -= num_blocks
+
+            elif self.lb_strategy == "least_batch":
+                min_score = sys.maxsize
+                eng_index = 0
+                for i in range(num_engines):
+                    idx = (self.eng_start_index + i) % num_engines
+                    waiting = current_counts[idx][0]
+                    running = current_counts[idx][1]
+                    score = waiting + running
+                    if score < min_score:
+                        min_score = score
+                        eng_index = idx
+                current_counts[eng_index][0] += self.client_count
+
+            else:
+                min_score = sys.maxsize
+                eng_index = 0
+                for i in range(num_engines):
+                    # Start from client_index to help with balancing when engines
+                    # are empty.
+                    idx = (self.eng_start_index + i) % num_engines
+                    waiting = current_counts[idx][0]
+                    running = current_counts[idx][1]
+                    score = waiting * 4 + running
+                    if score < min_score:
+                        min_score = score
+                        eng_index = idx
+                # Increment local waiting count for better balancing between stats
+                # updates from the coordinator (which happen every 100ms).
+                current_counts[eng_index][0] += self.client_count
 
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.

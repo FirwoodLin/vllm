@@ -162,6 +162,10 @@ class SchedulerStats:
     current_wave: int = 0
 
     kv_cache_usage: float = 0.0
+    # KV cache usage fraction at the time of the stats snapshot.
+
+    free_kv_blocks: int = 0
+    # Number of free KV cache blocks available when the stats were captured.
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None
