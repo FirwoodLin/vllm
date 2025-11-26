@@ -30,11 +30,16 @@ Multi-node:
 """
 
 import os
+import json
 from time import sleep
 
 from vllm import LLM, SamplingParams
 from vllm.utils.network_utils import get_open_port
+# import torch.distributed as dist # 导入 PyTorch 分布式库
+# import datetime # 用于设置 timeout
 
+os.environ["VLLM_TORCH_PROFILER_DIR"] = "./"
+os.environ["VLLM_MOE_ROUTING_SIMULATION_STRATEGY"] = "uniform_random"
 
 def parse_args():
     import argparse
@@ -43,7 +48,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="ibm-research/PowerMoE-3b",
+        default="/models/models--Qwen--Qwen3-235B-A22B-Instruct-2507-FP8/snapshots/ba82a1060073fa0ecdc70d7b1922ec071f60cf3e",
         help="Model name or path",
     )
     parser.add_argument("--dp-size", type=int, default=2, help="Data parallel size")
@@ -55,9 +60,9 @@ def parse_args():
         "--node-rank", type=int, default=0, help="Rank of the current node"
     )
     parser.add_argument(
-        "--master-addr", type=str, default="", help="Master node IP address"
+        "--master-addr", type=str, default="127.0.0.1", help="Master node IP address"
     )
-    parser.add_argument("--master-port", type=int, default=0, help="Master node port")
+    parser.add_argument("--master-port", type=int, default=26390, help="Master node port")
     parser.add_argument(
         "--enforce-eager", action="store_true", help="Enforce eager mode execution."
     )
@@ -78,7 +83,7 @@ def parse_args():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=300,
+        default=600,
         help=("Number of seconds before unresponsive process is killed."),
     )
     parser.add_argument(
@@ -100,6 +105,12 @@ def parse_args():
     parser.add_argument(
         "--quantization",
         type=str,
+    )
+    parser.add_argument(
+        "--kv-transfer-config",
+        type=str,
+        default='{ "kv_connector": "DecodeBenchConnector", "kv_role": "kv_both", "kv_connector_extra_config": { "fill_mean": 0.015, "fill_std": 0.0 } }', # decode only
+        help="KV transfer configuration JSON string.",
     )
     parser.add_argument(
         "--disable-expert-parallel",
@@ -128,6 +139,7 @@ def main(
     gpu_memory_utilization,
     enable_dbo,
     quantization,
+    kv_transfer_config,
 ):
     os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
     os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
@@ -144,7 +156,7 @@ def main(
         "The president of the United States is",
         "The capital of France is",
         "The future of AI is",
-    ] * 100
+    ] * 2
 
     # with DP, each rank should process different prompts.
     # usually all the DP ranks process a full dataset,
@@ -165,16 +177,20 @@ def main(
 
     # Create a sampling params object.
     # since we are doing data parallel, every rank can have different
-    # sampling params. here we set different max_tokens for different
+    # sampling params. here we set different max_tokens for different [10, 16][global_rank %2]
     # ranks for demonstration.
     sampling_params = SamplingParams(
-        temperature=0.8, top_p=0.95, max_tokens=[16, 20][global_dp_rank % 2]
+        temperature=0.8, top_p=0.95, max_tokens=10
     )
 
     # Create an LLM.
+    if kv_transfer_config and isinstance(kv_transfer_config, str):
+        kv_transfer_config = json.loads(kv_transfer_config)
+
     llm = LLM(
         model=model,
         tensor_parallel_size=GPUs_per_dp_rank,
+        decode_context_parallel_size=2,
         enforce_eager=enforce_eager,
         enable_expert_parallel=enable_expert_parallel,
         trust_remote_code=trust_remote_code,
@@ -184,8 +200,30 @@ def main(
         enable_dbo=enable_dbo,
         quantization=quantization,
         compilation_config=compilation_config,
+        load_format="dummy",
+        kv_transfer_config=kv_transfer_config,
     )
+    import torch
+    from torch.profiler import profile, record_function, ProfilerActivity
+
+    # 建议：先做一个 Warmup，避免把模型编译/初始化的时间算进 profile 里
+    # 如果你想看完整的启动过程，可以注释掉下面这两行
+    print(f"DP rank {global_dp_rank} warming up...")
+    llm.generate(["Warmup prompt"], sampling_params)
+    
+    llm.start_profile()
     outputs = llm.generate(prompts, sampling_params)
+    llm.stop_profile()
+    
+    if dp_size > 1 :
+        # 默认的进程组 (Default Process Group) 此时应该是我们刚刚初始化的 DP 组
+        from vllm.distributed.parallel_state import get_world_group
+
+        print(f"DP rank {global_dp_rank} reached global barrier, waiting for all ranks to stop profiling...")
+        get_world_group().cpu_group.barrier()
+        print(f"DP rank {global_dp_rank} passed global barrier.")
+    
+    
     # Print the outputs.
     for i, output in enumerate(outputs):
         if i >= 5:
@@ -220,13 +258,13 @@ if __name__ == "__main__":
     assert dp_size % node_size == 0, "dp_size should be divisible by node_size"
     dp_per_node = dp_size // node_size
 
-    from multiprocessing import Process
+    import multiprocessing
 
     procs = []
     for local_dp_rank, global_dp_rank in enumerate(
         range(node_rank * dp_per_node, (node_rank + 1) * dp_per_node)
     ):
-        proc = Process(
+        proc = multiprocessing.get_context("spawn").Process(
             target=main,
             args=(
                 args.model,
@@ -245,6 +283,7 @@ if __name__ == "__main__":
                 args.gpu_memory_utilization,
                 args.enable_dbo,
                 args.quantization,
+                args.kv_transfer_config,
             ),
         )
         proc.start()
