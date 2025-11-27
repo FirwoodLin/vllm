@@ -106,6 +106,8 @@ class DPCoordinator:
 class EngineState:
     def __init__(self):
         self.request_counts = [0, 0]  # [waiting, running]
+        self.waiting_blocks = 0
+        self.waiting_blocks_head = 0
         self.free_kv_blocks = 0
 
 
@@ -324,6 +326,8 @@ class DPCoordinatorProc:
                             )
                         stats[0] = scheduler_stats.num_waiting_reqs
                         stats[1] = scheduler_stats.num_running_reqs
+                        engine_state.waiting_blocks = scheduler_stats.num_waiting_blocks
+                        engine_state.waiting_blocks_head = scheduler_stats.num_waiting_blocks_head
                         engine_state.free_kv_blocks = scheduler_stats.free_kv_blocks
                         stats_changed = True
 
@@ -373,12 +377,14 @@ class DPCoordinatorProc:
         socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
 
     def _get_engine_counts(self) -> list[list[int]]:
-        """Return list of [waiting, running, free_kv_blocks] tuples for each engine."""
+        """Return list of [waiting, running, free_kv_blocks, waiting_blocks, waiting_blocks_head] tuples for each engine."""
         return [
             [
                 engine_state.request_counts[0],
                 engine_state.request_counts[1],
                 engine_state.free_kv_blocks,
+                engine_state.waiting_blocks,
+                engine_state.waiting_blocks_head,
             ]
             for engine_state in self.engines
         ]

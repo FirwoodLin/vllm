@@ -1117,7 +1117,7 @@ class DPEngineCoreProc(EngineCoreProc):
         # finished with DP peers every N steps.
         self.step_counter = 0
         self.current_wave = 0
-        self.last_counts = (0, 0)
+        self.last_counts = (0, 0, 0, 0)
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -1199,6 +1199,8 @@ class DPEngineCoreProc(EngineCoreProc):
             stats = SchedulerStats(
                 num_running_reqs=counts[0],
                 num_waiting_reqs=counts[1],
+                num_waiting_blocks=counts[2],
+                num_waiting_blocks_head=counts[3],
                 step_counter=self.step_counter,
                 current_wave=self.current_wave,
                 kv_cache_usage=self.scheduler.kv_cache_manager.usage,

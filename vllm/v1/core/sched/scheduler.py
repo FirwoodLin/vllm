@@ -1234,9 +1234,24 @@ class Scheduler(SchedulerInterface):
             else:
                 request.spec_token_ids = spec_token_ids
 
-    def get_request_counts(self) -> tuple[int, int]:
-        """Returns (num_running_reqs, num_waiting_reqs)."""
-        return len(self.running), len(self.waiting)
+    def get_request_counts(self) -> tuple[int, int, int, int]:
+        """Returns (num_running_reqs, num_waiting_reqs, num_waiting_blocks, num_waiting_blocks_head)."""
+        num_waiting_blocks = 0
+        for req in self.waiting:
+            num_waiting_blocks += (
+                req.num_tokens + self.block_size - 1
+            ) // self.block_size
+
+        num_waiting_blocks_head = 0
+        if self.waiting:
+            req = self.waiting.peek_request()
+            num_waiting_blocks_head = (
+                req.num_tokens + self.block_size - 1
+            ) // self.block_size
+
+        # if len(self.waiting) > 0:
+        #     logger.info(f"Waiting requests: {len(self.waiting)}, Waiting blocks: {num_waiting_blocks}, Waiting blocks head: {num_waiting_blocks_head}")
+        return len(self.running), len(self.waiting), num_waiting_blocks, num_waiting_blocks_head
 
     def add_request(self, request: Request) -> None:
         self.waiting.add_request(request)
@@ -1327,9 +1342,25 @@ class Scheduler(SchedulerInterface):
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
         connector_prefix_cache_stats = self._make_connector_prefix_cache_stats()
+
+        num_waiting_blocks = 0
+        for req in self.waiting:
+            num_waiting_blocks += (
+                req.num_tokens + self.block_size - 1
+            ) // self.block_size
+
+        num_waiting_blocks_head = 0
+        if self.waiting:
+            req = self.waiting.peek_request()
+            num_waiting_blocks_head = (
+                req.num_tokens + self.block_size - 1
+            ) // self.block_size
+
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
+            num_waiting_blocks=num_waiting_blocks,
+            num_waiting_blocks_head=num_waiting_blocks_head,
             kv_cache_usage=self.kv_cache_manager.usage,
             free_kv_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
             prefix_cache_stats=prefix_cache_stats,

@@ -1024,9 +1024,9 @@ class DPAsyncMPClient(AsyncMPClient):
             client_index,
         )
 
-        # List of [waiting, running, free_kv_blocks] per engine.
+        # List of [waiting, running, free_kv_blocks, waiting_blocks] per engine.
             # Used only by DPLBAsyncMPClient subclass.
-        self.lb_engines: list[list[int]] = [[0, 0, 0] for _ in self.core_engines]
+        self.lb_engines: list[list[int]] = [[0, 0, 99999, 0] for _ in self.core_engines]
 
         self.first_req_sock_addr = get_open_zmq_inproc_path()
         self.first_req_send_socket = self.resources.first_req_send_socket = (
@@ -1184,7 +1184,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         )
 
         self.lb_strategy = os.getenv("VLLM_DP_LB_STRATEGY", "weighted_least_connections")
-        logger.info("DP Load balancing strategy: %s", self.lb_strategy)
+        logger.info("DP Load balancing strategy: %s; ", self.lb_strategy)
 
         assert len(self.core_engines) > 1
 
@@ -1200,13 +1200,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             num_engines = len(current_counts)
 
             if self.lb_strategy == "least_cache":
-                max_free_blocks = -float("inf")
+                max_score = -float("inf")
                 eng_index = 0
                 for i in range(num_engines):
                     idx = (self.eng_start_index + i) % num_engines
                     free_blocks = current_counts[idx][2]
-                    if free_blocks > max_free_blocks:
-                        max_free_blocks = free_blocks
+                    waiting_blocks = current_counts[idx][3]
+                    score = free_blocks - waiting_blocks
+                    if score > max_score:
+                        max_score = score
                         eng_index = idx
 
                 # Update local estimate

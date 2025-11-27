@@ -198,6 +198,8 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg generation throughput: %.1f tokens/s",
             "Running: %d reqs",
             "Waiting: %d reqs",
+            "Waiting blocks: %d",
+            "Waiting blocks head: %d",
             "Free KV blocks: %d",
         ]
         log_args = [
@@ -205,6 +207,8 @@ class LoggingStatLogger(StatLoggerBase):
             self.last_generation_throughput,
             self.last_scheduler_stats.num_running_reqs,
             self.last_scheduler_stats.num_waiting_reqs,
+            self.last_scheduler_stats.num_waiting_blocks,
+            self.last_scheduler_stats.num_waiting_blocks_head,
             self.last_scheduler_stats.free_kv_blocks,
         ]
 
@@ -298,6 +302,12 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
             )
             self.last_scheduler_stats.num_running_reqs += (
                 last_scheduler_stats.num_running_reqs
+            )
+            self.last_scheduler_stats.num_waiting_blocks += (
+                last_scheduler_stats.num_waiting_blocks
+            )
+            self.last_scheduler_stats.num_waiting_blocks_head += (
+                last_scheduler_stats.num_waiting_blocks_head
             )
             self.last_scheduler_stats.kv_cache_usage += (
                 last_scheduler_stats.kv_cache_usage
