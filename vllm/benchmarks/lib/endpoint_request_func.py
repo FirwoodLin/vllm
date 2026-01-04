@@ -155,11 +155,15 @@ async def async_request_openai_completions(
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Completions API", "completions")
 
+    prompt = request_func_input.prompt
+    if isinstance(prompt, dict) and "prompt_token_ids" in prompt:
+        prompt = prompt["prompt_token_ids"]
+
     payload = {
         "model": request_func_input.model_name
         if request_func_input.model_name
         else request_func_input.model,
-        "prompt": request_func_input.prompt,
+        "prompt": prompt,
         "temperature": 0.0,
         "repetition_penalty": 1.0,
         "max_tokens": request_func_input.output_len,

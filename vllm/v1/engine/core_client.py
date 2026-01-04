@@ -5,6 +5,7 @@ import contextlib
 import multiprocessing
 import os
 import queue
+import random
 import sys
 import uuid
 import weakref
@@ -1202,8 +1203,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             if self.lb_strategy == "least_cache":
                 max_score = -float("inf")
                 eng_index = 0
+                # Randomize start index to avoid thundering herd on engine 0
+                # when stats are stale/reset.
+                start_idx = random.randint(0, num_engines - 1)
                 for i in range(num_engines):
-                    idx = (self.eng_start_index + i) % num_engines
+                    idx = (self.eng_start_index + start_idx + i) % num_engines
                     free_blocks = current_counts[idx][2]
                     waiting_blocks = current_counts[idx][3]
                     score = free_blocks - waiting_blocks

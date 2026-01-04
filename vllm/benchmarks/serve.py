@@ -1100,6 +1100,14 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "information such as response, error, ttfs, tpots, etc.",
     )
     parser.add_argument(
+        "--save-itls",
+        action="store_true",
+        help="Specify to save itls to the benchmark results json file. "
+        "This is useful when you want to analyze the inter-token latency "
+        "but do not want to save the full detailed results (which includes "
+        "generated texts).",
+    )
+    parser.add_argument(
         "--append-result",
         action="store_true",
         help="Append the benchmark result to the existing json file.",
@@ -1488,14 +1496,18 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     if not args.save_detailed:
         # Remove fields with too many data points
-        for field in [
+        fields_to_remove = [
             "input_lens",
             "output_lens",
             "ttfts",
             "itls",
             "generated_texts",
             "errors",
-        ]:
+        ]
+        if args.save_itls:
+            fields_to_remove.remove("itls")
+
+        for field in fields_to_remove:
             if field in result_json:
                 del result_json[field]
             if field in benchmark_result:
