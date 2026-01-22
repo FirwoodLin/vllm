@@ -1192,21 +1192,21 @@ class DPEngineCoreProc(EngineCoreProc):
         if not self.publish_dp_lb_stats:
             return
 
-        # Publish our request counts (if they've changed).
+        # Always publish our request counts to ensure coordinator has
+        # up-to-date info, especially at startup before any requests.
         counts = self.scheduler.get_request_counts()
-        if counts != self.last_counts:
-            self.last_counts = counts
-            stats = SchedulerStats(
-                num_running_reqs=counts[0],
-                num_waiting_reqs=counts[1],
-                num_waiting_blocks=counts[2],
-                num_waiting_blocks_head=counts[3],
-                step_counter=self.step_counter,
-                current_wave=self.current_wave,
-                kv_cache_usage=self.scheduler.kv_cache_manager.usage,
-                free_kv_blocks=self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks(),
-            )
-            self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
+        self.last_counts = counts
+        stats = SchedulerStats(
+            num_running_reqs=counts[0],
+            num_waiting_reqs=counts[1],
+            num_waiting_blocks=counts[2],
+            num_waiting_blocks_head=counts[3],
+            step_counter=self.step_counter,
+            current_wave=self.current_wave,
+            kv_cache_usage=self.scheduler.kv_cache_manager.usage,
+            free_kv_blocks=self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks(),
+        )
+        self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""

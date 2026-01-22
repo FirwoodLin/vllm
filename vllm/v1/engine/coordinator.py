@@ -314,7 +314,8 @@ class DPCoordinatorProc:
                         elif stats_wave != last_stats_wave or (
                             stats_step != last_stats_step
                         ):
-                            logger.warning(
+                            logger.debug(
+                            # logger.warning(
                                 "Received stats for out-of-order "
                                 "step (%d, %d) from engine %d (expected "
                                 "> (%d, %d))",

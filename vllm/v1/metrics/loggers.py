@@ -191,7 +191,7 @@ class LoggingStatLogger(StatLoggerBase):
         self._update_stats()
         self.aggregate_scheduler_stats()
         # Avoid log noise on an idle production system
-        log_fn = logger.debug if self.engine_is_idle else logger.info
+        log_fn = logger.info
         # Format and print output.
         log_parts = [
             "Avg prompt throughput: %.1f tokens/s",

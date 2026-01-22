@@ -1215,12 +1215,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                         max_score = score
                         eng_index = idx
 
-                # Update local estimate
+                # Update local estimate: new request goes to waiting queue first,
+                # so only increase waiting_blocks (free_blocks decreases when scheduled)
                 if request.prompt_token_ids:
                     num_tokens = len(request.prompt_token_ids)
                     block_size = self.vllm_config.cache_config.block_size
                     num_blocks = (num_tokens + block_size - 1) // block_size
-                    current_counts[eng_index][2] -= num_blocks
+                    current_counts[eng_index][3] += num_blocks
 
             elif self.lb_strategy == "least_batch":
                 min_score = sys.maxsize
