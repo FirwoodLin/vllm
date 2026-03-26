@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import subprocess
 import tempfile
 import time
@@ -12,6 +13,12 @@ import urllib3
 from ..utils import RemoteOpenAIServer
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+
+
+def write_random_csv(csv_path: Path, rows: list[tuple[int, int]]) -> None:
+    csv_lines = ["prompt_len,output_len"]
+    csv_lines.extend(f"{prompt_len},{output_len}" for prompt_len, output_len in rows)
+    csv_path.write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
 
 
 def generate_self_signed_cert(cert_dir: Path) -> tuple[Path, Path]:
@@ -179,3 +186,105 @@ def test_bench_serve_chat(server):
     print(result.stderr)
 
     assert result.returncode == 0, f"Benchmark failed: {result.stderr}"
+
+
+@pytest.mark.benchmark
+def test_bench_serve_random_csv(server, tmp_path: Path):
+    csv_path = tmp_path / "random_lengths.csv"
+    write_random_csv(csv_path, [(16, 4), (24, 5), (20, 3)])
+
+    command = [
+        "vllm",
+        "bench",
+        "serve",
+        "--model",
+        MODEL_NAME,
+        "--backend",
+        "openai",
+        "--host",
+        server.host,
+        "--port",
+        str(server.port),
+        "--dataset-name",
+        "random",
+        "--random-csv-path",
+        str(csv_path),
+        "--num-prompts",
+        "3",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    print(result.stdout)
+    print(result.stderr)
+
+    assert result.returncode == 0, f"Benchmark failed: {result.stderr}"
+
+
+@pytest.mark.benchmark
+def test_bench_serve_random_csv_chat_backend_fails(server, tmp_path: Path):
+    csv_path = tmp_path / "random_lengths.csv"
+    write_random_csv(csv_path, [(16, 4), (24, 5)])
+
+    command = [
+        "vllm",
+        "bench",
+        "serve",
+        "--model",
+        MODEL_NAME,
+        "--host",
+        server.host,
+        "--port",
+        str(server.port),
+        "--dataset-name",
+        "random",
+        "--random-csv-path",
+        str(csv_path),
+        "--num-prompts",
+        "2",
+        "--endpoint",
+        "/v1/chat/completions",
+        "--backend",
+        "openai-chat",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    print(result.stdout)
+    print(result.stderr)
+
+    assert result.returncode != 0
+    assert "random-csv-path" in (result.stdout + result.stderr)
+
+
+@pytest.mark.benchmark
+def test_bench_serve_no_save_generated_texts(server, tmp_path: Path):
+    result_path = tmp_path / "serve-result.json"
+    command = [
+        "vllm",
+        "bench",
+        "serve",
+        "--model",
+        MODEL_NAME,
+        "--host",
+        server.host,
+        "--port",
+        str(server.port),
+        "--input-len",
+        "32",
+        "--output-len",
+        "4",
+        "--num-prompts",
+        "3",
+        "--save-result",
+        "--save-detailed",
+        "--no-save-generated-texts",
+        "--result-filename",
+        str(result_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    print(result.stdout)
+    print(result.stderr)
+
+    assert result.returncode == 0, f"Benchmark failed: {result.stderr}"
+    saved_result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert "generated_texts" not in saved_result
+    assert "ttfts" in saved_result
+    assert "itls" in saved_result
+    assert "errors" in saved_result

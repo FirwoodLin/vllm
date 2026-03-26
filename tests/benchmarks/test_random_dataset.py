@@ -35,7 +35,7 @@ def random_dataset_params() -> Params:
     )
 
 
-def _fingerprint_sample(req: SampleRequest) -> tuple[str, int, int]:
+def _fingerprint_sample(req: SampleRequest) -> tuple[Any, int, int]:
     """Project a SampleRequest into a comparable tuple."""
     return (req.prompt, req.prompt_len, req.expected_output_len)
 
@@ -48,7 +48,7 @@ def _collect_samples(
     range_ratio: float = 0.3,
     input_len: int = 50,
     output_len: int = 20,
-) -> list[tuple[str, int, int]]:
+) -> list[tuple[Any, int, int]]:
     samples = dataset.sample(
         tokenizer=tokenizer,
         num_requests=num_requests,
@@ -134,6 +134,92 @@ def test_random_dataset_different_seeds(
         output_len=p.output_len,
     )
     assert a != b
+
+
+def _write_random_csv(tmp_path, rows: list[tuple[int, int]]) -> str:
+    csv_path = tmp_path / "random_lengths.csv"
+    csv_lines = ["prompt_len,output_len"]
+    csv_lines.extend(f"{prompt_len},{output_len}" for prompt_len, output_len in rows)
+    csv_path.write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+    return str(csv_path)
+
+
+@pytest.mark.benchmark
+def test_random_dataset_csv_returns_exact_token_lengths(
+    hf_tokenizer: PreTrainedTokenizerBase,
+    tmp_path,
+) -> None:
+    csv_path = _write_random_csv(tmp_path, [(4, 7), (6, 5), (5, 9)])
+    dataset = RandomDataset(
+        random_seed=123,
+        random_csv_path=csv_path,
+        disable_shuffle=True,
+    )
+
+    samples = dataset.sample(
+        tokenizer=hf_tokenizer,
+        num_requests=3,
+        prefix_len=2,
+    )
+
+    assert [sample.prompt_len for sample in samples] == [4, 6, 5]
+    assert [sample.expected_output_len for sample in samples] == [7, 5, 9]
+    assert all(isinstance(sample.prompt, list) for sample in samples)
+    assert all(
+        all(isinstance(token, int) for token in sample.prompt) for sample in samples
+    )
+    assert [len(cast(list[int], sample.prompt)) for sample in samples] == [4, 6, 5]
+
+
+@pytest.mark.benchmark
+def test_random_dataset_csv_no_oversample_uses_available_rows(
+    hf_tokenizer: PreTrainedTokenizerBase,
+    tmp_path,
+) -> None:
+    csv_path = _write_random_csv(tmp_path, [(3, 4), (5, 6)])
+    dataset = RandomDataset(
+        random_seed=0,
+        random_csv_path=csv_path,
+        disable_shuffle=True,
+    )
+
+    samples = dataset.sample(
+        tokenizer=hf_tokenizer,
+        num_requests=5,
+        no_oversample=True,
+    )
+
+    assert len(samples) == 2
+    assert [sample.prompt_len for sample in samples] == [3, 5]
+
+
+@pytest.mark.benchmark
+def test_random_dataset_csv_rejects_shorter_prompt_than_prefix(
+    hf_tokenizer: PreTrainedTokenizerBase,
+    tmp_path,
+) -> None:
+    csv_path = _write_random_csv(tmp_path, [(3, 4)])
+    dataset = RandomDataset(
+        random_seed=0,
+        random_csv_path=csv_path,
+        disable_shuffle=True,
+    )
+
+    with pytest.raises(ValueError, match="prompt_len"):
+        dataset.sample(
+            tokenizer=hf_tokenizer,
+            num_requests=1,
+            prefix_len=4,
+        )
+
+
+@pytest.mark.benchmark
+def test_random_dataset_csv_requires_prompt_and_output_columns(tmp_path) -> None:
+    csv_path = tmp_path / "invalid_random_lengths.csv"
+    csv_path.write_text("prompt_len\n4\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="output_len"):
+        RandomDataset(random_seed=0, random_csv_path=str(csv_path))
 
 
 # -----------------------------

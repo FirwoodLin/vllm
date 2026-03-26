@@ -60,6 +60,7 @@ MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
 )
+RANDOM_CSV_SUPPORTED_BACKENDS = {"vllm", "openai"}
 
 
 async def get_first_model_from_server(
@@ -160,6 +161,40 @@ async def fetch_spec_decode_metrics(
             )
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return None
+
+
+def _validate_random_csv_args(args: argparse.Namespace) -> None:
+    random_csv_path = getattr(args, "random_csv_path", None)
+    if random_csv_path is None:
+        return
+
+    if args.dataset_name != "random":
+        raise ValueError(
+            "--random-csv-path is only supported with --dataset-name random."
+        )
+
+    if args.skip_tokenizer_init:
+        raise ValueError("--random-csv-path requires tokenizer initialization.")
+
+    endpoint = args.endpoint.rstrip("/")
+    if args.backend == "openai-chat" or endpoint.endswith("/chat/completions"):
+        raise ValueError(
+            "--random-csv-path produces token-id prompts and is not supported "
+            "by chat completion backends. Use --backend openai or --backend "
+            "vllm with a completion endpoint such as /v1/completions."
+        )
+
+    if args.backend not in RANDOM_CSV_SUPPORTED_BACKENDS:
+        raise ValueError(
+            "--random-csv-path only supports completion backends: "
+            f"{sorted(RANDOM_CSV_SUPPORTED_BACKENDS)}."
+        )
+
+    if not endpoint.endswith("/completions"):
+        raise ValueError(
+            "--random-csv-path requires a completion endpoint such as "
+            "/v1/completions."
+        )
 
 
 class TaskType(Enum):
@@ -1387,6 +1422,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "information such as response, error, ttfts, tpots, etc.",
     )
     parser.add_argument(
+        "--no-save-generated-texts",
+        action="store_true",
+        help="When saving detailed benchmark results, omit generated_texts "
+        "from the saved JSON output.",
+    )
+    parser.add_argument(
         "--append-result",
         action="store_true",
         help="Append the benchmark result to the existing json file.",
@@ -1709,6 +1750,8 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         args.spec_bench_output_len = args.output_len
         args.prefix_repetition_output_len = args.output_len
 
+    _validate_random_csv_args(args)
+
     # when using random datasets, default to ignoring EOS
     # so generation runs to the requested length
     if (
@@ -1927,6 +1970,13 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "generated_texts",
             "errors",
         ]:
+            if field in result_json:
+                del result_json[field]
+            if field in benchmark_result:
+                del benchmark_result[field]
+
+    if args.no_save_generated_texts:
+        for field in ["generated_texts"]:
             if field in result_json:
                 del result_json[field]
             if field in benchmark_result:

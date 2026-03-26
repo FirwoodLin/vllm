@@ -15,6 +15,7 @@ generation. Supported dataset types include:
 import argparse
 import ast
 import base64
+import csv
 import io
 import json
 import logging
@@ -62,6 +63,13 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 DEFAULT_NUM_PROMPTS = 1000
+BenchmarkPrompt = (
+    str
+    | list[str]
+    | list[int]
+    | list[list[int]]
+    | list[dict[str, Any]]
+)
 
 # -----------------------------------------------------------------------------
 # Data Classes
@@ -74,7 +82,7 @@ class SampleRequest:
     Represents a single inference request for benchmarking.
     """
 
-    prompt: str | list[str]
+    prompt: BenchmarkPrompt
     prompt_len: int
     expected_output_len: int
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
@@ -460,8 +468,14 @@ class RandomDataset(BenchmarkDataset):
     DEFAULT_INPUT_LEN = 1024
     DEFAULT_OUTPUT_LEN = 128
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, random_csv_path: str | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
+        self.random_csv_path = random_csv_path
+        self.csv_lengths = (
+            self._load_csv_lengths(random_csv_path)
+            if random_csv_path is not None
+            else None
+        )
         # Use numpy's default_rng for deterministic sampling
         # Do not use random.seed() or np.random.seed() elsewhere in this class.
         # This ensures that the RNG is isolated from global RNG state.
@@ -480,6 +494,19 @@ class RandomDataset(BenchmarkDataset):
         batchsize: int = 1,
         **kwargs,
     ) -> list[SampleRequest]:
+        if self.csv_lengths is not None:
+            return self._sample_from_csv(
+                tokenizer=tokenizer,
+                num_requests=num_requests,
+                request_id_prefix=request_id_prefix,
+                no_oversample=no_oversample,
+                prefix_len=prefix_len,
+                range_ratio=range_ratio,
+                input_len=input_len,
+                output_len=output_len,
+                batchsize=batchsize,
+            )
+
         # validate total input tokens (prefix + sampled) is at least 1.
         num_special = int(tokenizer.num_special_tokens_to_add())
         real_input_len = max(0, int(input_len) - num_special)
@@ -501,9 +528,7 @@ class RandomDataset(BenchmarkDataset):
         )
 
         vocab_size = tokenizer.vocab_size
-        prohibited_tokens = tokenizer.all_special_ids
-        all_tokens = np.arange(vocab_size)
-        allowed_tokens = np.array(list(set(all_tokens) - set(prohibited_tokens)))
+        allowed_tokens = self._get_allowed_tokens(tokenizer)
 
         # Generate prefix once
         prefix_token_ids = self.get_prefix(tokenizer, allowed_tokens, prefix_len)
@@ -558,6 +583,201 @@ class RandomDataset(BenchmarkDataset):
             )
 
         return requests
+
+    def _sample_from_csv(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        request_id_prefix: str,
+        no_oversample: bool,
+        prefix_len: int,
+        range_ratio: float,
+        input_len: int,
+        output_len: int,
+        batchsize: int,
+    ) -> list[SampleRequest]:
+        ignored_args = []
+        if input_len != self.DEFAULT_INPUT_LEN:
+            ignored_args.append("--random-input-len")
+        if output_len != self.DEFAULT_OUTPUT_LEN:
+            ignored_args.append("--random-output-len")
+        if range_ratio != self.DEFAULT_RANGE_RATIO:
+            ignored_args.append("--random-range-ratio")
+        if ignored_args:
+            logger.warning(
+                "%s are ignored when --random-csv-path is provided.",
+                ", ".join(ignored_args),
+            )
+
+        csv_lengths = self._get_csv_lengths_for_sampling(
+            num_requests=num_requests,
+            no_oversample=no_oversample,
+        )
+        if any(row["prompt_len"] < prefix_len for row in csv_lengths):
+            raise ValueError(
+                "CSV prompt_len must be greater than or equal to "
+                "--random-prefix-len for every row."
+            )
+
+        allowed_tokens = self._get_allowed_tokens(tokenizer)
+        prefix_token_ids = self._generate_exact_prefix_token_ids(
+            allowed_tokens=allowed_tokens,
+            prefix_len=prefix_len,
+        )
+        offsets = self._rng.integers(0, len(allowed_tokens), size=len(csv_lengths))
+
+        requests = []
+        for i, row in enumerate(csv_lengths):
+            prompt_token_ids = self._generate_exact_prompt_token_ids(
+                prefix_token_ids=prefix_token_ids,
+                allowed_tokens=allowed_tokens,
+                prompt_len=row["prompt_len"],
+                offset=int(offsets[i]),
+                index=i,
+            )
+            requests.append(
+                SampleRequest(
+                    prompt=prompt_token_ids,
+                    prompt_len=row["prompt_len"],
+                    expected_output_len=row["output_len"],
+                    request_id=request_id_prefix + str(i),
+                )
+            )
+
+        if batchsize > 1:
+            batch_requests = []
+            for i in range(0, len(requests), batchsize):
+                batch = requests[i : i + batchsize]
+                batch_requests.append(
+                    SampleRequest(
+                        prompt=[cast(list[int], req.prompt) for req in batch],
+                        prompt_len=sum(req.prompt_len for req in batch),
+                        expected_output_len=0,
+                        request_id=request_id_prefix + str(i // batchsize),
+                    )
+                )
+            requests = batch_requests
+
+        return requests
+
+    def _load_csv_lengths(self, random_csv_path: str) -> list[dict[str, int]]:
+        with open(random_csv_path, encoding="utf-8", newline="") as csv_file:
+            reader = csv.DictReader(csv_file)
+            if reader.fieldnames is None:
+                raise ValueError("Random CSV file is empty.")
+
+            fieldnames = {
+                field.strip() if field is not None else field
+                for field in reader.fieldnames
+            }
+            required_fields = {"prompt_len", "output_len"}
+            missing_fields = required_fields - fieldnames
+            if missing_fields:
+                missing_fields_str = ", ".join(sorted(missing_fields))
+                raise ValueError(
+                    "Random CSV file must contain the following columns: "
+                    f"{missing_fields_str}."
+                )
+
+            csv_lengths = []
+            for row_idx, raw_row in enumerate(reader, start=2):
+                row = {
+                    key.strip() if key is not None else key: value
+                    for key, value in raw_row.items()
+                }
+                try:
+                    prompt_len = int(row["prompt_len"])
+                    output_len = int(row["output_len"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Random CSV values must be positive integers at "
+                        f"row {row_idx}."
+                    ) from exc
+
+                if prompt_len <= 0 or output_len <= 0:
+                    raise ValueError(
+                        "Random CSV values must be positive integers at "
+                        f"row {row_idx}."
+                    )
+
+                csv_lengths.append(
+                    {
+                        "prompt_len": prompt_len,
+                        "output_len": output_len,
+                    }
+                )
+
+        if not csv_lengths:
+            raise ValueError("Random CSV file does not contain any data rows.")
+
+        return csv_lengths
+
+    def _get_allowed_tokens(self, tokenizer: TokenizerLike) -> np.ndarray:
+        vocab_size = tokenizer.vocab_size
+        prohibited_tokens = np.asarray(tokenizer.all_special_ids, dtype=np.int64)
+        return np.setdiff1d(
+            np.arange(vocab_size, dtype=np.int64),
+            prohibited_tokens,
+            assume_unique=False,
+        )
+
+    def _get_csv_lengths_for_sampling(
+        self,
+        num_requests: int,
+        no_oversample: bool,
+    ) -> list[dict[str, int]]:
+        assert self.csv_lengths is not None
+
+        csv_lengths = list(self.csv_lengths)
+        if not self.disable_shuffle:
+            permutation = self._rng.permutation(len(csv_lengths))
+            csv_lengths = [csv_lengths[int(idx)] for idx in permutation]
+
+        if no_oversample:
+            return csv_lengths[: min(num_requests, len(csv_lengths))]
+
+        if num_requests <= len(csv_lengths):
+            return csv_lengths[:num_requests]
+
+        indices = np.arange(num_requests, dtype=np.int64) % len(csv_lengths)
+        return [csv_lengths[int(idx)] for idx in indices]
+
+    def _generate_exact_prefix_token_ids(
+        self,
+        allowed_tokens: np.ndarray,
+        prefix_len: int,
+    ) -> np.ndarray:
+        if prefix_len <= 0:
+            return np.empty(0, dtype=np.int64)
+
+        prefix_indices = self._rng.integers(0, len(allowed_tokens), size=prefix_len)
+        return allowed_tokens[prefix_indices]
+
+    def _generate_exact_prompt_token_ids(
+        self,
+        prefix_token_ids: np.ndarray,
+        allowed_tokens: np.ndarray,
+        prompt_len: int,
+        offset: int,
+        index: int,
+    ) -> list[int]:
+        suffix_len = prompt_len - len(prefix_token_ids)
+        if suffix_len < 0:
+            raise ValueError(
+                "CSV prompt_len must be greater than or equal to "
+                "--random-prefix-len for every row."
+            )
+
+        if suffix_len == 0:
+            return prefix_token_ids.tolist()
+
+        suffix = allowed_tokens[
+            (offset + index + np.arange(suffix_len, dtype=np.int64))
+            % len(allowed_tokens)
+        ]
+        if len(prefix_token_ids) == 0:
+            return suffix.tolist()
+        return np.concatenate((prefix_token_ids, suffix)).tolist()
 
     def get_prefix(
         self,
@@ -1602,6 +1822,17 @@ def add_random_dataset_base_args(
         help=("Batch size for random sampling. Only used for embeddings benchmark."),
     )
     parser_or_group.add_argument(
+        "--random-csv-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to a CSV file with prompt_len and output_len columns. "
+            "When set, the random dataset samples request lengths from the CSV. "
+            "Currently only supported by `vllm bench serve` for "
+            "completion-style backends."
+        ),
+    )
+    parser_or_group.add_argument(
         "--no-reranker",
         action="store_true",
         help=(
@@ -1943,6 +2174,7 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
                 random_seed=args.seed,
                 dataset_path=args.dataset_path,
                 disable_shuffle=args.disable_shuffle,
+                random_csv_path=getattr(args, "random_csv_path", None),
             ).sample(
                 tokenizer=tokenizer,
                 num_requests=args.num_prompts,

@@ -17,6 +17,13 @@ import regex as re
 from tqdm.asyncio import tqdm
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+RequestPrompt = (
+    str
+    | list[str]
+    | list[int]
+    | list[list[int]]
+    | list[dict[str, Any]]
+)
 
 
 class StreamedResponseHandler:
@@ -64,7 +71,7 @@ class StreamedResponseHandler:
 class RequestFuncInput:
     """The input for the request function."""
 
-    prompt: str | list[str]
+    prompt: RequestPrompt
     api_url: str
     prompt_len: int
     output_len: int
