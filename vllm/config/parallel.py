@@ -724,11 +724,19 @@ class ParallelConfig:
                     self.data_parallel_rank,
                 )
             if not self.enable_elastic_ep:
-                if not self._data_parallel_master_port_list:
-                    self._data_parallel_master_port_list = get_open_ports_list(5)
-                self.data_parallel_master_port = (
-                    self._data_parallel_master_port_list.pop()
-                )
+                if envs.VLLM_DP_MASTER_PORT > 0:
+                    base_port = envs.VLLM_DP_MASTER_PORT
+                    self.data_parallel_master_port = base_port
+                    if not self._data_parallel_master_port_list:
+                        self._data_parallel_master_port_list = [
+                            base_port + offset for offset in range(4, 0, -1)
+                        ]
+                else:
+                    if not self._data_parallel_master_port_list:
+                        self._data_parallel_master_port_list = get_open_ports_list(5)
+                    self.data_parallel_master_port = (
+                        self._data_parallel_master_port_list.pop()
+                    )
 
             if not (0 <= self.data_parallel_rank < self.data_parallel_size):
                 raise ValueError(

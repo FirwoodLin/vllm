@@ -28,6 +28,7 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
+@router.get("/get_load")
 @router.get("/load")
 async def get_server_load_metrics(request: Request):
     # This endpoint returns the current server load metrics.

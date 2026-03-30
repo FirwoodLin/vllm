@@ -68,6 +68,10 @@ async def serve_http(
     if h11_max_header_count is None:
         h11_max_header_count = H11_MAX_HEADER_COUNT_DEFAULT
 
+    # Increase the default listen backlog for high-concurrency serve
+    # deployments while still allowing explicit overrides via uvicorn_kwargs.
+    uvicorn_kwargs.setdefault("backlog", 4096)
+
     config = uvicorn.Config(app, **uvicorn_kwargs)
     # Set header limits
     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size

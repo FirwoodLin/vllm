@@ -1,0 +1,8 @@
+[
+  {
+    "_benchmark_name": "4dp8tp_async_mp",
+    "gpu_memory_utilization": 0.9,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 16384
+  }
+]
