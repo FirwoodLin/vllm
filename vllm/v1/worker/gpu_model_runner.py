@@ -128,6 +128,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.graph_timing import GraphTimingContext
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -225,9 +226,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        graph_timing_context: GraphTimingContext | None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+        self._graph_timing_context = graph_timing_context
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_ready_event = torch.Event()
@@ -258,7 +261,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+        copy_wait_start_ns = time.perf_counter_ns()
         self.async_copy_ready_event.synchronize()
+        copy_wait_wall_ms = (time.perf_counter_ns() - copy_wait_start_ns) / 1e6
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -279,6 +284,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             )
 
         output = self._model_runner_output
+        if self._graph_timing_context is not None:
+            output.graph_replay_timing_stats = self._graph_timing_context.resolve(
+                async_output_copy_wait_ms=copy_wait_wall_ms
+            )
+            self._graph_timing_context = None
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
         return output
@@ -380,6 +390,7 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
+    graph_timing_context: GraphTimingContext | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
@@ -3533,6 +3544,37 @@ class GPUModelRunner(
 
         return slot_mappings_by_gid, slot_mappings_by_layer
 
+    def _get_reply_global_rank(self) -> int:
+        return (
+            self.parallel_config.world_size
+            - self.parallel_config.tensor_parallel_size
+            * self.parallel_config.prefill_context_parallel_size
+        )
+
+    def _create_graph_timing_context(
+        self, cudagraph_mode: CUDAGraphMode
+    ) -> GraphTimingContext | None:
+        observability_config = self.vllm_config.observability_config
+        if not observability_config.enable_graph_replay_timing:
+            return None
+
+        reply_global_rank = self._get_reply_global_rank()
+        if self.parallel_config.rank != reply_global_rank:
+            return None
+
+        tp_rank = 0
+        if self.parallel_config.tensor_parallel_size > 1:
+            tp_rank = get_tp_group().rank_in_group
+
+        return GraphTimingContext(
+            reply_global_rank=reply_global_rank,
+            dp_rank=self.parallel_config.data_parallel_rank,
+            tp_rank=tp_rank,
+            dcp_rank=self.dcp_rank,
+            node_rank=self.parallel_config.node_rank,
+            runtime_mode=str(cudagraph_mode),
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -3760,6 +3802,13 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+        graph_timing_context = self._create_graph_timing_context(cudagraph_mode)
+        if graph_timing_context is not None and self.kv_cache_config.kv_cache_groups:
+            seq_lens = self.seq_lens.np[:num_reqs]
+            graph_timing_context.update_seqlen(
+                int(seq_lens.max().item()) if num_reqs > 0 else 0,
+                int(seq_lens.sum().item()) if num_reqs > 0 else 0,
+            )
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -3776,6 +3825,7 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
+                graph_timing_context=graph_timing_context,
                 skip_compiled=has_encoder_input,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
@@ -3851,6 +3901,8 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        # Keep graph_timing_context alive after set_forward_context() exits so
+        # sample_tokens() or AsyncGPUModelRunnerOutput can resolve it later.
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -3861,6 +3913,7 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            graph_timing_context,
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
@@ -3899,6 +3952,7 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            graph_timing_context,
             slot_mappings,
         ) = self.execute_model_state
         # Clear ephemeral state.
@@ -4052,6 +4106,10 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        graph_replay_timing_stats = None
+        if graph_timing_context is not None and not self.use_async_scheduling:
+            self._sync_device()
+            graph_replay_timing_stats = graph_timing_context.resolve()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
@@ -4073,6 +4131,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                graph_replay_timing_stats=graph_replay_timing_stats,
             )
 
         if not self.use_async_scheduling:
@@ -4088,6 +4147,7 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
+                graph_timing_context=graph_timing_context,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

@@ -549,6 +549,15 @@ class EngineArgs:
     enable_logging_iteration_details: bool = (
         ObservabilityConfig.enable_logging_iteration_details
     )
+    enable_logging_step_timing_details: bool = (
+        ObservabilityConfig.enable_logging_step_timing_details
+    )
+    logging_step_timing_interval: int = get_field(
+        ObservabilityConfig, "logging_step_timing_interval"
+    )
+    enable_graph_replay_timing: bool = (
+        ObservabilityConfig.enable_graph_replay_timing
+    )
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
@@ -1163,6 +1172,18 @@ class EngineArgs:
         observability_group.add_argument(
             "--enable-logging-iteration-details",
             **observability_kwargs["enable_logging_iteration_details"],
+        )
+        observability_group.add_argument(
+            "--enable-logging-step-timing-details",
+            **observability_kwargs["enable_logging_step_timing_details"],
+        )
+        observability_group.add_argument(
+            "--logging-step-timing-interval",
+            **observability_kwargs["logging_step_timing_interval"],
+        )
+        observability_group.add_argument(
+            "--enable-graph-replay-timing",
+            **observability_kwargs["enable_graph_replay_timing"],
         )
 
         # Scheduler arguments
@@ -1882,6 +1903,9 @@ class EngineArgs:
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,
+            enable_logging_step_timing_details=self.enable_logging_step_timing_details,
+            logging_step_timing_interval=self.logging_step_timing_interval,
+            enable_graph_replay_timing=self.enable_graph_replay_timing,
         )
 
         # Compilation config overrides

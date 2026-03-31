@@ -76,6 +76,16 @@ class ObservabilityConfig:
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
 
+    enable_logging_step_timing_details: bool = False
+    """Enable per-batch scheduler timing logs for async batch-queue execution."""
+
+    logging_step_timing_interval: int = Field(default=1, ge=1)
+    """Emit one step timing log every N batch ids.
+    For example, 10 logs batches where batch_id % 10 == 0."""
+
+    enable_graph_replay_timing: bool = False
+    """Enable per-batch CUDA graph replay timing on the reply rank."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""
@@ -148,5 +158,13 @@ class ObservabilityConfig:
         if self.collect_detailed_traces and not self.otlp_traces_endpoint:
             raise ValueError(
                 "collect_detailed_traces requires `--otlp-traces-endpoint` to be set."
+            )
+        if (
+            self.enable_graph_replay_timing
+            and not self.enable_logging_step_timing_details
+        ):
+            raise ValueError(
+                "enable_graph_replay_timing requires "
+                "enable_logging_step_timing_details to be enabled."
             )
         return self

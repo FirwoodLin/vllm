@@ -483,7 +483,13 @@ class UBatchWrapper:
             # Sync offloader before replay - ensures any external dependencies
             # from pre-capture prefetches are satisfied.
             get_offloader().sync_prev_onload()
-            cudagraph_metadata.cudagraph.replay()
+            graph_timing_context = forward_context.graph_timing_context
+            if graph_timing_context is None:
+                cudagraph_metadata.cudagraph.replay()
+            else:
+                graph_timing_context.record_replay(
+                    "ubatch_wrapper", cudagraph_metadata.cudagraph.replay
+                )
             return cudagraph_metadata.outputs
         else:
             ubatch_metadata = self._make_ubatch_metadata(

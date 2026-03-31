@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -80,6 +81,18 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+@dataclass
+class BatchTimingTicket:
+    batch_id: int
+    scheduler_output: SchedulerOutput
+    exec_model_future: Future[Any]
+    result_future: Future[ModelRunnerOutput] | None = None
+    schedule_cpu_ns: int = 0
+    grammar_cpu_ns: int = 0
+    update_cpu_ns: int = 0
+    grammar_deferred: bool = False
 
 
 class EngineCore:
@@ -181,12 +194,11 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = self.model_executor.max_concurrent_batches
-        self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
-        ) = None
+        self.batch_queue: deque[BatchTimingTicket] | None = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        self._batch_timing_id = 0
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -375,6 +387,76 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def _emit_batch_timing_log(
+        self,
+        ticket: BatchTimingTicket,
+        model_output: ModelRunnerOutput,
+    ) -> None:
+        observability_config = self.vllm_config.observability_config
+        if not observability_config.enable_logging_step_timing_details:
+            return
+        if ticket.batch_id % observability_config.logging_step_timing_interval != 0:
+            return
+
+        iteration_details = compute_iteration_details(ticket.scheduler_output)
+        scheduler_total_cpu_ms = (
+            ticket.schedule_cpu_ns + ticket.grammar_cpu_ns + ticket.update_cpu_ns
+        ) / 1e6
+        gen_tokens = iteration_details.num_generation_tokens
+        scheduler_us_per_gen_token = (
+            (scheduler_total_cpu_ms * 1000.0) / gen_tokens if gen_tokens > 0 else 0.0
+        )
+
+        log_fields = [
+            "ASYNC_STEP_TIMING",
+            f"batch_id={ticket.batch_id}",
+            f"ctx_reqs={iteration_details.num_ctx_requests}",
+            f"ctx_tokens={iteration_details.num_ctx_tokens}",
+            f"gen_reqs={iteration_details.num_generation_requests}",
+            f"gen_tokens={iteration_details.num_generation_tokens}",
+            f"schedule_cpu_ms={ticket.schedule_cpu_ns / 1e6:.2f}",
+            f"grammar_cpu_ms={ticket.grammar_cpu_ns / 1e6:.2f}",
+            f"update_cpu_ms={ticket.update_cpu_ns / 1e6:.2f}",
+            f"scheduler_total_cpu_ms={scheduler_total_cpu_ms:.2f}",
+            f"grammar_deferred={int(ticket.grammar_deferred)}",
+            f"scheduler_us_per_gen_token={scheduler_us_per_gen_token:.2f}",
+        ]
+
+        graph_timing_stats = model_output.graph_replay_timing_stats
+        if graph_timing_stats is not None:
+            replay_us_per_gen_token = (
+                (graph_timing_stats.replay_gpu_ms * 1000.0) / gen_tokens
+                if gen_tokens > 0
+                else 0.0
+            )
+            log_fields.extend(
+                [
+                    f"node_rank={graph_timing_stats.node_rank}",
+                    f"reply_global_rank={graph_timing_stats.reply_global_rank}",
+                    f"dp_rank={graph_timing_stats.dp_rank}",
+                    f"tp_rank={graph_timing_stats.tp_rank}",
+                    f"dcp_rank={graph_timing_stats.dcp_rank}",
+                    f"cudagraph_mode={graph_timing_stats.runtime_mode}",
+                    f"graph_impl={graph_timing_stats.graph_impl}",
+                    f"replay_count={graph_timing_stats.replay_count}",
+                    f"replay_gpu_ms={graph_timing_stats.replay_gpu_ms:.2f}",
+                    f"replay_wall_ms={graph_timing_stats.replay_wall_ms:.2f}",
+                    "async_output_copy_wait_ms="
+                    f"{graph_timing_stats.async_output_copy_wait_ms:.2f}",
+                    f"replay_us_per_gen_token={replay_us_per_gen_token:.2f}",
+                ]
+            )
+            if graph_timing_stats.seqlen is not None:
+                log_fields.append(f"seqlen={graph_timing_stats.seqlen}")
+            if graph_timing_stats.total_seqlen is not None:
+                log_fields.append(f"total_seqlen={graph_timing_stats.total_seqlen}")
+        elif model_output.cudagraph_stats is not None:
+            log_fields.append(
+                f"cudagraph_mode={model_output.cudagraph_stats.runtime_mode}"
+            )
+
+        logger.info(" ".join(log_fields))
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -442,41 +524,68 @@ class EngineCore:
         assert len(batch_queue) < self.batch_queue_size
 
         model_executed = False
-        deferred_scheduler_output = None
+        enable_timing_logs = (
+            self.vllm_config.observability_config.enable_logging_step_timing_details
+        )
+        deferred_timing_ticket: BatchTimingTicket | None = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule()
+            if enable_timing_logs:
+                t0 = time.perf_counter_ns()
+                scheduler_output = self.scheduler.schedule()
+                schedule_cpu_ns = time.perf_counter_ns() - t0
+            else:
+                scheduler_output = self.scheduler.schedule()
+                schedule_cpu_ns = 0
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            ticket = BatchTimingTicket(
+                batch_id=self._batch_timing_id,
+                scheduler_output=scheduler_output,
+                exec_model_future=exec_future,
+                schedule_cpu_ns=schedule_cpu_ns,
+            )
+            self._batch_timing_id += 1
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
+                ticket.result_future = future
             else:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
-                    )
+                    if enable_timing_logs:
+                        t0 = time.perf_counter_ns()
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        ticket.grammar_cpu_ns = time.perf_counter_ns() - t0
+                    else:
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+                    ticket.result_future = future
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                    ticket.grammar_deferred = True
+                    deferred_timing_ticket = ticket
 
-            if not deferred_scheduler_output:
+            if deferred_timing_ticket is None:
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                batch_queue.appendleft(ticket)
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
+                    and batch_queue[-1].result_future is not None
+                    and not batch_queue[-1].result_future.done()
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
@@ -489,7 +598,10 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        ticket = batch_queue.pop()
+        scheduler_output = ticket.scheduler_output
+        future = ticket.result_future
+        assert future is not None
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
@@ -498,20 +610,28 @@ class EngineCore:
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
-                exec_model_fut.result()
+                ticket.exec_model_future.result()
                 raise RuntimeError("unexpected error")
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        if enable_timing_logs:
+            t0 = time.perf_counter_ns()
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
+            ticket.update_cpu_ns = time.perf_counter_ns() - t0
+        else:
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
+        self._emit_batch_timing_log(ticket, model_output)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
-        if deferred_scheduler_output:
+        if deferred_timing_ticket is not None:
             # If we are doing speculative decoding with structured output,
             # we need to get the draft token ids from the prior step before
             # we can compute the grammar bitmask for the deferred request.
@@ -522,15 +642,25 @@ class EngineCore:
                 # filter out the invalid spec tokens, which will be padded
                 # with -1 and skipped by the grammar bitmask computation.
                 self.scheduler.update_draft_token_ids_in_output(
-                    draft_token_ids, deferred_scheduler_output
+                    draft_token_ids, deferred_timing_ticket.scheduler_output
                 )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
-            grammar_output = self.scheduler.get_grammar_bitmask(
-                deferred_scheduler_output
-            )
+            if enable_timing_logs:
+                t0 = time.perf_counter_ns()
+                grammar_output = self.scheduler.get_grammar_bitmask(
+                    deferred_timing_ticket.scheduler_output
+                )
+                deferred_timing_ticket.grammar_cpu_ns = (
+                    time.perf_counter_ns() - t0
+                )
+            else:
+                grammar_output = self.scheduler.get_grammar_bitmask(
+                    deferred_timing_ticket.scheduler_output
+                )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            deferred_timing_ticket.result_future = future
+            batch_queue.appendleft(deferred_timing_ticket)
 
         return engine_core_outputs, model_executed
 

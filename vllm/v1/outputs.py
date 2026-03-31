@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.v1.graph_timing import GraphReplayTimingStats
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -252,6 +253,8 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    graph_replay_timing_stats: GraphReplayTimingStats | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

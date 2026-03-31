@@ -349,5 +349,11 @@ class CUDAGraphWrapper:
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
-        entry.cudagraph.replay()
+        graph_timing_context = forward_context.graph_timing_context
+        if graph_timing_context is None:
+            entry.cudagraph.replay()
+        else:
+            graph_timing_context.record_replay(
+                "cudagraph_wrapper", entry.cudagraph.replay
+            )
         return entry.output

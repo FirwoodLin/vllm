@@ -14,6 +14,7 @@ from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.graph_timing import GraphTimingContext
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 
@@ -207,6 +208,7 @@ class ForwardContext:
     batch_descriptor: BatchDescriptor | None = None
 
     ubatch_slices: UBatchSlices | None = None
+    graph_timing_context: GraphTimingContext | None = None
 
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
@@ -271,6 +273,7 @@ def create_forward_context(
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+    graph_timing_context: GraphTimingContext | None = None,
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
 ):
@@ -289,6 +292,7 @@ def create_forward_context(
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
+        graph_timing_context=graph_timing_context,
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
     )
@@ -320,6 +324,7 @@ def set_forward_context(
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+    graph_timing_context: GraphTimingContext | None = None,
     skip_compiled: bool = False,
 ):
     """A context manager that stores the current forward context,
@@ -380,6 +385,7 @@ def set_forward_context(
         batch_descriptor,
         ubatch_slices,
         slot_mapping,
+        graph_timing_context,
         additional_kwargs,
         skip_compiled,
     )

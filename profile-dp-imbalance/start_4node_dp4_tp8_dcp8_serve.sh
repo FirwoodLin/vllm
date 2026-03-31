@@ -214,12 +214,14 @@ master_addr_resolved="$(resolve_host "${MASTER_ADDR}")"
 dp_bind_hint="tcp://${MASTER_ADDR}:${DP_MASTER_PORT:-<auto>}"
 serve_bind_hint="${SERVE_HOST}:${PORT}"
 
+  # --no-async-scheduling
 typeset -a cmd
 cmd=(
   "${VLLM_BIN}" serve "${MODEL}"
   --tensor-parallel-size "${TP_SIZE}"
-  --no-async-scheduling
   --data-parallel-size "${DP_SIZE}"
+  --enable-logging-step-timing-details
+  --enable-graph-replay-timing
   --data-parallel-backend mp
   --data-parallel-size-local "${DP_LOCAL_SIZE}"
   --data-parallel-address "${MASTER_ADDR}"
