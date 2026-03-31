@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import multiprocessing
 import os
+import re
 import signal
 import sys
 from collections.abc import Callable, Iterator
@@ -107,6 +108,39 @@ def unique_filepath(fn: Callable[[int], Path]) -> Path:
         if not p.exists():
             return p
         i += 1
+
+
+def build_process_log_path(log_dir: str | Path, process_name: str, pid: int) -> Path:
+    """Build a sanitized per-process log path."""
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", process_name).strip("._")
+    if not safe_name:
+        safe_name = "process"
+    return Path(log_dir).expanduser().resolve() / f"{safe_name}.pid{pid}.log"
+
+
+def redirect_stdio_to_file(log_path: str | Path) -> Path:
+    """Redirect stdout and stderr to a shared append-only file."""
+    path = Path(log_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    stdout_fd = sys.stdout.fileno()
+    stderr_fd = sys.stderr.fileno()
+    redirected_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(redirected_fd, stdout_fd)
+        os.dup2(redirected_fd, stderr_fd)
+    finally:
+        os.close(redirected_fd)
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(line_buffering=True, write_through=True)
+
+    return path
 
 
 # Process management utilities

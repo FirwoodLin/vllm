@@ -36,7 +36,12 @@ from vllm.utils.gc_utils import (
 )
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
-from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.utils.system_utils import (
+    build_process_log_path,
+    decorate_logs,
+    redirect_stdio_to_file,
+    set_process_title,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -1174,8 +1179,21 @@ class EngineCoreProc(EngineCore):
             else:
                 process_title = "EngineCore"
             set_process_title(process_title)
+            log_dir = vllm_config.observability_config.engine_core_log_dir
+            if log_dir is not None:
+                try:
+                    log_path = build_process_log_path(
+                        log_dir, process_title, os.getpid()
+                    )
+                    redirect_stdio_to_file(log_path)
+                except OSError:
+                    logger.exception(
+                        "Failed to redirect %s stdout/stderr to %s.",
+                        process_title,
+                        log_dir,
+                    )
+            decorate_logs(process_title)
             maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
-            decorate_logs()
 
             if data_parallel and vllm_config.kv_transfer_config is not None:
                 # modify the engine_id and append the local_dp_rank to it to ensure

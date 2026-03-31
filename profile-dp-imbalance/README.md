@@ -94,3 +94,7 @@ That captures:
   resume, increase `--queue-settle-seconds` in the Python script.
 - If your cluster auto-picks the wrong NIC, set `GLOO_SOCKET_IFNAME` and/or
   `NCCL_SOCKET_IFNAME` before running the serve script.
+
+# 文件路径
+
+/vllm 和 /mnt/nvme1n1/ml_research/linbinbin1/vllm-v0180 在物理上是同一路径，无需重复修改或者检查

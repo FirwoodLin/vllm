@@ -86,6 +86,10 @@ class ObservabilityConfig:
     enable_graph_replay_timing: bool = False
     """Enable per-batch CUDA graph replay timing on the reply rank."""
 
+    engine_core_log_dir: str | None = None
+    """If set, each EngineCore process redirects stdout/stderr to its own
+    log file under this directory."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""

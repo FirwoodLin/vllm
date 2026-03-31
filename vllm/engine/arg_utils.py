@@ -558,6 +558,7 @@ class EngineArgs:
     enable_graph_replay_timing: bool = (
         ObservabilityConfig.enable_graph_replay_timing
     )
+    engine_core_log_dir: str | None = ObservabilityConfig.engine_core_log_dir
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
@@ -1184,6 +1185,10 @@ class EngineArgs:
         observability_group.add_argument(
             "--enable-graph-replay-timing",
             **observability_kwargs["enable_graph_replay_timing"],
+        )
+        observability_group.add_argument(
+            "--engine-core-log-dir",
+            **observability_kwargs["engine_core_log_dir"],
         )
 
         # Scheduler arguments
@@ -1906,6 +1911,7 @@ class EngineArgs:
             enable_logging_step_timing_details=self.enable_logging_step_timing_details,
             logging_step_timing_interval=self.logging_step_timing_interval,
             enable_graph_replay_timing=self.enable_graph_replay_timing,
+            engine_core_log_dir=self.engine_core_log_dir,
         )
 
         # Compilation config overrides

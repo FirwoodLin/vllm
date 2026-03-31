@@ -90,3 +90,13 @@ def test_defaults_with_usage_context():
     vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
     assert vllm_config.scheduler_config.max_num_seqs == default_max_num_seqs
     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
+
+
+def test_engine_core_log_dir_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--engine-core-log-dir", "/tmp/engine-core-logs"])
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+
+    assert vllm_config.observability_config.engine_core_log_dir == (
+        "/tmp/engine-core-logs"
+    )
