@@ -21,6 +21,7 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.structured_output.request import StructuredOutputRequest
+from vllm.v1.ttft_timing import copy_request_ttft_trace, RequestTTFTTrace
 from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
@@ -73,6 +74,7 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        ttft_trace: RequestTTFTTrace | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -175,6 +177,7 @@ class Request:
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
+        self.ttft_trace = copy_request_ttft_trace(ttft_trace)
 
     @classmethod
     def from_engine_core_request(
@@ -198,6 +201,7 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            ttft_trace=request.ttft_trace,
         )
 
     def append_output_token_ids(

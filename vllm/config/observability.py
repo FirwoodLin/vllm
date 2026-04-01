@@ -83,6 +83,12 @@ class ObservabilityConfig:
     """Emit one step timing log every N batch ids.
     For example, 10 logs batches where batch_id % 10 == 0."""
 
+    enable_logging_ttft_timing_details: bool = False
+    """Enable request-scoped TTFT timing logs on first non-empty text output."""
+
+    logging_ttft_timing_interval: int = Field(default=1, ge=1)
+    """Emit one TTFT timing log every N requests that reach first text."""
+
     enable_graph_replay_timing: bool = False
     """Enable per-batch CUDA graph replay timing on the reply rank."""
 

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.v1.ttft_timing import RequestTTFTTrace
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -217,6 +218,10 @@ class RequestStateStats:
 
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
+
+    # Internal request-scoped TTFT trace used for timing logs.
+    ttft_trace: RequestTTFTTrace | None = None
+    ttft_logged: bool = False
 
 
 @dataclass

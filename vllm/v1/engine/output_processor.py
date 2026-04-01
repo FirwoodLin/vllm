@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
+from vllm.logger import init_logger
 from vllm.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
@@ -37,9 +38,15 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+from vllm.v1.ttft_timing import (
+    copy_request_ttft_trace,
+    merge_request_ttft_trace,
+    RequestTTFTTrace,
+)
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
+logger = init_logger(__name__)
 
 
 class RequestOutputCollector:
@@ -144,7 +151,9 @@ class RequestState:
         arrival_time: float,
         queue: RequestOutputCollector | None,
         log_stats: bool,
+        enable_ttft_timing: bool,
         stream_interval: int,
+        ttft_trace: RequestTTFTTrace | None = None,
         top_p: float | None = None,
         n: int | None = None,
         temperature: float | None = None,
@@ -174,6 +183,11 @@ class RequestState:
         self.num_cached_tokens = 0
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+        self.ttft_stats = self.stats if enable_ttft_timing else None
+        if enable_ttft_timing and self.ttft_stats is None:
+            self.ttft_stats = RequestStateStats(arrival_time=arrival_time)
+        if self.ttft_stats is not None:
+            self.ttft_stats.ttft_trace = copy_request_ttft_trace(ttft_trace)
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -202,6 +216,8 @@ class RequestState:
         self.prompt_len = len(self.prompt_token_ids)
         if self.stats is not None:
             self.stats.arrival_time = update.arrival_time
+        if self.ttft_stats is not None and self.ttft_stats is not self.stats:
+            self.ttft_stats.arrival_time = update.arrival_time
         self.is_prefilling = True
 
     @classmethod
@@ -214,6 +230,7 @@ class RequestState:
         request_index: int,
         queue: RequestOutputCollector | None,
         log_stats: bool,
+        enable_ttft_timing: bool,
         stream_interval: int,
     ) -> "RequestState":
         if sampling_params := request.sampling_params:
@@ -262,7 +279,9 @@ class RequestState:
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
+            enable_ttft_timing=enable_ttft_timing,
             stream_interval=stream_interval,
+            ttft_trace=request.ttft_trace,
             stream_input=request.resumable,
         )
 
@@ -420,6 +439,9 @@ class OutputProcessor:
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        enable_ttft_timing_details: bool = False,
+        ttft_timing_interval: int = 1,
+        connector_name: str | None = None,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -429,6 +451,14 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
+        self.enable_ttft_timing_details = enable_ttft_timing_details
+        self.ttft_timing_interval = ttft_timing_interval
+        self.connector_name = connector_name or "none"
+        self._ttft_log_index = 0
+
+    @property
+    def needs_iteration_stats(self) -> bool:
+        return self.enable_ttft_timing_details
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -527,6 +557,7 @@ class OutputProcessor:
             request_index=request_index,
             queue=queue,
             log_stats=self.log_stats,
+            enable_ttft_timing=self.enable_ttft_timing_details,
             stream_interval=self.stream_interval,
         )
         self.request_states[request_id] = req_state
@@ -610,6 +641,7 @@ class OutputProcessor:
             self._update_stats_from_output(
                 req_state, engine_core_output, engine_core_timestamp, iteration_stats
             )
+            self._merge_ttft_trace_update(req_state, engine_core_output.ttft_trace_update)
 
             new_token_ids = engine_core_output.new_token_ids
             pooling_output = engine_core_output.pooling_output
@@ -647,6 +679,8 @@ class OutputProcessor:
                 if req_state.streaming_input:
                     request_output.finished = False
 
+                self._maybe_emit_ttft_timing_log(req_state, request_output)
+
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)
@@ -673,7 +707,7 @@ class OutputProcessor:
                     self._update_stats_from_finished(
                         req_state, finish_reason, iteration_stats
                     )
-                    if self.tracing_enabled:
+                    if self.tracing_enabled and req_state.stats is not None:
                         self.do_tracing(engine_core_output, req_state, iteration_stats)
 
         return OutputProcessorOutput(
@@ -760,6 +794,81 @@ class OutputProcessor:
             kind=SpanKind.SERVER,
         )
 
+    def _tracked_stats(self, req_state: RequestState) -> RequestStateStats | None:
+        return req_state.stats or req_state.ttft_stats
+
+    def _merge_ttft_trace_update(
+        self,
+        req_state: RequestState,
+        ttft_trace_update: RequestTTFTTrace | None,
+    ) -> None:
+        if req_state.ttft_stats is None or ttft_trace_update is None:
+            return
+        req_state.ttft_stats.ttft_trace = merge_request_ttft_trace(
+            req_state.ttft_stats.ttft_trace, ttft_trace_update
+        )
+
+    def _maybe_emit_ttft_timing_log(
+        self,
+        req_state: RequestState,
+        request_output: RequestOutput | PoolingRequestOutput,
+    ) -> None:
+        if (
+            not self.enable_ttft_timing_details
+            or not isinstance(request_output, RequestOutput)
+            or req_state.ttft_stats is None
+            or req_state.ttft_stats.ttft_logged
+        ):
+            return
+        if not any(output.text for output in request_output.outputs):
+            return
+
+        ttft_stats = req_state.ttft_stats
+        ttft_stats.ttft_logged = True
+        log_index = self._ttft_log_index
+        self._ttft_log_index += 1
+        if log_index % self.ttft_timing_interval != 0:
+            return
+
+        trace = ttft_stats.ttft_trace or RequestTTFTTrace()
+        queue_wait_ms = 0.0
+        if ttft_stats.queued_ts and ttft_stats.scheduled_ts:
+            queue_wait_ms = max(ttft_stats.scheduled_ts - ttft_stats.queued_ts, 0.0)
+            queue_wait_ms *= 1000.0
+
+        server_ttft_ms = max(ttft_stats.first_token_latency, 0.0) * 1000.0
+        api_preprocess_ms = trace.api_preprocess_ns / 1e6
+        ipc_in_decode_ms = trace.ipc_in_decode_ns / 1e6
+        engine_preprocess_ms = trace.engine_preprocess_ns / 1e6
+        first_batch_load_kv_ms = trace.first_batch_load_kv_ns / 1e6
+        unattributed_ms = max(
+            server_ttft_ms
+            - api_preprocess_ms
+            - ipc_in_decode_ms
+            - engine_preprocess_ms
+            - queue_wait_ms
+            - first_batch_load_kv_ms,
+            0.0,
+        )
+
+        logger.info(
+            " ".join(
+                [
+                    "TTFT_TIMING",
+                    f"request_id={req_state.external_req_id}",
+                    f"internal_request_id={req_state.request_id}",
+                    f"connector={self.connector_name}",
+                    f"api_preprocess_ms={api_preprocess_ms:.2f}",
+                    f"ipc_in_decode_ms={ipc_in_decode_ms:.2f}",
+                    f"engine_preprocess_ms={engine_preprocess_ms:.2f}",
+                    f"queue_wait_ms={queue_wait_ms:.2f}",
+                    f"first_batch_load_kv_ms={first_batch_load_kv_ms:.2f}",
+                    f"unattributed_ms={unattributed_ms:.2f}",
+                    f"server_ttft_ms={server_ttft_ms:.2f}",
+                ]
+            )
+        )
+
     def _update_stats_from_output(
         self,
         req_state: RequestState,
@@ -771,13 +880,14 @@ class OutputProcessor:
             return
 
         assert engine_core_timestamp is not None
-        assert req_state.stats is not None
+        req_stats = self._tracked_stats(req_state)
+        assert req_stats is not None
         iteration_stats.update_from_output(
             engine_core_output,
             engine_core_timestamp,
             req_state.is_prefilling,
             req_state.prompt_len,
-            req_state.stats,
+            req_stats,
             self.lora_states,
             req_state.lora_name,
         )
@@ -792,16 +902,17 @@ class OutputProcessor:
             return
 
         assert finish_reason is not None
-        assert req_state.stats is not None
+        req_stats = self._tracked_stats(req_state)
+        assert req_stats is not None
         iteration_stats.update_from_finished_request(
             finish_reason=finish_reason,
             num_prompt_tokens=req_state.prompt_len,
             max_tokens_param=req_state.max_tokens_param,
-            req_stats=req_state.stats,
+            req_stats=req_stats,
             num_cached_tokens=req_state.num_cached_tokens,
         )
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 
         ParentRequest.observe_finished_request(
-            req_state.parent_req, iteration_stats, req_state.stats.num_generation_tokens
+            req_state.parent_req, iteration_stats, req_stats.num_generation_tokens
         )

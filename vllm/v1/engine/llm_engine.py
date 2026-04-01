@@ -37,6 +37,7 @@ from vllm.v1.executor import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.ttft_timing import RequestTTFTTrace
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.worker_base import WorkerBase
 
@@ -105,6 +106,17 @@ class LLMEngine:
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            enable_ttft_timing_details=(
+                self.observability_config.enable_logging_ttft_timing_details
+            ),
+            ttft_timing_interval=(
+                self.observability_config.logging_ttft_timing_interval
+            ),
+            connector_name=(
+                None
+                if self.vllm_config.kv_transfer_config is None
+                else self.vllm_config.kv_transfer_config.kv_connector
+            ),
         )
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
@@ -245,6 +257,10 @@ class LLMEngine:
                     "latter will be used, and the former will be ignored."
                 )
         else:
+            enable_ttft_timing = (
+                self.observability_config.enable_logging_ttft_timing_details
+            )
+            t0 = time.perf_counter_ns() if enable_ttft_timing else 0
             request = self.input_processor.process_inputs(
                 request_id,
                 prompt,
@@ -256,6 +272,10 @@ class LLMEngine:
                 trace_headers=trace_headers,
                 priority=priority,
             )
+            if enable_ttft_timing:
+                request.ttft_trace = RequestTTFTTrace(
+                    api_preprocess_ns=time.perf_counter_ns() - t0
+                )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
         self.input_processor.assign_request_id(request)
@@ -303,7 +323,14 @@ class LLMEngine:
 
         # 2) Process EngineCoreOutputs.
         with record_function_or_nullcontext("llm_engine step: process_outputs"):
-            iteration_stats = IterationStats() if self.log_stats else None
+            iteration_stats = (
+                IterationStats()
+                if (
+                    outputs.outputs
+                    and (self.log_stats or self.output_processor.needs_iteration_stats)
+                )
+                else None
+            )
             processed_outputs = self.output_processor.process_outputs(
                 outputs.outputs,
                 engine_core_timestamp=outputs.timestamp,

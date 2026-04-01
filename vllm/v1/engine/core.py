@@ -78,6 +78,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.ttft_timing import RequestTTFTTrace
 from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -873,6 +874,10 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        enable_ttft_timing = (
+            self.vllm_config.observability_config.enable_logging_ttft_timing_details
+        )
+        preprocess_start_ns = time.perf_counter_ns() if enable_ttft_timing else 0
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.
@@ -889,6 +894,12 @@ class EngineCore:
             # grammar compilation is async. Scheduler always checks grammar
             # compilation status before scheduling request.
             self.structured_output_manager.grammar_init(req)
+        if enable_ttft_timing:
+            if req.ttft_trace is None:
+                req.ttft_trace = RequestTTFTTrace()
+            req.ttft_trace.engine_preprocess_ns = (
+                time.perf_counter_ns() - preprocess_start_ns
+            )
         return req, request.current_wave
 
     def _eep_scale_up_before_kv_init(self):
@@ -1532,8 +1543,14 @@ class EngineCoreProc(EngineCore):
 
             ready_event.set()
             del ready_event
+            enable_ttft_timing = (
+                self.vllm_config.observability_config.enable_logging_ttft_timing_details
+            )
             while True:
                 for input_socket, _ in poller.poll():
+                    recv_decode_start_ns = (
+                        time.perf_counter_ns() if enable_ttft_timing else 0
+                    )
                     # (RequestType, RequestData)
                     type_frame, *data_frames = input_socket.recv_multipart(copy=False)
                     # NOTE(yongji): ignore READY message sent by DP coordinator
@@ -1547,6 +1564,12 @@ class EngineCoreProc(EngineCore):
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        if enable_ttft_timing:
+                            if req.ttft_trace is None:
+                                req.ttft_trace = RequestTTFTTrace()
+                            req.ttft_trace.ipc_in_decode_ns = (
+                                time.perf_counter_ns() - recv_decode_start_ns
+                            )
                         try:
                             request = self.preprocess_add_request(req)
                         except Exception:

@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
     DecodeBenchConnector,
     DecodeBenchConnectorMetadata,
+    DecodeBenchConnectorWorkerMetadata,
 )
 from vllm.forward_context import ForwardContext
 from vllm.utils.hashing import sha256
@@ -411,6 +412,23 @@ def test_decode_bench_connector_concurrent_requests():
     # Run second step - should NOT fill again (already filled)
     _, metadata2 = runner.run_single_step()
     assert len(metadata2.reqs_to_fill) == 0
+
+
+def test_decode_bench_connector_emits_batch_load_kv_worker_meta():
+    block_size = 16
+    num_gpu_blocks = 100
+
+    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
+    runner.vllm_config.observability_config.enable_logging_ttft_timing_details = True
+    req = runner.new_request([1] * (block_size * 2))
+
+    runner.run_single_step()
+
+    worker_meta = runner.worker_connector.build_connector_worker_meta()
+
+    assert isinstance(worker_meta, DecodeBenchConnectorWorkerMetadata)
+    assert req.request_id in worker_meta.req_batch_load_kv_ns
+    assert worker_meta.req_batch_load_kv_ns[req.request_id] >= 0
 
 
 if __name__ == "__main__":

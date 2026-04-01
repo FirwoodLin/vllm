@@ -17,6 +17,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
+from vllm.v1.ttft_timing import RequestTTFTTrace
 
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
@@ -100,6 +101,7 @@ class EngineCoreRequest(
     external_req_id: str | None = None
 
     reasoning_ended: bool | None = None
+    ttft_trace: RequestTTFTTrace | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:
@@ -165,6 +167,7 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+    ttft_trace_update: RequestTTFTTrace | None = None
 
     @property
     def finished(self) -> bool:

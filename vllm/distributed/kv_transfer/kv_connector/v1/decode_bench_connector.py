@@ -31,6 +31,7 @@ Usage:
           Set to 0 for constant values, >0 for random sampling
 """
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -40,7 +41,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionMetadata
@@ -69,6 +73,22 @@ class DecodeBenchConnectorMetadata(KVConnectorMetadata):
     # For standard attention: single group, e.g., ([1, 2, 3],)
     # For MLA: multiple groups, e.g., ([1, 2], [1, 2])
     reqs_to_fill: dict[str, tuple[tuple[list[int], ...], int]]
+
+
+@dataclass
+class DecodeBenchConnectorWorkerMetadata(KVConnectorWorkerMetadata):
+    """Worker-side timing data for the current decode bench batch."""
+
+    req_batch_load_kv_ns: dict[str, int]
+
+    def aggregate(
+        self, other: KVConnectorWorkerMetadata
+    ) -> KVConnectorWorkerMetadata:
+        assert isinstance(other, DecodeBenchConnectorWorkerMetadata)
+        aggregated = dict(self.req_batch_load_kv_ns)
+        for req_id, load_kv_ns in other.req_batch_load_kv_ns.items():
+            aggregated[req_id] = max(aggregated.get(req_id, 0), load_kv_ns)
+        return DecodeBenchConnectorWorkerMetadata(req_batch_load_kv_ns=aggregated)
 
 
 class DecodeBenchConnector(KVConnectorBase_V1):
@@ -108,6 +128,10 @@ class DecodeBenchConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, DecodeBenchConnectorMetadata)
         self.connector_worker.start_fill_kv(self._connector_metadata)
+
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        assert self.connector_worker is not None
+        return self.connector_worker.build_connector_worker_meta()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         # All operations are synchronous, so nothing to wait for
@@ -301,6 +325,7 @@ class DecodeBenchConnectorWorker:
 
         # Mapping from KV cache group index to list of layer names in that group
         self.group_to_layers: dict[int, list[str]] | None = None
+        self._latest_req_batch_load_kv_ns: dict[str, int] = {}
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Store references to the KV cache tensors and build group mapping."""
@@ -326,10 +351,16 @@ class DecodeBenchConnectorWorker:
         Supports both standard attention (single group) and MLA (multiple groups).
         """
         if not metadata.reqs_to_fill:
+            self._latest_req_batch_load_kv_ns = {}
             return
 
         assert self.kv_caches is not None, "KV caches must be registered before filling"
         assert self.group_to_layers is not None, "Group mapping must be initialized"
+
+        enable_ttft_timing = (
+            self.vllm_config.observability_config.enable_logging_ttft_timing_details
+        )
+        start_ns = time.perf_counter_ns() if enable_ttft_timing else 0
 
         for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
             # Fill blocks for each KV cache group
@@ -344,6 +375,23 @@ class DecodeBenchConnectorWorker:
                 len(block_ids_per_group),
                 req_id,
             )
+
+        if enable_ttft_timing:
+            batch_load_kv_ns = time.perf_counter_ns() - start_ns
+            self._latest_req_batch_load_kv_ns = {
+                req_id: batch_load_kv_ns for req_id in metadata.reqs_to_fill
+            }
+        else:
+            self._latest_req_batch_load_kv_ns = {}
+
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        if not self._latest_req_batch_load_kv_ns:
+            return None
+        metadata = DecodeBenchConnectorWorkerMetadata(
+            req_batch_load_kv_ns=self._latest_req_batch_load_kv_ns
+        )
+        self._latest_req_batch_load_kv_ns = {}
+        return metadata
 
     def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
         """

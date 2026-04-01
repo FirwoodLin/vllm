@@ -555,6 +555,12 @@ class EngineArgs:
     logging_step_timing_interval: int = get_field(
         ObservabilityConfig, "logging_step_timing_interval"
     )
+    enable_logging_ttft_timing_details: bool = (
+        ObservabilityConfig.enable_logging_ttft_timing_details
+    )
+    logging_ttft_timing_interval: int = get_field(
+        ObservabilityConfig, "logging_ttft_timing_interval"
+    )
     enable_graph_replay_timing: bool = (
         ObservabilityConfig.enable_graph_replay_timing
     )
@@ -1181,6 +1187,14 @@ class EngineArgs:
         observability_group.add_argument(
             "--logging-step-timing-interval",
             **observability_kwargs["logging_step_timing_interval"],
+        )
+        observability_group.add_argument(
+            "--enable-logging-ttft-timing-details",
+            **observability_kwargs["enable_logging_ttft_timing_details"],
+        )
+        observability_group.add_argument(
+            "--logging-ttft-timing-interval",
+            **observability_kwargs["logging_ttft_timing_interval"],
         )
         observability_group.add_argument(
             "--enable-graph-replay-timing",
@@ -1910,6 +1924,10 @@ class EngineArgs:
             enable_logging_iteration_details=self.enable_logging_iteration_details,
             enable_logging_step_timing_details=self.enable_logging_step_timing_details,
             logging_step_timing_interval=self.logging_step_timing_interval,
+            enable_logging_ttft_timing_details=(
+                self.enable_logging_ttft_timing_details
+            ),
+            logging_ttft_timing_interval=self.logging_ttft_timing_interval,
             enable_graph_replay_timing=self.enable_graph_replay_timing,
             engine_core_log_dir=self.engine_core_log_dir,
         )

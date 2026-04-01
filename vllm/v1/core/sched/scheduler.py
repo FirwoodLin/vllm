@@ -59,6 +59,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.ttft_timing import RequestTTFTTrace
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
@@ -1295,6 +1296,22 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = (
             kv_connector_output.kv_connector_stats if kv_connector_output else None
         )
+        decode_bench_batch_load_kv_ns: dict[str, int] | None = None
+        if (
+            kv_connector_output is not None
+            and kv_connector_output.kv_connector_worker_meta is not None
+        ):
+            from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (  # noqa: E501
+                DecodeBenchConnectorWorkerMetadata,
+            )
+
+            if isinstance(
+                kv_connector_output.kv_connector_worker_meta,
+                DecodeBenchConnectorWorkerMetadata,
+            ):
+                decode_bench_batch_load_kv_ns = (
+                    kv_connector_output.kv_connector_worker_meta.req_batch_load_kv_ns
+                )
         if kv_connector_stats and self.connector:
             kv_stats = self.connector.get_kv_connector_stats()
             if kv_stats:
@@ -1420,6 +1437,32 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            is_first_token_output = bool(new_token_ids) and (
+                request.num_output_tokens == len(new_token_ids)
+            )
+            ttft_trace_update = None
+            if is_first_token_output:
+                base_trace = request.ttft_trace
+                if (
+                    decode_bench_batch_load_kv_ns is not None
+                    and req_id in decode_bench_batch_load_kv_ns
+                ):
+                    ttft_trace_update = RequestTTFTTrace(
+                        api_preprocess_ns=(
+                            0 if base_trace is None else base_trace.api_preprocess_ns
+                        ),
+                        ipc_in_decode_ns=(
+                            0 if base_trace is None else base_trace.ipc_in_decode_ns
+                        ),
+                        engine_preprocess_ns=(
+                            0
+                            if base_trace is None
+                            else base_trace.engine_preprocess_ns
+                        ),
+                        first_batch_load_kv_ns=decode_bench_batch_load_kv_ns[req_id],
+                    )
+                else:
+                    ttft_trace_update = base_trace
             if (
                 new_token_ids
                 or pooler_output is not None
@@ -1443,6 +1486,7 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        ttft_trace_update=ttft_trace_update,
                     )
                 )
             else:

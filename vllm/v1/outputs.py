@@ -189,6 +189,10 @@ class KVConnectorOutput:
             set.union, [output.invalid_block_ids for output in outputs]
         )
         assert invalid_block_ids is not None
+        kv_connector_worker_meta = _combine_non_none(
+            lambda x, y: x.aggregate(y),
+            [output.kv_connector_worker_meta for output in outputs],
+        )
 
         assert all(
             output.expected_finished_count == outputs[0].expected_finished_count
@@ -202,6 +206,7 @@ class KVConnectorOutput:
             kv_connector_stats=kv_connector_stats,
             kv_cache_events=kv_cache_events,
             invalid_block_ids=invalid_block_ids,
+            kv_connector_worker_meta=kv_connector_worker_meta,
             expected_finished_count=expected_finished_count,
         )
 

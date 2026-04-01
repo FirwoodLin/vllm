@@ -52,6 +52,7 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.ttft_timing import RequestTTFTTrace
 
 logger = init_logger(__name__)
 
@@ -148,6 +149,17 @@ class AsyncLLM(EngineClient):
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            enable_ttft_timing_details=(
+                self.observability_config.enable_logging_ttft_timing_details
+            ),
+            ttft_timing_interval=(
+                self.observability_config.logging_ttft_timing_interval
+            ),
+            connector_name=(
+                None
+                if self.vllm_config.kv_transfer_config is None
+                else self.vllm_config.kv_transfer_config.kv_connector
+            ),
         )
 
         # EngineCore (starts the engine in background process).
@@ -353,6 +365,10 @@ class AsyncLLM(EngineClient):
                     "latter will be used, and the former will be ignored."
                 )
         else:
+            enable_ttft_timing = (
+                self.observability_config.enable_logging_ttft_timing_details
+            )
+            t0 = time.perf_counter_ns() if enable_ttft_timing else 0
             request = self.input_processor.process_inputs(
                 request_id,
                 prompt,
@@ -365,6 +381,10 @@ class AsyncLLM(EngineClient):
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
             )
+            if enable_ttft_timing:
+                request.ttft_trace = RequestTTFTTrace(
+                    api_preprocess_ns=time.perf_counter_ns() - t0
+                )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
         if reasoning_ended is not None:
@@ -664,7 +684,15 @@ class AsyncLLM(EngineClient):
                     num_outputs = len(outputs.outputs)
 
                     iteration_stats = (
-                        IterationStats() if (log_stats and num_outputs) else None
+                        IterationStats()
+                        if (
+                            num_outputs
+                            and (
+                                log_stats
+                                or output_processor.needs_iteration_stats
+                            )
+                        )
+                        else None
                     )
 
                     # Split outputs into chunks of at most
