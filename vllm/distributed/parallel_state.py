@@ -1854,41 +1854,75 @@ def get_node_count() -> int:
     return _NODE_COUNT
 
 
+def _best_effort_shutdown_barrier(group_name: str, group: Any | None) -> None:
+    """Synchronize group members before tearing down distributed state.
+
+    During graceful shutdown, letting rank 0 destroy the TCPStore or default
+    process group before peer ranks enter teardown can trigger noisy NCCL
+    heartbeat warnings. Use a short best-effort barrier so ranks begin
+    destruction together, but never block shutdown indefinitely if a peer is
+    already gone.
+    """
+    if group is None or getattr(group, "world_size", 1) <= 1:
+        return
+
+    try:
+        monitored_barrier = getattr(torch.distributed, "monitored_barrier", None)
+        cpu_group = getattr(group, "cpu_group", None)
+        if callable(monitored_barrier) and cpu_group is not None:
+            monitored_barrier(group=cpu_group, timeout=timedelta(seconds=5))
+        else:
+            group.barrier()
+    except Exception:
+        logger.warning(
+            "Shutdown barrier for %s group failed; continuing teardown.",
+            group_name,
+            exc_info=True,
+        )
+
+
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _TP
 
     if _TP:
+        _best_effort_shutdown_barrier("tp", _TP)
         _TP.destroy()
     _TP = None
 
     global _DCP
     if _DCP:
+        _best_effort_shutdown_barrier("dcp", _DCP)
         _DCP.destroy()
     _DCP = None
 
     global _PCP
     if _PCP:
+        _best_effort_shutdown_barrier("pcp", _PCP)
         _PCP.destroy()
     _PCP = None
 
     global _PP
     if _PP:
+        _best_effort_shutdown_barrier("pp", _PP)
         _PP.destroy()
     _PP = None
 
     global _DP
     if _DP:
+        _best_effort_shutdown_barrier("dp", _DP)
         _DP.destroy()
     _DP = None
 
     global _EP
     if _EP:
+        _best_effort_shutdown_barrier("ep", _EP)
         _EP.destroy()
     _EP = None
 
     global _EPLB
     if _EPLB:
+        _best_effort_shutdown_barrier("eplb", _EPLB)
         _EPLB.destroy()
     _EPLB = None
 
@@ -1896,6 +1930,7 @@ def destroy_model_parallel():
 def destroy_distributed_environment():
     global _WORLD, _NODE_COUNT
     if _WORLD:
+        _best_effort_shutdown_barrier("world", _WORLD)
         _WORLD.destroy()
     _WORLD = None
     _NODE_COUNT = None

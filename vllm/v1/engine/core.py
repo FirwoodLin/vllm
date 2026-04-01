@@ -687,6 +687,16 @@ class EngineCore:
         if self.scheduler:
             self.scheduler.shutdown()
 
+    def request_shutdown(self) -> None:
+        """Ask the busy loop to exit through its normal shutdown path.
+
+        This is safe to invoke through the utility RPC interface. Unlike
+        ``shutdown()``, it does not tear down the executor immediately while the
+        engine loop is still active.
+        """
+        if self.shutdown_state == EngineShutdownState.RUNNING:
+            self.shutdown_state = EngineShutdownState.REQUESTED
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
 

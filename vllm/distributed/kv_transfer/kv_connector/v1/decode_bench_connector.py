@@ -362,19 +362,20 @@ class DecodeBenchConnectorWorker:
         )
         start_ns = time.perf_counter_ns() if enable_ttft_timing else 0
 
-        for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
-            # Fill blocks for each KV cache group
-            for group_idx, block_ids in enumerate(block_ids_per_group):
-                self._fill_blocks(group_idx, block_ids, num_tokens)
+        # for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
+        #     # Fill blocks for each KV cache group
+        #     # skipped!!!!!
+        #     for group_idx, block_ids in enumerate(block_ids_per_group):
+        #         self._fill_blocks(group_idx, block_ids, num_tokens)
 
-            logger.debug(
-                "DecodeBenchConnector: Filled %d blocks (%d tokens) across %d groups "
-                "for request %s",
-                len(block_ids_per_group[0]) if block_ids_per_group else 0,
-                num_tokens,
-                len(block_ids_per_group),
-                req_id,
-            )
+        #     logger.debug(
+        #         "DecodeBenchConnector: Filled %d blocks (%d tokens) across %d groups "
+        #         "for request %s",
+        #         len(block_ids_per_group[0]) if block_ids_per_group else 0,
+        #         num_tokens,
+        #         len(block_ids_per_group),
+        #         req_id,
+        #     )
 
         if enable_ttft_timing:
             batch_load_kv_ns = time.perf_counter_ns() - start_ns

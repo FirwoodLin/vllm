@@ -1,0 +1,962 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Offline benchmark harness with Poisson arrivals using AsyncLLM directly."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import signal
+import time
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, cast
+
+import numpy as np
+import uvloop
+
+from vllm.benchmarks.datasets import RandomDataset, SampleRequest
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.inputs import token_inputs
+from vllm.logger import init_logger
+from vllm.outputs import RequestOutput
+from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.usage.usage_lib import UsageContext
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.config.scheduler import SchedulerConfig
+
+logger = init_logger(__name__)
+
+DEFAULT_KV_TRANSFER_CONFIG = {
+    "kv_connector": "DecodeBenchConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "fill_mean": 0.015,
+        "fill_std": 0.0,
+    },
+}
+
+DEFAULT_COMPILATION_CONFIG = {
+    "cudagraph_mode": "FULL_DECODE_ONLY",
+}
+
+DEFAULT_ENV_VARS = {
+    "VLLM_DEEP_GEMM_WARMUP": "skip",
+    "VLLM_RANDOMIZE_DP_DUMMY_INPUTS": "1",
+    "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": "uniform_random",
+}
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Expected a non-negative integer.")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Expected a positive integer.")
+    return parsed
+
+
+def _positive_float_or_inf(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0.0:
+        raise argparse.ArgumentTypeError("Expected a positive float or inf.")
+    return parsed
+
+
+def _json_dump(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(_jsonify(payload), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _jsonify(value: Any) -> Any:
+    if is_dataclass(value):
+        return _jsonify(asdict(value))
+
+    if isinstance(value, Enum):
+        return value.name
+
+    if isinstance(value, Path):
+        try:
+            return str(value.expanduser().resolve())
+        except Exception:
+            return str(value)
+
+    if isinstance(value, dict):
+        return {str(key): _jsonify(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [_jsonify(item) for item in value]
+
+    if isinstance(value, set):
+        return sorted((_jsonify(item) for item in value), key=repr)
+
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        return _jsonify(value.model_dump())
+
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return _jsonify(value.to_dict())
+
+    if hasattr(value, "to_json_string") and callable(value.to_json_string):
+        json_text = value.to_json_string()
+        try:
+            return _jsonify(json.loads(json_text))
+        except Exception:
+            return json_text
+
+    return value
+
+
+def _interval_ms(start_s: float, end_s: float) -> float | None:
+    if start_s == 0.0 or end_s == 0.0:
+        return None
+    return max(end_s - start_s, 0.0) * 1000.0
+
+
+def _build_request_id(prefix: str, index: int) -> str:
+    return f"{prefix}{index:06d}"
+
+
+def default_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
+    if max_num_seqs <= 0:
+        return []
+
+    sizes = [1, 2, 4, 8, 16]
+    if max_num_seqs <= 16:
+        return [size for size in sizes if size <= max_num_seqs]
+
+    sizes.extend(range(32, max_num_seqs + 1, 16))
+    return sorted(set(size for size in sizes if size <= max_num_seqs))
+
+
+def _apply_benchmark_env_defaults() -> None:
+    for key, value in DEFAULT_ENV_VARS.items():
+        os.environ.setdefault(key, value)
+
+
+def _apply_benchmark_arg_defaults(args: argparse.Namespace) -> None:
+    if args.cudagraph_capture_sizes is None:
+        compilation_config = getattr(args, "compilation_config", None)
+        existing_capture_sizes = None
+        if isinstance(compilation_config, dict):
+            existing_capture_sizes = compilation_config.get("cudagraph_capture_sizes")
+        elif compilation_config is not None:
+            existing_capture_sizes = getattr(
+                compilation_config,
+                "cudagraph_capture_sizes",
+                None,
+            )
+
+        if existing_capture_sizes is not None:
+            return
+
+        max_num_seqs = args.max_num_seqs or SchedulerConfig.DEFAULT_MAX_NUM_SEQS
+        args.cudagraph_capture_sizes = default_cudagraph_capture_sizes(max_num_seqs)
+
+
+def _prepare_output_dir(output_dir: Path) -> None:
+    if output_dir.exists() and not output_dir.is_dir():
+        raise ValueError(
+            "--output-dir must be a directory path, but got an existing file: "
+            f"{output_dir}"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def connector_mode_from_config(kv_transfer_config: Any) -> str:
+    if kv_transfer_config is None:
+        return "none"
+
+    if isinstance(kv_transfer_config, dict):
+        connector_name = kv_transfer_config.get("kv_connector")
+    else:
+        connector_name = getattr(kv_transfer_config, "kv_connector", None)
+
+    return "decode_bench" if connector_name == "DecodeBenchConnector" else "none"
+
+
+def build_poisson_arrival_deadlines_ns(
+    num_requests: int,
+    request_rate: float,
+    seed: int,
+) -> list[int]:
+    if num_requests <= 0:
+        return []
+
+    if request_rate == float("inf"):
+        return [0] * num_requests
+
+    rng = np.random.default_rng(seed + 1)
+    deltas_s = rng.exponential(1.0 / request_rate, size=num_requests)
+    deadlines_s = np.cumsum(deltas_s)
+    return [int(deadline * 1e9) for deadline in deadlines_s]
+
+
+def load_length_requests(
+    csv_path: str,
+    tokenizer: Any,
+    seed: int,
+    request_id_prefix: str,
+    csv_repeat: int = 1,
+) -> list[SampleRequest]:
+    if csv_repeat <= 0:
+        raise ValueError("csv_repeat must be >= 1.")
+
+    dataset = RandomDataset(
+        random_seed=seed,
+        random_csv_path=csv_path,
+        disable_shuffle=True,
+    )
+    total_rows = len(dataset.csv_lengths or [])
+    total_requests = total_rows * csv_repeat
+    requests = dataset.sample(
+        tokenizer=tokenizer,
+        num_requests=total_requests,
+        request_id_prefix="",
+        no_oversample=False,
+    )
+    for index, request in enumerate(requests):
+        request.request_id = _build_request_id(request_id_prefix, index)
+    return requests
+
+
+def resolve_csv_repeat(
+    total_rows: int,
+    warmup_requests: int,
+    max_requests: int | None,
+    csv_repeat: int | None,
+) -> int:
+    if total_rows <= 0:
+        raise ValueError("CSV must contain at least one data row.")
+
+    if csv_repeat is not None:
+        if csv_repeat <= 0:
+            raise ValueError("csv_repeat must be >= 1.")
+        return csv_repeat
+
+    if max_requests is None:
+        return 1
+
+    total_needed = warmup_requests + max_requests
+    if total_needed <= 0:
+        return 1
+
+    return max(1, int(np.ceil(total_needed / total_rows)))
+
+
+def split_warmup_and_measured_requests(
+    requests: list[SampleRequest],
+    warmup_requests: int,
+    max_requests: int | None,
+) -> tuple[list[SampleRequest], list[SampleRequest]]:
+    warmup = requests[:warmup_requests]
+    measured = requests[warmup_requests:]
+    if max_requests is not None:
+        measured = measured[:max_requests]
+    return warmup, measured
+
+
+def validate_request_lengths(
+    requests: list[SampleRequest],
+    max_model_len: int,
+) -> None:
+    too_long = [
+        request for request in requests
+        if request.prompt_len + request.expected_output_len > max_model_len
+    ]
+    if not too_long:
+        return
+
+    examples = ", ".join(
+        f"{req.request_id}:{req.prompt_len}+{req.expected_output_len}"
+        for req in too_long[:3]
+    )
+    raise ValueError(
+        "Some requests exceed max_model_len="
+        f"{max_model_len}. Example(s): {examples}"
+    )
+
+
+def build_success_record(
+    request: SampleRequest,
+    output: RequestOutput,
+    submit_ts_ns: int,
+    finish_ts_ns: int,
+) -> dict[str, Any]:
+    if not output.finished or not output.outputs:
+        raise ValueError("Received a finished request without final outputs.")
+
+    completion = output.outputs[0]
+    metrics = output.metrics
+    ttft_trace = None if metrics is None else metrics.ttft_trace
+    kv_fill_ms = 0.0
+    if ttft_trace is not None:
+        kv_fill_ms = float(ttft_trace.first_batch_load_kv_ns / 1e6)
+
+    queued_time_ms = None
+    prefill_time_ms = None
+    decode_time_ms = None
+    inference_time_ms = None
+    ttft_ms = None
+    if metrics is not None:
+        queued_time_ms = _interval_ms(metrics.queued_ts, metrics.scheduled_ts)
+        prefill_time_ms = _interval_ms(metrics.scheduled_ts, metrics.first_token_ts)
+        decode_time_ms = _interval_ms(metrics.first_token_ts, metrics.last_token_ts)
+        inference_time_ms = _interval_ms(metrics.scheduled_ts, metrics.last_token_ts)
+        ttft_ms = float(metrics.first_token_latency * 1000.0)
+
+    return {
+        "request_id": request.request_id,
+        "submit_ts_ns": submit_ts_ns,
+        "finish_ts_ns": finish_ts_ns,
+        "e2e_ms": float((finish_ts_ns - submit_ts_ns) / 1e6),
+        "ttft_ms": ttft_ms,
+        "queued_time_ms": queued_time_ms,
+        "kv_fill_ms": kv_fill_ms,
+        "prefill_time_ms": prefill_time_ms,
+        "decode_time_ms": decode_time_ms,
+        "inference_time_ms": inference_time_ms,
+        "prompt_len": request.prompt_len,
+        "expected_output_len": request.expected_output_len,
+        "actual_output_tokens": len(completion.token_ids),
+        "finish_reason": completion.finish_reason,
+        "num_cached_tokens": int(output.num_cached_tokens or 0),
+        "is_error": False,
+        "error_message": None,
+    }
+
+
+def build_error_record(
+    request: SampleRequest,
+    submit_ts_ns: int,
+    finish_ts_ns: int,
+    error: Exception | str,
+) -> dict[str, Any]:
+    return {
+        "request_id": request.request_id,
+        "submit_ts_ns": submit_ts_ns,
+        "finish_ts_ns": finish_ts_ns,
+        "e2e_ms": float((finish_ts_ns - submit_ts_ns) / 1e6),
+        "ttft_ms": None,
+        "queued_time_ms": None,
+        "kv_fill_ms": 0.0,
+        "prefill_time_ms": None,
+        "decode_time_ms": None,
+        "inference_time_ms": None,
+        "prompt_len": request.prompt_len,
+        "expected_output_len": request.expected_output_len,
+        "actual_output_tokens": 0,
+        "finish_reason": None,
+        "num_cached_tokens": 0,
+        "is_error": True,
+        "error_message": str(error),
+    }
+
+
+def _metric_summary(records: list[dict[str, Any]], key: str) -> dict[str, float] | None:
+    values = [
+        float(record[key])
+        for record in records
+        if not record["is_error"] and record.get(key) is not None
+    ]
+    if not values:
+        return None
+
+    data = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(np.mean(data)),
+        "p50": float(np.percentile(data, 50)),
+        "p90": float(np.percentile(data, 90)),
+        "p95": float(np.percentile(data, 95)),
+        "p99": float(np.percentile(data, 99)),
+    }
+
+
+def build_summary(
+    records: list[dict[str, Any]],
+    connector_mode: str,
+    first_submit_ts_ns: int | None,
+    last_finish_ts_ns: int | None,
+) -> dict[str, Any]:
+    total_requests = len(records)
+    failed_requests = sum(1 for record in records if record["is_error"])
+    successful_requests = total_requests - failed_requests
+
+    runtime_s = 0.0
+    if first_submit_ts_ns is not None and last_finish_ts_ns is not None:
+        runtime_s = max(last_finish_ts_ns - first_submit_ts_ns, 0) / 1e9
+
+    summary = {
+        "total_requests": total_requests,
+        "successful_requests": successful_requests,
+        "failed_requests": failed_requests,
+        "failure_ratio": (
+            float(failed_requests / total_requests) if total_requests else 0.0
+        ),
+        "benchmark_runtime_s": runtime_s,
+        "achieved_request_throughput_rps": (
+            float(total_requests / runtime_s) if runtime_s > 0 else 0.0
+        ),
+        "connector_mode": connector_mode,
+        "e2e_ms": _metric_summary(records, "e2e_ms"),
+        "ttft_ms": _metric_summary(records, "ttft_ms"),
+        "queued_time_ms": _metric_summary(records, "queued_time_ms"),
+    }
+    if connector_mode == "decode_bench":
+        summary["kv_fill_ms"] = _metric_summary(records, "kv_fill_ms")
+    return summary
+
+
+@dataclass
+class RunRecorder:
+    requests_path: Path
+    progress_log_interval: int
+    records: list[dict[str, Any]]
+    first_submit_ts_ns: int | None = None
+    last_finish_ts_ns: int | None = None
+    completed_requests: int = 0
+
+    def __post_init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._fh = self.requests_path.open("w", encoding="utf-8")
+
+    def close(self) -> None:
+        self._fh.close()
+
+    async def note_submit(self, submit_ts_ns: int) -> None:
+        async with self._lock:
+            if self.first_submit_ts_ns is None or submit_ts_ns < self.first_submit_ts_ns:
+                self.first_submit_ts_ns = submit_ts_ns
+
+    async def append(self, record: dict[str, Any]) -> None:
+        async with self._lock:
+            self._fh.write(json.dumps(record, sort_keys=True) + "\n")
+            self._fh.flush()
+            self.records.append(record)
+            self.completed_requests += 1
+            finish_ts_ns = int(record["finish_ts_ns"])
+            if self.last_finish_ts_ns is None or finish_ts_ns > self.last_finish_ts_ns:
+                self.last_finish_ts_ns = finish_ts_ns
+            if (
+                self.progress_log_interval > 0
+                and self.completed_requests % self.progress_log_interval == 0
+            ):
+                logger.info(
+                    "Completed %d measured requests.",
+                    self.completed_requests,
+                )
+
+
+def _enforce_harness_observability(args: argparse.Namespace) -> None:
+    if getattr(args, "disable_log_stats", False):
+        raise ValueError(
+            "offline_poisson_harness requires log stats. "
+            "Remove --disable-log-stats."
+        )
+    if getattr(args, "skip_tokenizer_init", False):
+        raise ValueError(
+            "offline_poisson_harness length_csv mode requires tokenizer init. "
+            "Remove --skip-tokenizer-init."
+        )
+
+    args.disable_log_stats = False
+    args.enable_logging_ttft_timing_details = True
+    args.logging_ttft_timing_interval = 1
+
+
+def _validate_frontend_args(args: argparse.Namespace) -> None:
+    if args.csv_format != "length_csv":
+        raise NotImplementedError("Only --csv-format=length_csv is implemented.")
+    if args.routing_mode != "internal_dplb":
+        raise NotImplementedError(
+            "Only --routing-mode=internal_dplb is implemented."
+        )
+
+
+def _build_sampling_params(output_len: int) -> SamplingParams:
+    return SamplingParams(
+        max_tokens=output_len,
+        temperature=0.0,
+        top_p=1.0,
+        ignore_eos=True,
+        detokenize=False,
+        output_kind=RequestOutputKind.FINAL_ONLY,
+    )
+
+
+async def _submit_one_request(
+    *,
+    engine: Any,
+    request: SampleRequest,
+    recorder: RunRecorder | None,
+    inflight: set[asyncio.Task[None]],
+) -> None:
+    assert request.request_id is not None
+    assert isinstance(request.prompt, list)
+
+    submit_ts_ns = time.time_ns()
+    if recorder is not None:
+        await recorder.note_submit(submit_ts_ns)
+
+    try:
+        collector = await engine.add_request(
+            request_id=request.request_id,
+            prompt=token_inputs(prompt_token_ids=cast(list[int], request.prompt)),
+            params=_build_sampling_params(request.expected_output_len),
+            arrival_time=submit_ts_ns / 1e9,
+            data_parallel_rank=None,
+        )
+    except Exception as exc:
+        if recorder is None:
+            raise
+        finish_ts_ns = time.time_ns()
+        await recorder.append(
+            build_error_record(request, submit_ts_ns, finish_ts_ns, exc)
+        )
+        return
+
+    async def wait_for_completion() -> None:
+        try:
+            final_output = await collector.get()
+            finish_ts_ns = time.time_ns()
+            if not isinstance(final_output, RequestOutput):
+                raise TypeError(
+                    f"Expected RequestOutput, got {type(final_output).__name__}."
+                )
+            record = build_success_record(
+                request=request,
+                output=final_output,
+                submit_ts_ns=submit_ts_ns,
+                finish_ts_ns=finish_ts_ns,
+            )
+        except Exception as exc:
+            if recorder is None:
+                raise
+            finish_ts_ns = time.time_ns()
+            record = build_error_record(request, submit_ts_ns, finish_ts_ns, exc)
+
+        if recorder is not None:
+            await recorder.append(record)
+
+    task = asyncio.create_task(wait_for_completion())
+    inflight.add(task)
+    task.add_done_callback(inflight.discard)
+
+
+async def _run_warmup(engine: Any, requests: list[SampleRequest]) -> None:
+    if not requests:
+        return
+
+    logger.info("Running %d warmup request(s).", len(requests))
+    inflight: set[asyncio.Task[None]] = set()
+    for request in requests:
+        await _submit_one_request(
+            engine=engine,
+            request=request,
+            recorder=None,
+            inflight=inflight,
+        )
+    while inflight:
+        await asyncio.gather(*tuple(inflight))
+
+
+def _write_parquet_if_requested(
+    output_dir: Path,
+    records: list[dict[str, Any]],
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise RuntimeError(
+            "--save-merged-parquet requires pandas to be installed."
+        ) from exc
+
+    parquet_path = output_dir / "merged_requests.parquet"
+    pd.DataFrame(records).to_parquet(parquet_path, index=False)
+
+
+async def _request_clean_cluster_shutdown(async_llm: Any) -> None:
+    parallel_config = getattr(async_llm.vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        return
+
+    # In pure internal DPLB multi-node runs, the frontend manages both local
+    # and remote EngineCore sockets. Ask every EngineCore to enter its normal
+    # shutdown path before tearing down the local client resources so remote
+    # nodes do not see rank-0 disappear out from under torch.distributed.
+    has_remote_dp_engines = (
+        parallel_config.data_parallel_size > parallel_config.data_parallel_size_local
+    )
+    if not has_remote_dp_engines:
+        return
+
+    engine_core = getattr(async_llm, "engine_core", None)
+    call_utility_async = getattr(engine_core, "call_utility_async", None)
+    if not callable(call_utility_async):
+        logger.warning(
+            "Skipping clean multi-node shutdown request because EngineCore "
+            "client does not expose call_utility_async()."
+        )
+        return
+
+    logger.info("Requesting shutdown across all managed EngineCore processes.")
+    try:
+        # Request the EngineCore busy loops to exit gracefully. Calling the
+        # shutdown() utility directly tears down the executor immediately while
+        # the loop may still execute one final dummy batch.
+        await call_utility_async("request_shutdown")
+    except Exception:
+        logger.warning(
+            "Failed to request clean multi-node shutdown before local cleanup.",
+            exc_info=True,
+        )
+
+
+async def run_frontend(args: argparse.Namespace) -> None:
+    _validate_frontend_args(args)
+    _enforce_harness_observability(args)
+    _apply_benchmark_env_defaults()
+    _apply_benchmark_arg_defaults(args)
+
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    _prepare_output_dir(output_dir)
+
+    async_llm: Any | None = None
+    recorder = RunRecorder(
+        requests_path=output_dir / "requests.jsonl",
+        progress_log_interval=args.progress_log_interval,
+        records=[],
+    )
+
+    try:
+        async_llm = AsyncLLM.from_engine_args(
+            engine_args,
+            usage_context=UsageContext.OPENAI_API_SERVER,
+        )
+        tokenizer = async_llm.renderer.tokenizer
+        if tokenizer is None:
+            raise RuntimeError("AsyncLLM did not initialize a tokenizer.")
+
+        request_id_prefix = args.request_id_prefix or f"r{args.seed}-"
+        dataset = RandomDataset(
+            random_seed=args.seed,
+            random_csv_path=args.input_csv,
+            disable_shuffle=True,
+        )
+        total_rows = len(dataset.csv_lengths or [])
+        csv_repeat = resolve_csv_repeat(
+            total_rows=total_rows,
+            warmup_requests=args.warmup_requests,
+            max_requests=args.max_requests,
+            csv_repeat=args.csv_repeat,
+        )
+        all_requests = load_length_requests(
+            csv_path=args.input_csv,
+            tokenizer=tokenizer,
+            seed=args.seed,
+            request_id_prefix=request_id_prefix,
+            csv_repeat=csv_repeat,
+        )
+        warmup_requests, measured_requests = split_warmup_and_measured_requests(
+            all_requests,
+            warmup_requests=args.warmup_requests,
+            max_requests=args.max_requests,
+        )
+        if not measured_requests:
+            raise ValueError(
+                "No measured requests remain after warmup/max-requests. "
+                "Increase --csv-repeat, reduce --warmup-requests, or reduce "
+                "--max-requests."
+            )
+
+        validate_request_lengths(measured_requests, async_llm.model_config.max_model_len)
+        validate_request_lengths(warmup_requests, async_llm.model_config.max_model_len)
+
+        connector_mode = connector_mode_from_config(args.kv_transfer_config)
+        run_meta = {
+            "model": args.model,
+            "topology": {
+                "dp_size": args.data_parallel_size,
+                "dp_size_local": args.data_parallel_size_local,
+                "tp_size": args.tensor_parallel_size,
+                "dcp_size": args.decode_context_parallel_size,
+                "ep_enabled": bool(args.enable_expert_parallel),
+            },
+            "routing_mode": args.routing_mode,
+            "dispatch_policy": "waiting_x4_plus_running",
+            "connector_mode": connector_mode,
+            "csv_path": str(Path(args.input_csv).expanduser().resolve()),
+            "csv_rows": total_rows,
+            "csv_repeat": csv_repeat,
+            "loaded_requests": len(all_requests),
+            "request_rate": args.request_rate,
+            "arrival_process": args.arrival_process,
+            "seed": args.seed,
+            "warmup_requests": len(warmup_requests),
+            "measured_requests": len(measured_requests),
+            "benchmark_start_time": datetime.now().astimezone().isoformat(),
+            "engine_args": {
+                key: value
+                for key, value in vars(args).items()
+                if key not in {"output_dir"}
+            },
+        }
+        _json_dump(output_dir / "run_meta.json", run_meta)
+
+        await _run_warmup(async_llm, warmup_requests)
+
+        arrival_deadlines_ns = build_poisson_arrival_deadlines_ns(
+            num_requests=len(measured_requests),
+            request_rate=args.request_rate,
+            seed=args.seed,
+        )
+
+        logger.info("Submitting %d measured request(s).", len(measured_requests))
+        inflight: set[asyncio.Task[None]] = set()
+        scheduling_start_ns = time.perf_counter_ns()
+        for index, request in enumerate(measured_requests):
+            deadline_ns = scheduling_start_ns + arrival_deadlines_ns[index]
+            sleep_ns = deadline_ns - time.perf_counter_ns()
+            if sleep_ns > 0:
+                await asyncio.sleep(sleep_ns / 1e9)
+            await _submit_one_request(
+                engine=async_llm,
+                request=request,
+                recorder=recorder,
+                inflight=inflight,
+            )
+
+        while inflight:
+            await asyncio.gather(*tuple(inflight))
+
+        summary = build_summary(
+            records=recorder.records,
+            connector_mode=connector_mode,
+            first_submit_ts_ns=recorder.first_submit_ts_ns,
+            last_finish_ts_ns=recorder.last_finish_ts_ns,
+        )
+        _json_dump(output_dir / "summary.json", summary)
+        _write_parquet_if_requested(
+            output_dir=output_dir,
+            records=recorder.records,
+            enabled=args.save_merged_parquet,
+        )
+    finally:
+        recorder.close()
+        if async_llm is not None:
+            await _request_clean_cluster_shutdown(async_llm)
+            async_llm.shutdown()
+
+
+def run_headless_engine(args: argparse.Namespace) -> None:
+    _enforce_harness_observability(args)
+    _apply_benchmark_env_defaults()
+    _apply_benchmark_arg_defaults(args)
+
+    from vllm.utils.network_utils import get_tcp_uri
+    from vllm.v1.engine.utils import CoreEngineProcManager
+    from vllm.v1.executor import Executor
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    usage_context = UsageContext.OPENAI_API_SERVER
+    vllm_config = engine_args.create_engine_config(
+        usage_context=usage_context,
+        headless=True,
+    )
+
+    if engine_args.data_parallel_hybrid_lb:
+        raise ValueError("data_parallel_hybrid_lb is not applicable in headless mode")
+
+    parallel_config = vllm_config.parallel_config
+    local_engine_count = parallel_config.data_parallel_size_local
+    if local_engine_count <= 0:
+        raise ValueError("data_parallel_size_local must be > 0 in headless mode")
+
+    shutdown_requested = False
+
+    def signal_handler(signum, frame) -> None:  # type: ignore[override]
+        nonlocal shutdown_requested
+        logger.debug("Received %d signal.", signum)
+        if not shutdown_requested:
+            shutdown_requested = True
+            raise SystemExit
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    if parallel_config.node_rank_within_dp > 0:
+        executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+        executor.start_worker_monitor(inline=True)
+        return
+
+    host = parallel_config.data_parallel_master_ip
+    port = parallel_config.data_parallel_rpc_port
+    handshake_address = get_tcp_uri(host, port)
+
+    logger.info(
+        "Launching %d data parallel engine(s) in headless mode, with head node "
+        "address %s.",
+        local_engine_count,
+        handshake_address,
+    )
+
+    engine_manager = CoreEngineProcManager(
+        local_engine_count=local_engine_count,
+        start_index=vllm_config.parallel_config.data_parallel_rank,
+        local_start_index=0,
+        vllm_config=vllm_config,
+        local_client=False,
+        handshake_address=handshake_address,
+        executor_class=Executor.get_class(vllm_config),
+        log_stats=True,
+    )
+
+    try:
+        engine_manager.join_first()
+    finally:
+        timeout = None
+        if shutdown_requested:
+            timeout = vllm_config.shutdown_timeout
+            logger.info("Waiting up to %d seconds for processes to exit", timeout)
+        engine_manager.shutdown(timeout=timeout)
+
+
+def build_parser() -> FlexibleArgumentParser:
+    parser = FlexibleArgumentParser(
+        description="Offline Poisson benchmark harness using AsyncLLM directly.",
+    )
+    subparsers = parser.add_subparsers(dest="role", required=True)
+
+    frontend = subparsers.add_parser(
+        "frontend",
+        help="Run the benchmark frontend and local engine(s).",
+    )
+    frontend.add_argument("--input-csv", required=True, help="Input CSV path.")
+    frontend.add_argument(
+        "--csv-repeat",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Repeat the input CSV this many times before applying "
+            "--warmup-requests and --max-requests. Defaults to the minimum "
+            "repeat count needed to satisfy warmup + max-requests when "
+            "--max-requests is set; otherwise defaults to 1."
+        ),
+    )
+    frontend.add_argument(
+        "--csv-format",
+        default="length_csv",
+        choices=["length_csv", "prompt_csv"],
+        help="Input CSV format.",
+    )
+    frontend.add_argument(
+        "--arrival-process",
+        default="poisson",
+        choices=["poisson"],
+        help="Arrival process for request submission.",
+    )
+    frontend.add_argument(
+        "--request-rate",
+        type=_positive_float_or_inf,
+        required=True,
+        help="Total request rate in requests/sec. Use inf for no delay.",
+    )
+    frontend.add_argument(
+        "--max-requests",
+        type=_non_negative_int,
+        default=None,
+        help="Cap the number of measured requests.",
+    )
+    frontend.add_argument(
+        "--warmup-requests",
+        type=_non_negative_int,
+        default=0,
+        help="Number of warmup requests to run before measurement.",
+    )
+    frontend.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory for run_meta.json, requests.jsonl and summary.json.",
+    )
+    frontend.add_argument(
+        "--save-merged-parquet",
+        action="store_true",
+        help="Also export merged_requests.parquet.",
+    )
+    frontend.add_argument(
+        "--request-id-prefix",
+        default=None,
+        help="Request id prefix. Default: r<seed>-",
+    )
+    frontend.add_argument(
+        "--routing-mode",
+        default="internal_dplb",
+        choices=["internal_dplb", "explicit_rank_replay"],
+        help="Dispatch mode. Only internal_dplb is implemented.",
+    )
+    frontend.add_argument(
+        "--progress-log-interval",
+        type=_non_negative_int,
+        default=100,
+        help="Log progress every N measured completions. Use 0 to disable.",
+    )
+    AsyncEngineArgs.add_cli_args(frontend)
+    frontend.set_defaults(
+        enable_expert_parallel=True,
+        all2all_backend="deepep_low_latency",
+        attention_backend="FLASHMLA",
+        kv_transfer_config=DEFAULT_KV_TRANSFER_CONFIG.copy(),
+        load_format="dummy",
+        compilation_config=DEFAULT_COMPILATION_CONFIG.copy(),
+        enable_prefix_caching=False,
+    )
+
+    headless = subparsers.add_parser(
+        "headless-engine",
+        help="Run engine-core processes only for remote multi-node DP.",
+    )
+    AsyncEngineArgs.add_cli_args(headless)
+    headless.set_defaults(
+        enable_expert_parallel=True,
+        all2all_backend="deepep_low_latency",
+        attention_backend="FLASHMLA",
+        kv_transfer_config=DEFAULT_KV_TRANSFER_CONFIG.copy(),
+        load_format="dummy",
+        compilation_config=DEFAULT_COMPILATION_CONFIG.copy(),
+        enable_prefix_caching=False,
+    )
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.role == "frontend":
+        uvloop.run(run_frontend(args))
+    elif args.role == "headless-engine":
+        run_headless_engine(args)
+    else:
+        raise ValueError(f"Unknown role: {args.role}")
+
+
+if __name__ == "__main__":
+    main()
