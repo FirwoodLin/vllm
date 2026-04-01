@@ -206,6 +206,10 @@ cython_debug/
 # Python pickle files
 *.pkl
 
+# Local benchmark outputs
+offline_bench/
+offline_bench_nofill/
+
 # Sphinx documentation
 _build/
 
