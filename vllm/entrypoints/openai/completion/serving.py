@@ -289,11 +289,18 @@ class OpenAIServingCompletion(OpenAIServing):
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
+        include_queue_time = bool(
+            stream_options is not None and stream_options.include_queue_time
+        )
+        queue_time_ms: float | None = None
 
         try:
             async for prompt_idx, res in result_generator:
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
+
+                if queue_time_ms is None and num_prompts == 1:
+                    queue_time_ms = self.get_queue_time_ms(res)
 
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
@@ -411,6 +418,8 @@ class OpenAIServingCompletion(OpenAIServing):
                             completion_tokens=completion_tokens,
                             total_tokens=prompt_tokens + completion_tokens,
                         )
+                        if include_queue_time and queue_time_ms is not None:
+                            chunk.usage.queue_time_ms = queue_time_ms
 
                     response_json = chunk.model_dump_json(exclude_unset=False)
                     yield f"data: {response_json}\n\n"
@@ -429,6 +438,8 @@ class OpenAIServingCompletion(OpenAIServing):
                 )
 
             if include_usage:
+                if include_queue_time and queue_time_ms is not None:
+                    final_usage_info.queue_time_ms = queue_time_ms
                 final_usage_chunk = CompletionStreamResponse(
                     id=request_id,
                     created=created_time,

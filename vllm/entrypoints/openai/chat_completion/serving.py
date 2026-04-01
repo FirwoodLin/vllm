@@ -584,9 +584,16 @@ class OpenAIServingChat(OpenAIServing):
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
+        include_queue_time = bool(
+            stream_options is not None and stream_options.include_queue_time
+        )
+        queue_time_ms: float | None = None
 
         try:
             async for res in result_generator:
+                if queue_time_ms is None:
+                    queue_time_ms = self.get_queue_time_ms(res)
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -635,6 +642,8 @@ class OpenAIServingChat(OpenAIServing):
                                 completion_tokens=0,
                                 total_tokens=num_prompt_tokens,
                             )
+                            if include_queue_time and queue_time_ms is not None:
+                                chunk.usage.queue_time_ms = queue_time_ms
 
                         data = chunk.model_dump_json(exclude_unset=True)
                         yield f"data: {data}\n\n"
@@ -671,6 +680,8 @@ class OpenAIServingChat(OpenAIServing):
                                         completion_tokens=0,
                                         total_tokens=num_prompt_tokens,
                                     )
+                                    if include_queue_time and queue_time_ms is not None:
+                                        chunk.usage.queue_time_ms = queue_time_ms
 
                                 data = chunk.model_dump_json(exclude_unset=True)
                                 yield f"data: {data}\n\n"
@@ -1202,6 +1213,8 @@ class OpenAIServingChat(OpenAIServing):
                             completion_tokens=completion_tokens,
                             total_tokens=num_prompt_tokens + completion_tokens,
                         )
+                        if include_queue_time and queue_time_ms is not None:
+                            chunk.usage.queue_time_ms = queue_time_ms
 
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
@@ -1215,6 +1228,8 @@ class OpenAIServingChat(OpenAIServing):
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
                 )
+                if include_queue_time and queue_time_ms is not None:
+                    final_usage.queue_time_ms = queue_time_ms
                 if self.enable_prompt_tokens_details and num_cached_tokens:
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
                         cached_tokens=num_cached_tokens

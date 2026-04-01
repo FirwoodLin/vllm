@@ -217,6 +217,15 @@ class OpenAIServing:
         self.io_processor = engine_client.io_processor
         self.input_processor = engine_client.input_processor
 
+    @staticmethod
+    def get_queue_time_ms(output: RequestOutput) -> float | None:
+        metrics = output.metrics
+        if metrics is None:
+            return None
+        if metrics.queued_ts == 0.0 or metrics.scheduled_ts == 0.0:
+            return None
+        return max(0.0, (metrics.scheduled_ts - metrics.queued_ts) * 1000.0)
+
     async def beam_search(
         self,
         prompt: ProcessorInputs,

@@ -61,6 +61,7 @@ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) a
     shutil.which("gnuplot") is not None
 )
 RANDOM_CSV_SUPPORTED_BACKENDS = {"vllm", "openai"}
+DEFAULT_ROUTING_PROMPT_LEN_THRESHOLD = 100000
 
 
 async def get_first_model_from_server(
@@ -101,6 +102,25 @@ class SpecDecodeMetrics:
     num_draft_tokens: int
     num_accepted_tokens: int
     accepted_per_pos: dict[int, int]
+
+
+@dataclass(frozen=True)
+class RouteTarget:
+    base_url: str
+    api_url: str
+
+
+@dataclass(frozen=True)
+class PromptLenRoutingConfig:
+    threshold_prompt_len: int
+    short: RouteTarget
+    long: RouteTarget
+
+    def route_for_prompt_len(self, prompt_len: int) -> Literal["short", "long"]:
+        return "short" if prompt_len < self.threshold_prompt_len else "long"
+
+    def target_for_route(self, route_name: Literal["short", "long"]) -> RouteTarget:
+        return self.short if route_name == "short" else self.long
 
 
 async def fetch_spec_decode_metrics(
@@ -197,6 +217,155 @@ def _validate_random_csv_args(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_prompt_len_routing_args(args: argparse.Namespace) -> None:
+    routing_threshold = getattr(args, "routing_prompt_len_threshold", None)
+    routing_base_url_short = getattr(args, "routing_base_url_short", None)
+    routing_base_url_long = getattr(args, "routing_base_url_long", None)
+
+    if (
+        routing_threshold is None
+        and routing_base_url_short is None
+        and routing_base_url_long is None
+    ):
+        return
+
+    if routing_base_url_short is None or routing_base_url_long is None:
+        raise ValueError(
+            "Prompt-length routing requires both --routing-base-url-short "
+            "and --routing-base-url-long."
+        )
+
+    if routing_threshold is not None and routing_threshold < 0:
+        raise ValueError(
+            "--routing-prompt-len-threshold must be greater than or equal to 0."
+        )
+
+    if args.dataset_name != "random":
+        raise ValueError(
+            "Prompt-length routing is only supported with "
+            "--dataset-name random."
+        )
+
+    if args.random_csv_path is None:
+        raise ValueError(
+            "Prompt-length routing requires --random-csv-path so requests can "
+            "be routed by prompt_len."
+        )
+
+    if args.skip_tokenizer_init:
+        raise ValueError(
+            "Prompt-length routing requires tokenizer initialization."
+        )
+
+    endpoint = args.endpoint.rstrip("/")
+    if args.backend == "openai-chat" or endpoint.endswith("/chat/completions"):
+        raise ValueError(
+            "Prompt-length routing is not supported by chat completion "
+            "backends. Use --backend openai or --backend vllm with a "
+            "completion endpoint such as /v1/completions."
+        )
+
+    if args.backend not in RANDOM_CSV_SUPPORTED_BACKENDS:
+        raise ValueError(
+            "Prompt-length routing only supports completion backends: "
+            f"{sorted(RANDOM_CSV_SUPPORTED_BACKENDS)}."
+        )
+
+    if not endpoint.endswith("/completions"):
+        raise ValueError(
+            "Prompt-length routing requires a completion endpoint such as "
+            "/v1/completions."
+        )
+
+    if args.model is None:
+        raise ValueError(
+            "Prompt-length routing requires an explicit --model because "
+            "automatic model discovery only supports a single base URL."
+        )
+
+
+def _maybe_get_prompt_len_routing_config(
+    args: argparse.Namespace,
+) -> PromptLenRoutingConfig | None:
+    routing_base_url_short = getattr(args, "routing_base_url_short", None)
+    routing_base_url_long = getattr(args, "routing_base_url_long", None)
+
+    if routing_base_url_short is None and routing_base_url_long is None:
+        return None
+
+    routing_threshold = getattr(args, "routing_prompt_len_threshold", None)
+    if routing_threshold is None:
+        routing_threshold = DEFAULT_ROUTING_PROMPT_LEN_THRESHOLD
+
+    return PromptLenRoutingConfig(
+        threshold_prompt_len=routing_threshold,
+        short=RouteTarget(
+            base_url=routing_base_url_short,
+            api_url=f"{routing_base_url_short}{args.endpoint}",
+        ),
+        long=RouteTarget(
+            base_url=routing_base_url_long,
+            api_url=f"{routing_base_url_long}{args.endpoint}",
+        ),
+    )
+
+
+def _combine_spec_decode_metrics(
+    metrics: Iterable[SpecDecodeMetrics],
+) -> SpecDecodeMetrics:
+    accepted_per_pos: dict[int, int] = {}
+    num_drafts = 0
+    num_draft_tokens = 0
+    num_accepted_tokens = 0
+
+    for route_metrics in metrics:
+        num_drafts += route_metrics.num_drafts
+        num_draft_tokens += route_metrics.num_draft_tokens
+        num_accepted_tokens += route_metrics.num_accepted_tokens
+        for pos, value in route_metrics.accepted_per_pos.items():
+            accepted_per_pos[pos] = accepted_per_pos.get(pos, 0) + value
+
+    return SpecDecodeMetrics(
+        num_drafts=num_drafts,
+        num_draft_tokens=num_draft_tokens,
+        num_accepted_tokens=num_accepted_tokens,
+        accepted_per_pos=accepted_per_pos,
+    )
+
+
+async def _fetch_combined_spec_decode_metrics(
+    route_targets: dict[str, RouteTarget],
+    session: aiohttp.ClientSession,
+) -> SpecDecodeMetrics | None:
+    metrics_results = await asyncio.gather(
+        *(
+            fetch_spec_decode_metrics(route_target.base_url, session)
+            for route_target in route_targets.values()
+        )
+    )
+    available_metrics: list[SpecDecodeMetrics] = []
+    missing_routes: list[str] = []
+    for route_name, route_metrics in zip(route_targets, metrics_results):
+        if route_metrics is None:
+            missing_routes.append(route_name)
+        else:
+            available_metrics.append(route_metrics)
+
+    if not available_metrics:
+        return None
+
+    if missing_routes:
+        missing_routes_str = ", ".join(missing_routes)
+        print(
+            "WARNING: Skipping speculative decoding stats because metrics "
+            "were unavailable for active routes: "
+            f"{missing_routes_str}"
+        )
+        return None
+
+    return _combine_spec_decode_metrics(available_metrics)
+
+
 class TaskType(Enum):
     GENERATION = "generation"
     POOLING = "pooling"
@@ -231,6 +400,10 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
+    mean_queue_time_ms: float
+    median_queue_time_ms: float
+    std_queue_time_ms: float
+    percentiles_queue_time_ms: list[tuple[float, float]]
     # Max output tokens per second and concurrent requests at that peak
     max_output_tokens_per_s: float
     max_concurrent_requests: int
@@ -454,6 +627,7 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
+    queue_times: list[float] = []
     input_audio_duration = 0.0
     for i in range(len(outputs)):
         if outputs[i].success:
@@ -485,6 +659,8 @@ def calculate_metrics(
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
+            if outputs[i].queue_time is not None:
+                queue_times.append(outputs[i].queue_time)
             input_audio_duration += outputs[i].input_audio_duration
             completed += 1
         else:
@@ -628,6 +804,13 @@ def calculate_metrics(
         percentiles_e2el_ms=[
             (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
         ],
+        mean_queue_time_ms=np.mean(queue_times or 0) * 1000,
+        std_queue_time_ms=np.std(queue_times or 0) * 1000,
+        median_queue_time_ms=np.median(queue_times or 0) * 1000,
+        percentiles_queue_time_ms=[
+            (p, np.percentile(queue_times or 0, p) * 1000)
+            for p in selected_percentiles
+        ],
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
         rtfx=input_audio_duration / dur_s,
@@ -664,15 +847,74 @@ async def benchmark(
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
+    routing_config: PromptLenRoutingConfig | None = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
     except KeyError:
         raise ValueError(f"Unknown backend: {endpoint_type}") from None
 
+    runtime_targets: dict[str, RouteTarget]
+    route_test_requests: dict[str, SampleRequest]
+    request_routes: list[Literal["short", "long"]] | None = None
+    routing_request_counts: dict[Literal["short", "long"], int] | None = None
+    collect_queue_time = endpoint_type == "vllm"
+    if routing_config is None:
+        runtime_targets = {"default": RouteTarget(base_url=base_url, api_url=api_url)}
+        route_test_requests = {"default": input_requests[0]}
+    else:
+        request_routes = []
+        routing_request_counts = {"short": 0, "long": 0}
+        route_test_requests = {}
+        for request in input_requests:
+            route_name = routing_config.route_for_prompt_len(request.prompt_len)
+            request_routes.append(route_name)
+            routing_request_counts[route_name] += 1
+            route_test_requests.setdefault(route_name, request)
+        runtime_targets = {
+            route_name: routing_config.target_for_route(route_name)
+            for route_name, count in routing_request_counts.items()
+            if count > 0
+        }
+
+    def build_request_input(
+        sample_request: SampleRequest,
+        *,
+        target_api_url: str,
+        request_model_id: str = model_id,
+        request_model_name: str | None = model_name,
+    ) -> RequestFuncInput:
+        mm_content = sample_request.multi_modal_data
+        assert (
+            mm_content is None
+            or isinstance(mm_content, dict)
+            or (
+                isinstance(mm_content, list)
+                and all(isinstance(item, dict) for item in mm_content)
+            )
+        ), "multi_modal_data must be a dict or list[dict]"
+        return RequestFuncInput(
+            model=request_model_id,
+            model_name=request_model_name,
+            prompt=sample_request.prompt,
+            api_url=target_api_url,
+            prompt_len=sample_request.prompt_len,
+            output_len=sample_request.expected_output_len,
+            logprobs=logprobs,
+            multi_modal_content=mm_content,
+            ignore_eos=ignore_eos,
+            extra_headers=extra_headers,
+            extra_body=extra_body,
+            request_id=sample_request.request_id,
+            collect_queue_time=collect_queue_time,
+        )
+
     # Reuses connections across requests to reduce TLS handshake overhead.
     # Use ssl_context if provided, otherwise default to True for https URLs
-    ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
+    ssl_setting = ssl_context if ssl_context is not None else any(
+        route_target.api_url.startswith("https://")
+        for route_target in runtime_targets.values()
+    )
     connector = aiohttp.TCPConnector(
         limit=max_concurrency or 0,
         limit_per_host=max_concurrency or 0,
@@ -690,57 +932,54 @@ async def benchmark(
         timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
     )
 
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len, test_mm_content = (
-        input_requests[0].prompt,
-        input_requests[0].prompt_len,
-        input_requests[0].expected_output_len,
-        input_requests[0].multi_modal_data,
-    )
-
-    assert (
-        test_mm_content is None
-        or isinstance(test_mm_content, dict)
-        or (
-            isinstance(test_mm_content, list)
-            and all(isinstance(item, dict) for item in test_mm_content)
+    route_test_inputs = {
+        route_name: build_request_input(
+            route_test_requests[route_name],
+            target_api_url=route_target.api_url,
         )
-    ), "multi_modal_data must be a dict or list[dict]"
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-        extra_headers=extra_headers,
-        extra_body=extra_body,
-    )
+        for route_name, route_target in runtime_targets.items()
+    }
+
+    if len(route_test_inputs) == 1:
+        print("Starting initial single prompt test run...")
+    else:
+        print("Starting initial prompt test runs for active routes...")
 
     if ready_check_timeout_sec > 0:
-        test_output = await wait_for_endpoint(
-            request_func,
-            test_input,
-            session,
-            timeout_seconds=ready_check_timeout_sec,
-        )
-        if not test_output.success:
-            raise ValueError(
-                "Initial test run failed - Please make sure benchmark "
-                "arguments are correctly specified. "
-                f"Error: {test_output.error}"
+        for route_name, test_input in route_test_inputs.items():
+            if route_name != "default":
+                print(
+                    "Running ready check for "
+                    f"{route_name} route: {test_input.api_url}"
+                )
+            test_output = await wait_for_endpoint(
+                request_func,
+                test_input,
+                session,
+                timeout_seconds=ready_check_timeout_sec,
             )
-        else:
-            print("Initial test run completed.")
+            if not test_output.success:
+                route_msg = "" if route_name == "default" else f" for {route_name} route"
+                raise ValueError(
+                    "Initial test run failed"
+                    f"{route_msg} - Please make sure benchmark arguments are "
+                    f"correctly specified. Error: {test_output.error}"
+                )
+        print("Initial test run completed.")
     else:
         print("Skipping endpoint ready check.")
 
     if num_warmups > 0:
-        print(f"Warming up with {num_warmups} requests...")
-        warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
+        total_warmups = num_warmups * len(route_test_inputs)
+        if len(route_test_inputs) == 1:
+            print(f"Warming up with {num_warmups} requests...")
+        else:
+            print(
+                "Warming up with "
+                f"{num_warmups} requests per active route "
+                f"({total_warmups} total)..."
+            )
+        warmup_pbar = None if disable_tqdm else tqdm(total=total_warmups)
         warmup_semaphore = (
             asyncio.Semaphore(max_concurrency)
             if max_concurrency
@@ -748,15 +987,20 @@ async def benchmark(
         )
         warmup_tasks = []
 
-        async def warmup_limited_request_func():
+        async def warmup_limited_request_func(warmup_input: RequestFuncInput):
             async with warmup_semaphore:
                 return await request_func(
-                    request_func_input=test_input, session=session, pbar=warmup_pbar
+                    request_func_input=warmup_input,
+                    session=session,
+                    pbar=warmup_pbar,
                 )
 
-        for _ in range(num_warmups):
-            request_task = asyncio.create_task(warmup_limited_request_func())
-            warmup_tasks.append(request_task)
+        for warmup_input in route_test_inputs.values():
+            for _ in range(num_warmups):
+                request_task = asyncio.create_task(
+                    warmup_limited_request_func(warmup_input)
+                )
+                warmup_tasks.append(request_task)
         _ = await asyncio.gather(*warmup_tasks)
 
         if warmup_pbar is not None:
@@ -773,24 +1017,26 @@ async def benchmark(
 
     if profile:
         print("Starting profiler...")
-        profile_input = RequestFuncInput(
-            model=model_id,
-            model_name=model_name,
-            prompt=test_prompt,
-            api_url=base_url + "/start_profile",
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
-            multi_modal_content=test_mm_content,
-            ignore_eos=ignore_eos,
-            extra_headers=extra_headers,
-            extra_body=extra_body,
-        )
-        profile_output = await request_func(
-            request_func_input=profile_input, session=session
-        )
-        if profile_output.success:
-            print("Profiler started")
+        for route_name, test_request in route_test_requests.items():
+            route_target = runtime_targets[route_name]
+            profile_input = build_request_input(
+                test_request,
+                target_api_url=route_target.base_url + "/start_profile",
+            )
+            profile_output = await request_func(
+                request_func_input=profile_input, session=session
+            )
+            if profile_output.success:
+                if route_name == "default":
+                    print("Profiler started")
+                else:
+                    print(f"Profiler started for {route_name} route")
+            else:
+                route_desc = "benchmark target" if route_name == "default" else route_name
+                print(
+                    "WARNING: Failed to start profiler for "
+                    f"{route_desc} route: {profile_output.error}"
+                )
 
     distribution = "Poisson process" if burstiness == 1.0 else "Gamma distribution"
 
@@ -806,7 +1052,9 @@ async def benchmark(
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
-    spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
+    spec_decode_metrics_before = await _fetch_combined_spec_decode_metrics(
+        runtime_targets, session
+    )
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -836,6 +1084,7 @@ async def benchmark(
             }
         )
 
+    request_index = 0
     async for request, current_request_rate in get_request(
         input_requests,
         request_rate,
@@ -851,31 +1100,20 @@ async def benchmark(
                 for rps_val in range(last_int_rps + 1, current_int_rps + 1):
                     rps_change_events.append({"rps": rps_val, "timestamp": timestamp})
                 last_int_rps = current_int_rps
-        prompt, prompt_len, output_len, mm_content, request_id = (
-            request.prompt,
-            request.prompt_len,
-            request.expected_output_len,
-            request.multi_modal_data,
-            request.request_id,
-        )
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
-        request_func_input = RequestFuncInput(
-            model=req_model_id,
-            model_name=req_model_name,
-            prompt=prompt,
-            api_url=api_url,
-            prompt_len=prompt_len,
-            output_len=output_len,
-            logprobs=logprobs,
-            multi_modal_content=mm_content,
-            ignore_eos=ignore_eos,
-            extra_headers=extra_headers,
-            extra_body=extra_body,
-            request_id=request_id,
+        target_api_url = api_url
+        if request_routes is not None:
+            target_api_url = runtime_targets[request_routes[request_index]].api_url
+
+        request_func_input = build_request_input(
+            request,
+            target_api_url=target_api_url,
+            request_model_id=req_model_id,
+            request_model_name=req_model_name,
         )
         tasks.append(
             asyncio.create_task(
@@ -884,6 +1122,7 @@ async def benchmark(
                 )
             )
         )
+        request_index += 1
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if pbar is not None:
@@ -891,7 +1130,9 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    spec_decode_metrics_after = await fetch_spec_decode_metrics(base_url, session)
+    spec_decode_metrics_after = await _fetch_combined_spec_decode_metrics(
+        runtime_targets, session
+    )
     spec_decode_stats: dict[str, Any] | None = None
     if spec_decode_metrics_before is not None and spec_decode_metrics_after is not None:
         delta_drafts = (
@@ -1018,6 +1259,10 @@ async def benchmark(
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],
+            "queue_times_ms": [
+                output.queue_time * 1000 if output.queue_time is not None else None
+                for output in outputs
+            ],
             "start_times": [output.start_time for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
@@ -1038,6 +1283,14 @@ async def benchmark(
 
     if rps_change_events:
         result["rps_change_events"] = rps_change_events
+
+    if routing_config is not None and routing_request_counts is not None:
+        result["routing_enabled"] = True
+        result["routing_threshold_prompt_len"] = routing_config.threshold_prompt_len
+        result["routing_base_url_short"] = routing_config.short.base_url
+        result["routing_base_url_long"] = routing_config.long.base_url
+        result["routing_request_counts"] = routing_request_counts
+        result["request_routes"] = request_routes
 
     if spec_decode_stats is not None:
         result["spec_decode_acceptance_rate"] = spec_decode_stats["acceptance_rate"]
@@ -1090,10 +1343,18 @@ async def benchmark(
             print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
             result[f"p{p_word}_{metric_attribute_name}_ms"] = value
 
+    has_queue_time_metrics = any(output.queue_time is not None for output in outputs)
+
     if task_type == TaskType.GENERATION and tokenizer:
         process_one_metric("ttft", "TTFT", "Time to First Token")
         process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
         process_one_metric("itl", "ITL", "Inter-token Latency")
+        if has_queue_time_metrics:
+            process_one_metric(
+                "queue_time",
+                "Queue Time",
+                "Time Waiting for First Scheduling",
+            )
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
 
     if spec_decode_stats is not None:
@@ -1129,19 +1390,26 @@ async def benchmark(
 
     if profile:
         print("Stopping profiler...")
-        profile_input = RequestFuncInput(
-            model=model_id,
-            prompt=test_prompt,
-            api_url=base_url + "/stop_profile",
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
-        )
-        profile_output = await request_func(
-            request_func_input=profile_input, session=session
-        )
-        if profile_output.success:
-            print("Profiler stopped")
+        for route_name, test_request in route_test_requests.items():
+            route_target = runtime_targets[route_name]
+            profile_input = build_request_input(
+                test_request,
+                target_api_url=route_target.base_url + "/stop_profile",
+            )
+            profile_output = await request_func(
+                request_func_input=profile_input, session=session
+            )
+            if profile_output.success:
+                if route_name == "default":
+                    print("Profiler stopped")
+                else:
+                    print(f"Profiler stopped for {route_name} route")
+            else:
+                route_desc = "benchmark target" if route_name == "default" else route_name
+                print(
+                    "WARNING: Failed to stop profiler for "
+                    f"{route_desc} route: {profile_output.error}"
+                )
 
     await session.close()
     return result
@@ -1193,6 +1461,10 @@ def save_to_pytorch_benchmark_format(
         "mean_ttft_ms",
         "std_ttft_ms",
         "p99_ttft_ms",
+        "median_queue_time_ms",
+        "mean_queue_time_ms",
+        "std_queue_time_ms",
+        "p99_queue_time_ms",
         "mean_tpot_ms",
         "median_tpot_ms",
         "std_tpot_ms",
@@ -1204,7 +1476,14 @@ def save_to_pytorch_benchmark_format(
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
+    ignored_metrics = [
+        "ttfts",
+        "itls",
+        "queue_times_ms",
+        "generated_texts",
+        "errors",
+        "request_routes",
+    ]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]] for k in metrics if k in results},
@@ -1284,6 +1563,30 @@ def add_cli_args(parser: argparse.ArgumentParser):
         type=str,
         default=None,
         help="Server or API base url if not using http host and port.",
+    )
+    parser.add_argument(
+        "--routing-prompt-len-threshold",
+        type=int,
+        default=None,
+        help="Prompt length threshold used for dual-URL routing. Requests with "
+        "prompt_len below the threshold are sent to "
+        "--routing-base-url-short and requests with prompt_len at or above "
+        "the threshold are sent to --routing-base-url-long. Defaults to "
+        f"{DEFAULT_ROUTING_PROMPT_LEN_THRESHOLD} when routing is enabled.",
+    )
+    parser.add_argument(
+        "--routing-base-url-short",
+        type=str,
+        default=None,
+        help="Base URL for requests whose prompt_len is below "
+        "--routing-prompt-len-threshold.",
+    )
+    parser.add_argument(
+        "--routing-base-url-long",
+        type=str,
+        default=None,
+        help="Base URL for requests whose prompt_len is greater than or equal "
+        "to --routing-prompt-len-threshold.",
     )
     # Use 127.0.0.1 here instead of localhost to force the use of ipv4
     parser.add_argument("--host", type=str, default="127.0.0.1")
@@ -1468,7 +1771,7 @@ def add_cli_args(parser: argparse.ArgumentParser):
         default=None,
         help="Comma-separated list of selected metrics to report percentiles. "
         "This argument specifies the metrics to report percentiles. "
-        'Allowed metric names are "ttft", "tpot", "itl", "e2el". '
+        'Allowed metric names are "ttft", "tpot", "itl", "queue_time", "e2el". '
         'If not specified, defaults to "ttft,tpot,itl" for generative models '
         'and "e2el" for pooling models.',
     )
@@ -1686,6 +1989,10 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         api_url = f"http://{host_port}{args.endpoint}"
         base_url = f"http://{host_port}"
 
+    _validate_random_csv_args(args)
+    _validate_prompt_len_routing_args(args)
+    routing_config = _maybe_get_prompt_len_routing_config(args)
+
     # Headers
     headers = None
     if args.header:
@@ -1702,6 +2009,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     if args.insecure:
         # Disable SSL certificate verification
         ssl_context = False
+    elif routing_config is not None and (
+        routing_config.short.base_url.startswith("https://")
+        or routing_config.long.base_url.startswith("https://")
+    ):
+        ssl_context = True
     elif "https://" in base_url:
         # Use default SSL context for HTTPS
         ssl_context = True
@@ -1749,8 +2061,6 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         args.hf_output_len = args.output_len
         args.spec_bench_output_len = args.output_len
         args.prefix_repetition_output_len = args.output_len
-
-    _validate_random_csv_args(args)
 
     # when using random datasets, default to ignoring EOS
     # so generation runs to the requested length
@@ -1838,6 +2148,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
         ssl_context=ssl_context,
+        routing_config=routing_config,
     )
 
     # Save config and results to json
@@ -1967,8 +2278,10 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "start_times",
             "ttfts",
             "itls",
+            "queue_times_ms",
             "generated_texts",
             "errors",
+            "request_routes",
         ]:
             if field in result_json:
                 del result_json[field]

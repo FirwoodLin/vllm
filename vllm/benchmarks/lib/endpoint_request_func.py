@@ -84,6 +84,7 @@ class RequestFuncInput:
     ignore_eos: bool = False
     language: str | None = None
     request_id: str | None = None
+    collect_queue_time: bool = False
 
 
 @dataclass
@@ -101,6 +102,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     input_audio_duration: float = 0.0  # in seconds
+    queue_time: float | None = None  # in seconds
 
 
 class RequestFunc(Protocol):
@@ -133,7 +135,21 @@ def _update_payload_common(
     if request_func_input.ignore_eos:
         payload["ignore_eos"] = request_func_input.ignore_eos
     if request_func_input.extra_body:
-        payload.update(request_func_input.extra_body)
+        extra_body = dict(request_func_input.extra_body)
+        has_stream_options = "stream_options" in extra_body
+        stream_options = extra_body.pop("stream_options", None)
+        payload.update(extra_body)
+
+        if has_stream_options:
+            if stream_options is None:
+                payload["stream_options"] = None
+            elif payload.get("stream_options") is None:
+                payload["stream_options"] = dict(stream_options)
+            else:
+                payload["stream_options"] = {
+                    **payload["stream_options"],
+                    **stream_options,
+                }
 
 
 def _update_headers_common(
@@ -186,6 +202,8 @@ async def async_request_openai_completions(
             "include_usage": True,
         },
     }
+    if request_func_input.collect_queue_time:
+        payload["stream_options"]["include_queue_time"] = True
     _update_payload_common(payload, request_func_input)
 
     headers = _get_headers()
@@ -244,6 +262,9 @@ async def async_request_openai_completions(
                                 generated_text += text or ""
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                queue_time_ms = usage.get("queue_time_ms")
+                                if queue_time_ms is not None:
+                                    output.queue_time = queue_time_ms / 1000.0
                 if first_chunk_received:
                     output.success = True
                 else:
@@ -315,6 +336,8 @@ async def async_request_openai_chat_completions(
             "include_usage": True,
         },
     }
+    if request_func_input.collect_queue_time:
+        payload["stream_options"]["include_queue_time"] = True
     _update_payload_common(payload, request_func_input)
 
     headers = _get_headers("application/json")
@@ -365,6 +388,9 @@ async def async_request_openai_chat_completions(
                                 generated_text += content or ""
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                queue_time_ms = usage.get("queue_time_ms")
+                                if queue_time_ms is not None:
+                                    output.queue_time = queue_time_ms / 1000.0
 
                             most_recent_timestamp = timestamp
 

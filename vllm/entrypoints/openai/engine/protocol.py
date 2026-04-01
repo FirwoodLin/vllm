@@ -106,6 +106,7 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
+    queue_time_ms: float | None = None
 
 
 class RequestResponseMetadata(BaseModel):
@@ -160,6 +161,7 @@ AnyResponseFormat: TypeAlias = (
 class StreamOptions(OpenAIBaseModel):
     include_usage: bool | None = False
     continuous_usage_stats: bool | None = False
+    include_queue_time: bool | None = False
 
 
 class FunctionDefinition(OpenAIBaseModel):

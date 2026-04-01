@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+import http.server
+import socket
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +22,88 @@ def write_random_csv(csv_path: Path, rows: list[tuple[int, int]]) -> None:
     csv_lines = ["prompt_len,output_len"]
     csv_lines.extend(f"{prompt_len},{output_len}" for prompt_len, output_len in rows)
     csv_path.write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+
+
+def _find_free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class RecordingCompletionServer:
+    def __init__(self, address: str = "127.0.0.1") -> None:
+        self.address = address
+        self.port = -1
+        self.prompt_lens: list[int] = []
+        self._lock = threading.Lock()
+        self.server: http.server.ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+
+    def __enter__(self):
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args, **kwargs):
+                pass
+
+            def do_GET(self):
+                if self.path != "/v1/models":
+                    self.send_error(404)
+                    return
+
+                body = json.dumps(
+                    {"data": [{"id": MODEL_NAME, "root": MODEL_NAME}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                if self.path != "/v1/completions":
+                    self.send_error(404)
+                    return
+
+                content_length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(content_length) or b"{}")
+                prompt = payload.get("prompt", [])
+                prompt_len = len(prompt) if isinstance(prompt, list) else 0
+                with outer._lock:
+                    outer.prompt_lens.append(prompt_len)
+
+                max_tokens = int(payload.get("max_tokens", 1))
+                body = (
+                    'data: {"choices":[{"text":"x"}]}\n\n'
+                    + "data: "
+                    + json.dumps({"usage": {"completion_tokens": max_tokens}})
+                    + "\n\n"
+                    + "data: [DONE]\n\n"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.port = _find_free_port()
+        self.server = http.server.ThreadingHTTPServer(
+            (self.address, self.port), Handler
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.server is not None:
+            self.server.shutdown()
+            self.server.server_close()
+        if self.thread is not None:
+            self.thread.join()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.address}:{self.port}"
 
 
 def generate_self_signed_cert(cert_dir: Path) -> tuple[Path, Path]:
@@ -251,6 +336,57 @@ def test_bench_serve_random_csv_chat_backend_fails(server, tmp_path: Path):
 
     assert result.returncode != 0
     assert "random-csv-path" in (result.stdout + result.stderr)
+
+
+@pytest.mark.benchmark
+def test_bench_serve_random_csv_prompt_len_routing(tmp_path: Path):
+    csv_path = tmp_path / "random_lengths.csv"
+    result_path = tmp_path / "serve-routing-result.json"
+    write_random_csv(csv_path, [(99, 2), (100, 2), (101, 2)])
+
+    with RecordingCompletionServer() as short_server, RecordingCompletionServer() as long_server:
+        command = [
+            "vllm",
+            "bench",
+            "serve",
+            "--model",
+            MODEL_NAME,
+            "--backend",
+            "openai",
+            "--dataset-name",
+            "random",
+            "--random-csv-path",
+            str(csv_path),
+            "--num-prompts",
+            "3",
+            "--routing-prompt-len-threshold",
+            "100",
+            "--routing-base-url-short",
+            short_server.base_url,
+            "--routing-base-url-long",
+            long_server.base_url,
+            "--save-result",
+            "--save-detailed",
+            "--disable-tqdm",
+            "--result-filename",
+            str(result_path),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+
+    print(result.stdout)
+    print(result.stderr)
+
+    assert result.returncode == 0, f"Benchmark failed: {result.stderr}"
+    assert short_server.prompt_lens == [99]
+    assert sorted(long_server.prompt_lens) == [100, 101]
+
+    saved_result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert saved_result["routing_enabled"] is True
+    assert saved_result["routing_threshold_prompt_len"] == 100
+    assert saved_result["routing_base_url_short"] == short_server.base_url
+    assert saved_result["routing_base_url_long"] == long_server.base_url
+    assert saved_result["routing_request_counts"] == {"short": 1, "long": 2}
+    assert saved_result["request_routes"] == ["short", "long", "long"]
 
 
 @pytest.mark.benchmark
