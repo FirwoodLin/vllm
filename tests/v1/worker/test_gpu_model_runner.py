@@ -238,6 +238,27 @@ def test_update_states_new_request(model_runner, dist_init):
     assert _is_req_state_block_table_match(model_runner, req_id)
 
 
+def test_update_states_new_request_preserves_output_tokens(model_runner, dist_init):
+    req_id = "req_0"
+    scheduler_output = _schedule_new_request(req_id)
+    new_req = scheduler_output.scheduled_new_reqs[0]
+    prompt_len = len(new_req.prompt_token_ids or [])
+
+    new_req.output_token_ids = [42]
+    new_req.num_computed_tokens = prompt_len
+    scheduler_output.num_scheduled_tokens = {req_id: 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+
+    model_runner._update_states(scheduler_output)
+
+    req_state = model_runner.requests[req_id]
+    req_index = model_runner.input_batch.req_id_to_index[req_id]
+    assert req_state.output_token_ids == [42]
+    assert model_runner.input_batch.req_output_token_ids[req_index] == [42]
+    assert model_runner.input_batch.token_ids_cpu[req_index, prompt_len] == 42
+    assert model_runner.input_batch.num_computed_tokens_cpu[req_index] == prompt_len
+
+
 def test_update_states_request_finished(model_runner, dist_init):
     req_id = "req_0"
 

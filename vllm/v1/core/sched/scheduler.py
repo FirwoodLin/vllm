@@ -599,6 +599,9 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    if self.connector is not None:
+                        self.connector.prepare_request_for_external_kv(request)
+
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)

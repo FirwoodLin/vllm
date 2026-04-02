@@ -29,6 +29,11 @@ Usage:
         - fill_mean (float): Mean value for random normal fill (default: 0.015)
         - fill_std (float): Standard deviation for random fill (default: 0.0)
           Set to 0 for constant values, >0 for random sampling
+        - dummy_prefill (bool): When True, append a synthetic output token and
+          use an immediately-completing async KV load to enter pure decode
+          (default: False)
+        - dummy_output_token_id (int): Synthetic token ID used when
+          dummy_prefill is enabled (default: 0)
 """
 
 import time
@@ -133,6 +138,12 @@ class DecodeBenchConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         return self.connector_worker.build_connector_worker_meta()
 
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_finished(finished_req_ids)
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         # All operations are synchronous, so nothing to wait for
         pass
@@ -165,6 +176,10 @@ class DecodeBenchConnector(KVConnectorBase_V1):
             request, num_computed_tokens
         )
 
+    def prepare_request_for_external_kv(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.prepare_request_for_external_kv(request)
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -195,15 +210,31 @@ class DecodeBenchConnectorScheduler:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        self.dummy_prefill = kv_transfer_config.get_from_extra_config(
+            "dummy_prefill", False
+        )
+        self.dummy_output_token_id = kv_transfer_config.get_from_extra_config(
+            "dummy_output_token_id", 0
+        )
 
         # Track which requests have already been filled
         self._filled_requests: set[str] = set()
+        self._prepared_requests: set[str] = set()
 
         # Track pending fills for the current scheduler step
         # request_id -> (block_ids_per_group, num_tokens_to_fill)
         # Note: _pending_fills doesn't need explicit cleanup - it's cleared
         # after build_connector_meta() is called in the same scheduler step
         self._pending_fills: dict[str, tuple[tuple[list[int], ...], int]] = {}
+
+    def prepare_request_for_external_kv(self, request: "Request") -> None:
+        if not self.dummy_prefill or request.request_id in self._prepared_requests:
+            return
+
+        request.append_output_token_ids(self.dummy_output_token_id)
+        self._prepared_requests.add(request.request_id)
 
     def get_num_new_matched_tokens(
         self,
@@ -225,6 +256,12 @@ class DecodeBenchConnectorScheduler:
         # Only fill once per request on first scheduling
         if req_id in self._filled_requests:
             return 0, False
+
+        if self.dummy_prefill:
+            num_tokens_to_load = max(0, request.num_tokens - num_computed_tokens)
+            if num_tokens_to_load == 0:
+                return 0, False
+            return num_tokens_to_load, True
 
         # Calculate how many tokens we need to fill
         # Fill all uncomputed tokens except the last one (which will be decoded)
@@ -304,7 +341,10 @@ class DecodeBenchConnectorScheduler:
         """
         Called when a request has finished. Clean up any state.
         """
-        self._filled_requests.discard(request.request_id)
+        req_id = request.request_id
+        self._filled_requests.discard(req_id)
+        self._prepared_requests.discard(req_id)
+        self._pending_fills.pop(req_id, None)
 
 
 class DecodeBenchConnectorWorker:
@@ -319,12 +359,16 @@ class DecodeBenchConnectorWorker:
         assert kv_transfer_config is not None
         self.fill_mean = kv_transfer_config.get_from_extra_config("fill_mean", 0.015)
         self.fill_std = kv_transfer_config.get_from_extra_config("fill_std", 0.0)
+        self.dummy_prefill = kv_transfer_config.get_from_extra_config(
+            "dummy_prefill", False
+        )
 
         # Will be populated via register_kv_caches
         self.kv_caches: dict[str, torch.Tensor] | None = None
 
         # Mapping from KV cache group index to list of layer names in that group
         self.group_to_layers: dict[int, list[str]] | None = None
+        self._finished_recving_req_ids: set[str] = set()
         self._latest_req_batch_load_kv_ns: dict[str, int] = {}
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -351,6 +395,7 @@ class DecodeBenchConnectorWorker:
         Supports both standard attention (single group) and MLA (multiple groups).
         """
         if not metadata.reqs_to_fill:
+            self._finished_recving_req_ids = set()
             self._latest_req_batch_load_kv_ns = {}
             return
 
@@ -385,6 +430,9 @@ class DecodeBenchConnectorWorker:
         else:
             self._latest_req_batch_load_kv_ns = {}
 
+        if self.dummy_prefill:
+            self._finished_recving_req_ids = set(metadata.reqs_to_fill)
+
     def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
         if not self._latest_req_batch_load_kv_ns:
             return None
@@ -393,6 +441,16 @@ class DecodeBenchConnectorWorker:
         )
         self._latest_req_batch_load_kv_ns = {}
         return metadata
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        if not self.dummy_prefill or not self._finished_recving_req_ids:
+            return None, None
+
+        finished_recving = self._finished_recving_req_ids
+        self._finished_recving_req_ids = set()
+        return None, finished_recving
 
     def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
         """

@@ -209,3 +209,20 @@ def test_prompt_token_stats_full_external_transfer_recompute():
     assert stats.local_cache_hit == 0
     assert stats.external_kv_transfer == 1000
     assert stats.recomputed_tokens == 1
+
+
+def test_prompt_token_stats_clamps_external_tokens_beyond_prompt_budget():
+    """Ignore synthetic non-prompt tokens in external KV metrics."""
+    stats = PromptTokenStats()
+
+    stats.update_from_output(
+        num_cached_tokens=1000,
+        num_external_computed_tokens=1001,
+        prompt_len=1000,
+    )
+
+    assert stats.computed == 0
+    assert stats.local_cache_hit == 0
+    assert stats.external_kv_transfer == 1000
+    assert stats.cached_tokens == 1000
+    assert stats.recomputed_tokens == 0

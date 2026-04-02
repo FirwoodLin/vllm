@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Unit tests for DecodeBenchConnector.
-
-Tests the functionality of the DecodeBenchConnector which fills KV cache
-with dummy values for decode performance benchmarking.
-"""
+"""Unit tests for DecodeBenchConnector."""
 
 import pytest
 import torch
@@ -13,8 +8,6 @@ import torch
 from vllm import SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
-
-# ruff: noqa: E501
 from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
     DecodeBenchConnector,
     DecodeBenchConnectorMetadata,
@@ -24,7 +17,8 @@ from vllm.forward_context import ForwardContext
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.request import Request
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request, RequestStatus
 
 from .utils import (
     EOS_TOKEN_ID,
@@ -33,70 +27,81 @@ from .utils import (
     create_vllm_config,
 )
 
+pytestmark = pytest.mark.cpu_test
+
 
 class DecodeBenchTestRunner:
-    """Test runner for DecodeBenchConnector."""
+    """Test harness for scheduler/worker DecodeBenchConnector interactions."""
 
-    def __init__(self, block_size: int, num_gpu_blocks: int):
-        self.block_size = block_size
-        self.num_gpu_blocks = num_gpu_blocks
-
+    def __init__(
+        self,
+        block_size: int,
+        num_gpu_blocks: int,
+        *,
+        dummy_prefill: bool = False,
+        dummy_output_token_id: int = 0,
+    ):
         self.req_id = -1
 
-        # Create vllm config with DecodeBenchConnector
         vllm_config = create_vllm_config(
-            block_size=block_size, max_num_batched_tokens=1000
+            block_size=block_size,
+            max_num_batched_tokens=1000,
+            kv_connector_extra_config={
+                "dummy_prefill": dummy_prefill,
+                "dummy_output_token_id": dummy_output_token_id,
+            },
         )
         vllm_config.kv_transfer_config = KVTransferConfig(
             kv_connector="DecodeBenchConnector",
             kv_role="kv_both",
+            kv_connector_extra_config={
+                "dummy_prefill": dummy_prefill,
+                "dummy_output_token_id": dummy_output_token_id,
+            },
         )
 
         self.vllm_config = vllm_config
         self.scheduler: Scheduler = create_scheduler(
-            vllm_config, num_blocks=num_gpu_blocks
+            vllm_config,
+            num_blocks=num_gpu_blocks,
         )
-
-        # Create worker-side connector
         self.worker_connector = DecodeBenchConnector(
-            vllm_config, KVConnectorRole.WORKER
+            vllm_config,
+            KVConnectorRole.WORKER,
         )
 
-        # Create dummy KV caches for testing
-        # Shape: [num_blocks, 2, num_heads, block_size, head_dim]
-        # Using simplified shape for testing
         num_heads = 4
         head_dim = 64
-        self.kv_caches = {
+        kv_caches = {
             f"layer_{i}": torch.zeros(
-                num_gpu_blocks, 2, num_heads, block_size, head_dim
+                num_gpu_blocks,
+                2,
+                num_heads,
+                block_size,
+                head_dim,
             )
-            for i in range(2)  # 2 layers for testing
+            for i in range(2)
         }
+        self.worker_connector.register_kv_caches(kv_caches)
 
-        # Register KV caches with worker connector
-        self.worker_connector.register_kv_caches(self.kv_caches)
-
-        # Extract scheduler-side connector
         scheduler_connector = self.scheduler.connector
-        assert scheduler_connector is not None
         assert isinstance(scheduler_connector, DecodeBenchConnector)
-        self.scheduler_connector: DecodeBenchConnector = scheduler_connector
+        self.scheduler_connector = scheduler_connector
 
         init_none_hash(sha256)
         self._block_hasher = get_request_block_hasher(block_size, sha256)
-
-        self._dummy_ctx: ForwardContext = ForwardContext(
-            no_compile_layers={}, attn_metadata={}, virtual_engine=0, slot_mapping={}
+        self._dummy_ctx = ForwardContext(
+            no_compile_layers={},
+            attn_metadata={},
+            virtual_engine=0,
+            slot_mapping={},
         )
 
     def new_request(self, token_ids: list[int]) -> Request:
-        """Create a new request with given token IDs."""
         self.req_id += 1
 
         sampling_params = SamplingParams(max_tokens=100)
         sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
-
         req = Request(
             request_id=str(self.req_id),
             prompt_token_ids=token_ids,
@@ -104,332 +109,103 @@ class DecodeBenchTestRunner:
             pooling_params=None,
             block_hasher=self._block_hasher,
         )
-
         self.scheduler.add_request(req)
         return req
 
-    def run_single_step(self, token_id: int = 0):
-        """Run a single scheduler + worker step."""
-        scheduler_output = self.scheduler.schedule()
+    def run_connector(
+        self, scheduler_output
+    ) -> tuple[DecodeBenchConnectorMetadata, KVConnectorOutput | None]:
+        metadata = scheduler_output.kv_connector_metadata
+        assert isinstance(metadata, DecodeBenchConnectorMetadata)
 
-        # Get connector metadata
-        kv_connector_metadata = scheduler_output.kv_connector_metadata
-        assert kv_connector_metadata is not None
-        assert isinstance(kv_connector_metadata, DecodeBenchConnectorMetadata)
-
-        # Bind metadata and load KV
-        self.worker_connector.bind_connector_metadata(kv_connector_metadata)
+        self.worker_connector.bind_connector_metadata(metadata)
         self.worker_connector.start_load_kv(self._dummy_ctx)
-
-        if scheduler_output.total_num_scheduled_tokens > 0:
-            self.worker_connector.wait_for_save()
-
+        finished_sending, finished_recving = self.worker_connector.get_finished(
+            scheduler_output.finished_req_ids
+        )
+        worker_meta = self.worker_connector.build_connector_worker_meta()
         self.worker_connector.clear_connector_metadata()
 
-        # Create model runner output
-        model_runner_output = create_model_runner_output(
-            reqs=self.scheduler.running,
-            token_id=token_id,
+        if (
+            finished_sending is None
+            and finished_recving is None
+            and worker_meta is None
+        ):
+            return metadata, None
+
+        return metadata, KVConnectorOutput(
+            finished_sending=finished_sending,
+            finished_recving=finished_recving,
+            kv_connector_worker_meta=worker_meta,
         )
 
-        self.scheduler.update_from_output(scheduler_output, model_runner_output)
 
-        return scheduler_output, kv_connector_metadata
-
-
-def test_decode_bench_connector_basic():
-    """Test basic functionality of DecodeBenchConnector."""
+def test_decode_bench_connector_default_mode_remains_sync():
     block_size = 16
-    num_gpu_blocks = 100
-
-    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
-
-    # Create a request with multiple blocks worth of tokens
-    num_tokens = block_size * 3  # 3 blocks
-    token_ids = [1] * num_tokens
-
-    req = runner.new_request(token_ids)
-
-    # Run first step - should fill KV cache with dummy values
-    scheduler_output, metadata = runner.run_single_step()
-
-    # Check that get_num_new_matched_tokens returned correct value
-    # Should be num_tokens - 1 (all except the last token for decode)
-    expected_fill_tokens = num_tokens - 1
-
-    # Check metadata has the request to fill
-    assert len(metadata.reqs_to_fill) == 1
-    assert req.request_id in metadata.reqs_to_fill
-
-    block_ids_per_group, num_tokens_to_fill = metadata.reqs_to_fill[req.request_id]
-    assert num_tokens_to_fill == expected_fill_tokens
-
-    # For standard attention, there's only one group
-    assert len(block_ids_per_group) == 1
-    block_ids = block_ids_per_group[0]
-
-    # Calculate expected number of blocks
-    expected_num_blocks = (expected_fill_tokens + block_size - 1) // block_size
-    assert len(block_ids) == expected_num_blocks
-
-    # Verify KV caches were filled with constant value
-    for layer_name, kv_cache in runner.kv_caches.items():
-        for block_id in block_ids:
-            # Check that the block was filled
-            block_data = kv_cache[block_id]
-            # Should be filled with constant value 0.015
-            assert torch.allclose(block_data, torch.tensor(0.015))
-
-
-def test_decode_bench_connector_no_refill():
-    """Test that DecodeBenchConnector only fills once per request."""
-    block_size = 16
-    num_gpu_blocks = 100
-
-    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
-
-    # Create a request
-    num_tokens = block_size * 2
-    token_ids = [1] * num_tokens
-
-    runner.new_request(token_ids)
-
-    # Run first step - should fill KV cache
-    _, metadata1 = runner.run_single_step()
-    assert len(metadata1.reqs_to_fill) == 1
-
-    # Run second step - should NOT fill again (already filled)
-    _, metadata2 = runner.run_single_step()
-    assert len(metadata2.reqs_to_fill) == 0
-
-
-def test_decode_bench_connector_single_token():
-    """Test DecodeBenchConnector with single token request."""
-    block_size = 16
-    num_gpu_blocks = 100
-
-    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
-
-    # Create a request with just 1 token
-    # Should not fill anything (need at least 2 tokens: 1 to fill, 1 to decode)
-    token_ids = [1]
-
-    runner.new_request(token_ids)
-
-    # Run step - should NOT fill KV cache
-    _, metadata = runner.run_single_step()
-    assert len(metadata.reqs_to_fill) == 0
-
-
-def test_decode_bench_connector_two_tokens():
-    """Test DecodeBenchConnector with two token request."""
-    block_size = 16
-    num_gpu_blocks = 100
-
-    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
-
-    # Create a request with 2 tokens
-    # Should fill 1 token (first token), decode the second
-    token_ids = [1, 2]
-
-    req = runner.new_request(token_ids)
-
-    # Run step
-    _, metadata = runner.run_single_step()
-
-    assert len(metadata.reqs_to_fill) == 1
-    assert req.request_id in metadata.reqs_to_fill
-
-    block_ids_per_group, num_tokens_to_fill = metadata.reqs_to_fill[req.request_id]
-    assert num_tokens_to_fill == 1
-    # For standard attention, there's only one group
-    assert len(block_ids_per_group) == 1
-    assert len(block_ids_per_group[0]) == 1  # 1 token needs 1 block
-
-
-def test_decode_bench_connector_large_context():
-    """Test DecodeBenchConnector with large context size."""
-    block_size = 16
-    num_gpu_blocks = 1000
-
-    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
-
-    # Create a request with many blocks
-    num_blocks = 20
-    num_tokens = block_size * num_blocks
-    token_ids = list(range(num_tokens))
-
-    req = runner.new_request(token_ids)
-
-    # Run step
-    _, metadata = runner.run_single_step()
-
-    assert len(metadata.reqs_to_fill) == 1
-    assert req.request_id in metadata.reqs_to_fill
-
-    block_ids_per_group, num_tokens_to_fill = metadata.reqs_to_fill[req.request_id]
-
-    # Should fill all tokens except the last one
-    expected_fill_tokens = num_tokens - 1
-    assert num_tokens_to_fill == expected_fill_tokens
-
-    # For standard attention, there's only one group
-    assert len(block_ids_per_group) == 1
-    block_ids = block_ids_per_group[0]
-
-    # Calculate expected number of blocks
-    expected_num_blocks = (expected_fill_tokens + block_size - 1) // block_size
-    assert len(block_ids) == expected_num_blocks
-
-    # Verify blocks were filled
-    for layer_name, kv_cache in runner.kv_caches.items():
-        for block_id in block_ids:
-            block_data = kv_cache[block_id]
-            assert torch.allclose(block_data, torch.tensor(0.015))
-
-
-def test_decode_bench_connector_multiple_requests():
-    """Test DecodeBenchConnector with multiple sequential requests."""
-    block_size = 16
-    num_gpu_blocks = 100
-
-    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
-
-    # First request
-    req1 = runner.new_request([1] * (block_size * 2))
-    _, metadata1 = runner.run_single_step()
-
-    assert len(metadata1.reqs_to_fill) == 1
-    assert req1.request_id in metadata1.reqs_to_fill
-
-    # Complete first request
-    while runner.scheduler.running:
-        runner.run_single_step()
-
-    # Add EOS to finish
-    scheduler_output = runner.scheduler.schedule()
-    model_runner_output = create_model_runner_output(
-        reqs=runner.scheduler.running,
-        token_id=EOS_TOKEN_ID,
-        use_eos=True,
+    runner = DecodeBenchTestRunner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        dummy_prefill=False,
     )
-    runner.scheduler.update_from_output(scheduler_output, model_runner_output)
+    prompt_len = block_size * 2
+    req = runner.new_request([1] * prompt_len)
 
-    # Second request - should also get filled
-    req2 = runner.new_request([2] * (block_size * 3))
-    _, metadata2 = runner.run_single_step()
+    scheduler_output = runner.scheduler.schedule()
+    metadata, kv_output = runner.run_connector(scheduler_output)
 
-    assert len(metadata2.reqs_to_fill) == 1
-    assert req2.request_id in metadata2.reqs_to_fill
-
-    # Different request should have different metadata
-    _, num_tokens1 = metadata1.reqs_to_fill[req1.request_id]
-    _, num_tokens2 = metadata2.reqs_to_fill[req2.request_id]
-
-    assert num_tokens1 == block_size * 2 - 1
-    assert num_tokens2 == block_size * 3 - 1
-
-
-def test_decode_bench_connector_partial_block():
-    """Test DecodeBenchConnector with partial block filling."""
-    block_size = 16
-    num_gpu_blocks = 100
-
-    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
-
-    # Create a request that doesn't align to block boundaries
-    # e.g., 2.5 blocks worth of tokens
-    num_tokens = block_size * 2 + block_size // 2
-    token_ids = [1] * num_tokens
-
-    req = runner.new_request(token_ids)
-
-    # Run step
-    _, metadata = runner.run_single_step()
-
-    assert len(metadata.reqs_to_fill) == 1
+    assert req.status == RequestStatus.RUNNING
+    assert req.num_output_tokens == 0
+    assert req.num_computed_tokens == prompt_len - 1
+    assert scheduler_output.num_scheduled_tokens[req.request_id] == 1
     assert req.request_id in metadata.reqs_to_fill
-
-    block_ids_per_group, num_tokens_to_fill = metadata.reqs_to_fill[req.request_id]
-
-    # Should fill all tokens except the last one
-    expected_fill_tokens = num_tokens - 1
-    assert num_tokens_to_fill == expected_fill_tokens
-
-    # For standard attention, there's only one group
-    assert len(block_ids_per_group) == 1
-    block_ids = block_ids_per_group[0]
-
-    # Should allocate 3 blocks to hold the partial data
-    expected_num_blocks = 3
-    assert len(block_ids) == expected_num_blocks
+    assert metadata.reqs_to_fill[req.request_id][1] == prompt_len - 1
+    assert kv_output is None
 
 
-def test_decode_bench_connector_concurrent_requests():
-    """Test DecodeBenchConnector with multiple concurrent requests in the same batch."""
+def test_decode_bench_connector_dummy_prefill_uses_async_full_hit():
     block_size = 16
-    num_gpu_blocks = 1000
-
-    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
-
-    # Create multiple requests that will be batched together
-    req1 = runner.new_request([1] * (block_size * 2))
-    req2 = runner.new_request([2] * (block_size * 3))
-    req3 = runner.new_request([3] * (block_size * 1))
-
-    # Run first step - all requests should be filled concurrently
-    _, metadata = runner.run_single_step()
-
-    # All three requests should be in the metadata
-    assert len(metadata.reqs_to_fill) == 3
-    assert req1.request_id in metadata.reqs_to_fill
-    assert req2.request_id in metadata.reqs_to_fill
-    assert req3.request_id in metadata.reqs_to_fill
-
-    # Verify each request has correct fill info
-    block_ids_per_group1, num_tokens1 = metadata.reqs_to_fill[req1.request_id]
-    block_ids_per_group2, num_tokens2 = metadata.reqs_to_fill[req2.request_id]
-    block_ids_per_group3, num_tokens3 = metadata.reqs_to_fill[req3.request_id]
-
-    # Verify token counts (all tokens except last one)
-    assert num_tokens1 == block_size * 2 - 1
-    assert num_tokens2 == block_size * 3 - 1
-    assert num_tokens3 == block_size * 1 - 1
-
-    # Verify block counts for each request
-    assert len(block_ids_per_group1[0]) == 2  # 2 blocks
-    assert len(block_ids_per_group2[0]) == 3  # 3 blocks
-    assert len(block_ids_per_group3[0]) == 1  # 1 block
-
-    # Verify all blocks are filled in KV cache
-    for req_id, (block_ids_per_group, _) in metadata.reqs_to_fill.items():
-        block_ids = block_ids_per_group[0]
-        for layer_name, kv_cache in runner.kv_caches.items():
-            for block_id in block_ids:
-                block_data = kv_cache[block_id]
-                assert torch.allclose(block_data, torch.tensor(0.015))
-
-    # Run second step - should NOT fill again (already filled)
-    _, metadata2 = runner.run_single_step()
-    assert len(metadata2.reqs_to_fill) == 0
-
-
-def test_decode_bench_connector_emits_batch_load_kv_worker_meta():
-    block_size = 16
-    num_gpu_blocks = 100
-
-    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
+    synthetic_token_id = 7
+    runner = DecodeBenchTestRunner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        dummy_prefill=True,
+        dummy_output_token_id=synthetic_token_id,
+    )
     runner.vllm_config.observability_config.enable_logging_ttft_timing_details = True
-    req = runner.new_request([1] * (block_size * 2))
+    prompt_len = block_size * 2
+    req = runner.new_request([1] * prompt_len)
 
-    runner.run_single_step()
+    first_output = runner.scheduler.schedule()
+    metadata, kv_output = runner.run_connector(first_output)
 
-    worker_meta = runner.worker_connector.build_connector_worker_meta()
+    assert first_output.total_num_scheduled_tokens == 0
+    assert req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert req.num_tokens == prompt_len + 1
+    assert req.num_output_tokens == 1
+    assert list(req.output_token_ids) == [synthetic_token_id]
+    assert req.request_id in metadata.reqs_to_fill
+    assert metadata.reqs_to_fill[req.request_id][1] == prompt_len + 1
 
-    assert isinstance(worker_meta, DecodeBenchConnectorWorkerMetadata)
-    assert req.request_id in worker_meta.req_batch_load_kv_ns
-    assert worker_meta.req_batch_load_kv_ns[req.request_id] >= 0
+    assert kv_output is not None
+    assert kv_output.finished_recving == {req.request_id}
+    assert isinstance(
+        kv_output.kv_connector_worker_meta, DecodeBenchConnectorWorkerMetadata
+    )
+    assert req.request_id in kv_output.kv_connector_worker_meta.req_batch_load_kv_ns
 
+    model_runner_output = create_model_runner_output(reqs=[])
+    model_runner_output.kv_connector_output = kv_output
+    runner.scheduler.update_from_output(first_output, model_runner_output)
+    assert req.request_id in runner.scheduler.finished_recving_kv_req_ids
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    second_output = runner.scheduler.schedule()
+    scheduled_req = second_output.scheduled_new_reqs[0]
+
+    assert req.status == RequestStatus.RUNNING
+    assert req.num_computed_tokens == prompt_len
+    assert req.num_cached_tokens == prompt_len
+    assert second_output.num_scheduled_tokens[req.request_id] == 1
+    assert scheduled_req.req_id == req.request_id
+    assert scheduled_req.num_computed_tokens == prompt_len
+    assert scheduled_req.prompt_token_ids == [1] * prompt_len
+    assert scheduled_req.output_token_ids == [synthetic_token_id]

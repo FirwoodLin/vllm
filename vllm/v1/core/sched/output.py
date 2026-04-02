@@ -38,6 +38,7 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    output_token_ids: list[int] | None = None
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -59,6 +60,7 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            output_token_ids=list(request.output_token_ids),
             prefill_token_ids=prefill_token_ids,
         )
 
@@ -75,6 +77,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"output_token_ids={self.output_token_ids},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
@@ -91,11 +94,15 @@ class NewRequestData:
         prefill_token_ids_len = (
             len(self.prefill_token_ids) if self.prefill_token_ids is not None else None
         )
+        output_token_ids_len = (
+            len(self.output_token_ids) if self.output_token_ids is not None else None
+        )
         return (
             f"NewRequestData("
             f"req_id={self.req_id},"
             f"prompt_token_ids_len={prompt_token_ids_len},"
             f"prefill_token_ids_len={prefill_token_ids_len},"
+            f"output_token_ids_len={output_token_ids_len},"
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"

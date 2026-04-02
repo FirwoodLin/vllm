@@ -446,6 +446,16 @@ class KVConnectorBase_V1(ABC):
     # Scheduler-side methods
     # ==============================
 
+    def prepare_request_for_external_kv(self, request: "Request") -> None:
+        """
+        Prepare a request before local/external KV prefix matching.
+
+        Connectors can override this hook to perform idempotent request-side
+        mutations needed for external KV loading. The default implementation is
+        a no-op.
+        """
+        return
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,

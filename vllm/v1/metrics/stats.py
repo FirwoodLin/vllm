@@ -279,10 +279,19 @@ class PromptTokenStats:
         prompt_len: int,
     ) -> None:
         """Update stats from a prefill output."""
+        num_cached_tokens = min(max(num_cached_tokens, 0), prompt_len)
+
         # When all tokens are cached, the scheduler reduces num_cached_tokens
         # by 1 to force the model to recompute the last token, since the model
         # needs at least one input token to run a forward pass.
         recomputed = 1 if (num_cached_tokens + 1 == prompt_len) else 0
+        # Prompt-token metrics should ignore any externally-computed tokens
+        # beyond the prompt budget, e.g. a synthetic decode token added by
+        # DecodeBenchConnector dummy_prefill.
+        num_external_computed_tokens = min(
+            max(num_external_computed_tokens, 0),
+            num_cached_tokens + recomputed,
+        )
 
         self.computed += prompt_len - num_cached_tokens
         self.external_kv_transfer += num_external_computed_tokens
