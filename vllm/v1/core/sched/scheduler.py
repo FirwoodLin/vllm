@@ -168,6 +168,11 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        # Total tokens across all queued requests in waiting +
+        # skipped_waiting. This is maintained incrementally to avoid scanning
+        # the waiting queues on every stats emission.
+        self.waiting_total_tokens: int = 0
+        self._queued_waiting_request_ids: set[str] = set()
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -600,7 +605,13 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     if self.connector is not None:
+                        old_waiting_tokens = self._request_waiting_tokens(request)
                         self.connector.prepare_request_for_external_kv(request)
+                        # Connector hooks may mutate request length while the
+                        # request is still queued (for example, dummy_prefill).
+                        self._update_queued_waiting_request_tokens(
+                            request, old_waiting_tokens
+                        )
 
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
@@ -763,6 +774,7 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
+                old_waiting_tokens = self._request_waiting_tokens(request)
                 request = request_queue.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
@@ -783,8 +795,12 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    self._update_queued_waiting_request_tokens(
+                        request, old_waiting_tokens
+                    )
                     continue
 
+                self._remove_queued_waiting_request(request)
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -950,7 +966,7 @@ class Scheduler(SchedulerInterface):
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
         # Put the request back to the waiting queue.
-        self.waiting.prepend_request(request)
+        self._enqueue_waiting_request(request, prepend=True)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -995,6 +1011,11 @@ class Scheduler(SchedulerInterface):
         Discards the last sampled output token from the prior input chunk.
         """
 
+        tracked_in_waiting = session.request_id in self._queued_waiting_request_ids
+        old_waiting_tokens = (
+            self._request_waiting_tokens(session) if tracked_in_waiting else 0
+        )
+
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         num_computed_tokens = session.num_computed_tokens
@@ -1028,6 +1049,8 @@ class Scheduler(SchedulerInterface):
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+        if tracked_in_waiting:
+            self._update_queued_waiting_request_tokens(session, old_waiting_tokens)
 
     def _make_cached_request_data(
         self,
@@ -1354,6 +1377,10 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            tracked_in_waiting = req_id in self._queued_waiting_request_ids
+            old_waiting_tokens = (
+                self._request_waiting_tokens(request) if tracked_in_waiting else 0
+            )
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1393,6 +1420,10 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                if tracked_in_waiting:
+                    self._update_queued_waiting_request_tokens(
+                        request, old_waiting_tokens
+                    )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -1501,6 +1532,8 @@ class Scheduler(SchedulerInterface):
             self.running = remove_all(self.running, stopped_running_reqs)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
+            for request in stopped_preempted_reqs:
+                self._remove_queued_waiting_request(request)
             self.waiting.remove_requests(stopped_preempted_reqs)
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
@@ -1582,11 +1615,56 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
-    def _enqueue_waiting_request(self, request: Request) -> None:
-        if self._is_blocked_waiting_status(request.status):
-            self.skipped_waiting.add_request(request)
+    @staticmethod
+    def _request_waiting_tokens(request: Request) -> int:
+        return request.num_tokens
+
+    def _add_queued_waiting_request(self, request: Request) -> None:
+        req_id = request.request_id
+        assert req_id not in self._queued_waiting_request_ids, (
+            f"Request {req_id} already tracked in waiting queues."
+        )
+        self._queued_waiting_request_ids.add(req_id)
+        self.waiting_total_tokens += self._request_waiting_tokens(request)
+
+    def _remove_queued_waiting_request(self, request: Request) -> None:
+        req_id = request.request_id
+        assert req_id in self._queued_waiting_request_ids, (
+            f"Request {req_id} missing from waiting queue accounting."
+        )
+        self._queued_waiting_request_ids.remove(req_id)
+        self.waiting_total_tokens -= self._request_waiting_tokens(request)
+        assert self.waiting_total_tokens >= 0, "Waiting token accounting underflow."
+
+    def _update_queued_waiting_request_tokens(
+        self, request: Request, old_waiting_tokens: int
+    ) -> None:
+        req_id = request.request_id
+        assert req_id in self._queued_waiting_request_ids, (
+            f"Request {req_id} missing from waiting queue accounting."
+        )
+        self.waiting_total_tokens += (
+            self._request_waiting_tokens(request) - old_waiting_tokens
+        )
+        assert self.waiting_total_tokens >= 0, "Waiting token accounting underflow."
+
+    def _enqueue_waiting_request(
+        self, request: Request, prepend: bool = False
+    ) -> None:
+        queue = (
+            self.skipped_waiting
+            if self._is_blocked_waiting_status(request.status)
+            else self.waiting
+        )
+        if prepend:
+            queue.prepend_request(request)
         else:
-            self.waiting.add_request(request)
+            queue.add_request(request)
+        self._add_queued_waiting_request(request)
+
+    def _peek_waiting_request(self) -> Request | None:
+        queue = self._select_waiting_queue_for_scheduling()
+        return queue.peek_request() if queue is not None else None
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
@@ -1816,6 +1894,8 @@ class Scheduler(SchedulerInterface):
         if running_requests_to_remove:
             self.running = remove_all(self.running, running_requests_to_remove)
         if waiting_requests_to_remove:
+            for request in waiting_requests_to_remove:
+                self._remove_queued_waiting_request(request)
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
 
@@ -1971,9 +2051,16 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        waiting_head = self._peek_waiting_request()
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
+            waiting_total_tokens=self.waiting_total_tokens,
+            waiting_head_tokens=(
+                self._request_waiting_tokens(waiting_head)
+                if waiting_head is not None
+                else 0
+            ),
             kv_cache_usage=self.kv_cache_manager.usage,
             encoder_cache_usage=self._get_encoder_cache_usage(),
             prefix_cache_stats=prefix_cache_stats,
@@ -2104,7 +2191,9 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            old_waiting_tokens = self._request_waiting_tokens(request)
             self._update_waiting_for_remote_kv(request)
+            self._update_queued_waiting_request_tokens(request, old_waiting_tokens)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
@@ -2193,6 +2282,10 @@ class Scheduler(SchedulerInterface):
         # it. This set tracks blocks already marked for recomputation.
         marked_invalid_block_ids: set[int] = set()
         for request in requests:
+            was_queued_waiting = request.request_id in self._queued_waiting_request_ids
+            old_waiting_tokens = (
+                self._request_waiting_tokens(request) if was_queued_waiting else 0
+            )
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
@@ -2257,6 +2350,10 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = request.num_cached_tokens
 
                 affected_req_ids.add(request.request_id)
+                if was_queued_waiting:
+                    self._update_queued_waiting_request_tokens(
+                        request, old_waiting_tokens
+                    )
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 

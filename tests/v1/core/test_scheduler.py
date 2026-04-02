@@ -742,6 +742,61 @@ def test_preempt_during_execution():
     assert requests[1].output_token_ids[0] == 42
 
 
+def test_preempted_request_late_output_updates_waiting_token_accounting():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        block_size=16,
+        num_blocks=11,
+        enable_prefix_caching=False,
+    )
+    requests = create_requests(num_requests=2, num_tokens=80, block_size=16)
+
+    scheduler.add_request(requests[0])
+    scheduler_output0 = scheduler.schedule()
+    scheduler.add_request(requests[1])
+    scheduler_output1 = scheduler.schedule()
+
+    scheduler.update_from_output(
+        scheduler_output0,
+        ModelRunnerOutput(
+            req_ids=[requests[0].request_id],
+            req_id_to_index={requests[0].request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    _ = scheduler.schedule()
+    assert requests[1].status == RequestStatus.PREEMPTED
+    assert scheduler.waiting_total_tokens == 80
+
+    scheduler.update_from_output(
+        scheduler_output1,
+        ModelRunnerOutput(
+            req_ids=[requests[1].request_id],
+            req_id_to_index={requests[1].request_id: 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    assert requests[1].num_tokens == 81
+    assert scheduler.waiting_total_tokens == 81
+
+    scheduler.finish_requests(
+        requests[0].request_id, RequestStatus.FINISHED_STOPPED
+    )
+    resumed_output = scheduler.schedule()
+
+    assert requests[1].request_id in resumed_output.num_scheduled_tokens
+    assert requests[1].status == RequestStatus.RUNNING
+    assert scheduler.waiting_total_tokens == 0
+
+
 def test_scheduler_reset_prefix_cache():
     scheduler = create_scheduler(enable_prefix_caching=True)
     requests = create_requests(num_requests=10)
@@ -1117,6 +1172,90 @@ def _step_until_done(
 
 def _num_waiting_requests(scheduler: Scheduler) -> int:
     return len(scheduler.waiting) + len(scheduler.skipped_waiting)
+
+
+def test_make_stats_reports_waiting_token_backlog():
+    scheduler = create_scheduler()
+    req_head = create_requests(num_requests=1, num_tokens=4, req_ids=["head"])[0]
+    req_tail = create_requests(num_requests=1, num_tokens=7, req_ids=["tail"])[0]
+
+    scheduler.add_request(req_head)
+    scheduler.add_request(req_tail)
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_waiting_reqs == 2
+    assert stats.waiting_total_tokens == 11
+    assert stats.waiting_head_tokens == 4
+
+
+def test_make_stats_reports_total_tokens_for_async_kv_request():
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=8, is_async=True)
+    )
+    request = create_requests(num_requests=1, num_tokens=16)[0]
+
+    scheduler.add_request(request)
+    _ = scheduler.schedule()
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_waiting_reqs == 1
+    assert stats.waiting_total_tokens == 16
+    assert stats.waiting_head_tokens == 16
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_schedule_updates_waiting_tokens_for_connector_request_prep_mutation():
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True)
+    )
+    request = create_requests(num_requests=1, num_tokens=10)[0]
+
+    def prepare_request_for_external_kv(req: Request) -> None:
+        req.append_output_token_ids(0)
+
+    scheduler.connector.prepare_request_for_external_kv = Mock(
+        side_effect=prepare_request_for_external_kv
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        side_effect=lambda req, _: (req.num_tokens, True)
+    )
+
+    scheduler.add_request(request)
+    assert scheduler.waiting_total_tokens == 10
+
+    _ = scheduler.schedule()
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert request.num_tokens == 11
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert stats.num_waiting_reqs == 1
+    assert stats.waiting_total_tokens == 11
+    assert stats.waiting_head_tokens == 11
+
+
+def test_make_stats_updates_waiting_tokens_after_reset_prefix_cache_preemption():
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    requests = create_requests(num_requests=2, num_tokens=10)
+
+    for request in requests:
+        scheduler.add_request(request)
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.waiting_total_tokens == 20
+    assert stats.waiting_head_tokens == 10
+
+    _ = scheduler.schedule()
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_waiting_reqs == 2
+    assert stats.waiting_total_tokens == 20
+    assert stats.waiting_head_tokens == 10
 
 
 def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):

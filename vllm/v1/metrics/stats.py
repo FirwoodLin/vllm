@@ -174,6 +174,10 @@ class SchedulerStats:
 
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    # Total tokens across all queued requests in waiting + skipped_waiting.
+    waiting_total_tokens: int = 0
+    # Total tokens for the next queued request selected by scheduler policy.
+    waiting_head_tokens: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0

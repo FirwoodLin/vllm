@@ -221,13 +221,19 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg generation throughput: %.1f tokens/s",
             "Running: %d reqs",
             "Waiting: %d reqs",
+            "Waiting tokens: %d",
         ]
         log_args: list[int | float | str] = [
             self.last_prompt_throughput,
             self.last_generation_throughput,
             self.last_scheduler_stats.num_running_reqs,
             self.last_scheduler_stats.num_waiting_reqs,
+            self.last_scheduler_stats.waiting_total_tokens,
         ]
+
+        if not self.aggregated:
+            log_parts.append("Waiting head tokens: %d")
+            log_args.append(self.last_scheduler_stats.waiting_head_tokens)
 
         if self.num_preemptions > 0:
             log_parts.append("Preemptions: %d")
@@ -327,6 +333,9 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
             )
             self.last_scheduler_stats.num_running_reqs += (
                 last_scheduler_stats.num_running_reqs
+            )
+            self.last_scheduler_stats.waiting_total_tokens += (
+                last_scheduler_stats.waiting_total_tokens
             )
             self.last_scheduler_stats.kv_cache_usage += (
                 last_scheduler_stats.kv_cache_usage
