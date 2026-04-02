@@ -5,6 +5,7 @@ import os
 import socket
 import time
 import warnings
+import weakref
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
 from typing import Any
@@ -673,6 +674,7 @@ class AsyncLLM(EngineClient):
         # a circular reference via self.
         self._logger_ref = [self.logger_manager]
         logger_ref = self._logger_ref
+        self_ref = weakref.ref(self)
         renderer = self.renderer
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
 
@@ -731,6 +733,9 @@ class AsyncLLM(EngineClient):
                             iteration_stats=iteration_stats,
                             mm_cache_stats=renderer.stat_mm_cache(),
                         )
+                        if outputs.scheduler_stats is not None and num_outputs > 0:
+                            if async_llm := self_ref():
+                                async_llm.do_log_stats_with_interval()
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
@@ -898,6 +903,16 @@ class AsyncLLM(EngineClient):
     async def do_log_stats(self) -> None:
         if self.logger_manager:
             self.logger_manager.log()
+
+    def do_log_stats_with_interval(self) -> None:
+        """Log stats when the time interval has passed."""
+        now = time.time()
+        if not hasattr(self, "_last_log_time"):
+            self._last_log_time = now
+        if now - self._last_log_time >= envs.VLLM_LOG_STATS_INTERVAL:
+            if self.logger_manager:
+                self.logger_manager.log()
+            self._last_log_time = now
 
     async def check_health(self) -> None:
         logger.debug("Called check_health.")

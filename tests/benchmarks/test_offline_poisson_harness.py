@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.benchmarks.offline_poisson_harness import (
+    _apply_benchmark_arg_defaults,
+    _compute_pre_forward_ttft_ms,
+    _enforce_harness_observability,
     _request_clean_cluster_shutdown,
     _submit_one_request,
+    build_success_record,
     build_poisson_arrival_deadlines_ns,
     build_summary,
     connector_mode_from_config,
@@ -18,6 +24,7 @@ from vllm.benchmarks.offline_poisson_harness import (
     split_warmup_and_measured_requests,
 )
 from vllm.benchmarks.datasets import SampleRequest
+from vllm.v1.ttft_timing import RequestTTFTTrace
 
 
 @pytest.fixture(scope="session")
@@ -182,6 +189,8 @@ def test_build_summary_counts_failures_and_uses_measured_window() -> None:
             "finish_ts_ns": 1_100,
             "e2e_ms": 1.0,
             "ttft_ms": 0.4,
+            "ttft_including_forward_ms": 0.5,
+            "ttft_post_schedule_to_first_token_ms": 0.1,
             "queued_time_ms": 0.1,
             "kv_fill_ms": 0.0,
             "prefill_time_ms": 0.1,
@@ -201,6 +210,8 @@ def test_build_summary_counts_failures_and_uses_measured_window() -> None:
             "finish_ts_ns": 2_200,
             "e2e_ms": 2.0,
             "ttft_ms": None,
+            "ttft_including_forward_ms": None,
+            "ttft_post_schedule_to_first_token_ms": None,
             "queued_time_ms": None,
             "kv_fill_ms": 0.0,
             "prefill_time_ms": None,
@@ -219,6 +230,7 @@ def test_build_summary_counts_failures_and_uses_measured_window() -> None:
     summary = build_summary(
         records=records,
         connector_mode="none",
+        ttft_semantics="first_real_token_latency",
         first_submit_ts_ns=100,
         last_finish_ts_ns=2_200,
     )
@@ -227,8 +239,114 @@ def test_build_summary_counts_failures_and_uses_measured_window() -> None:
     assert summary["successful_requests"] == 1
     assert summary["failed_requests"] == 1
     assert summary["benchmark_runtime_s"] == pytest.approx((2_200 - 100) / 1e9)
+    assert summary["ttft_semantics"] == "first_real_token_latency"
     assert summary["e2e_ms"]["mean"] == pytest.approx(1.0)
     assert summary["ttft_ms"]["p50"] == pytest.approx(0.4)
+    assert summary["ttft_including_forward_ms"]["p50"] == pytest.approx(0.5)
+    assert summary["ttft_post_schedule_to_first_token_ms"]["p50"] == pytest.approx(
+        0.1
+    )
+
+
+def _build_fake_metrics() -> SimpleNamespace:
+    return SimpleNamespace(
+        queued_ts=1.0,
+        scheduled_ts=1.122,
+        first_token_ts=1.1367,
+        last_token_ts=1.2400,
+        first_token_latency=0.1367,
+        ttft_trace=RequestTTFTTrace(
+            api_preprocess_ns=1_800_000,
+            ipc_in_decode_ns=900_000,
+            engine_preprocess_ns=1_100_000,
+            first_batch_load_kv_ns=12_000_000,
+        ),
+    )
+
+
+@pytest.mark.benchmark
+def test_compute_pre_forward_ttft_ms_uses_schedule_boundary() -> None:
+    assert _compute_pre_forward_ttft_ms(_build_fake_metrics()) == pytest.approx(125.8)
+
+
+@pytest.mark.benchmark
+def test_build_success_record_uses_pre_forward_ttft_for_dummy_prefill() -> None:
+    record = build_success_record(
+        request=SampleRequest(
+            prompt=[11, 12, 13],
+            prompt_len=3,
+            expected_output_len=2,
+            request_id="r0-000000",
+        ),
+        output=RequestOutput(
+            request_id="r0-000000",
+            prompt=None,
+            prompt_token_ids=[11, 12, 13],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="",
+                    token_ids=[21, 22],
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="length",
+                )
+            ],
+            finished=True,
+            metrics=_build_fake_metrics(),
+        ),
+        submit_ts_ns=100,
+        finish_ts_ns=2_100,
+        kv_transfer_config={
+            "kv_connector": "DecodeBenchConnector",
+            "kv_connector_extra_config": {
+                "dummy_prefill": True,
+            },
+        },
+    )
+
+    assert record["ttft_ms"] == pytest.approx(125.8)
+    assert record["ttft_including_forward_ms"] == pytest.approx(136.7)
+    assert record["ttft_post_schedule_to_first_token_ms"] == pytest.approx(10.9)
+    assert record["queued_time_ms"] == pytest.approx(122.0)
+
+
+@pytest.mark.benchmark
+def test_build_success_record_keeps_first_token_ttft_without_dummy_prefill() -> None:
+    record = build_success_record(
+        request=SampleRequest(
+            prompt=[11, 12, 13],
+            prompt_len=3,
+            expected_output_len=2,
+            request_id="r0-000000",
+        ),
+        output=RequestOutput(
+            request_id="r0-000000",
+            prompt=None,
+            prompt_token_ids=[11, 12, 13],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="",
+                    token_ids=[21, 22],
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="length",
+                )
+            ],
+            finished=True,
+            metrics=_build_fake_metrics(),
+        ),
+        submit_ts_ns=100,
+        finish_ts_ns=2_100,
+        kv_transfer_config=None,
+    )
+
+    assert record["ttft_ms"] == pytest.approx(136.7)
+    assert record["ttft_including_forward_ms"] == pytest.approx(136.7)
+    assert record["ttft_post_schedule_to_first_token_ms"] is None
 
 
 @pytest.mark.benchmark
@@ -240,10 +358,62 @@ def test_connector_mode_from_config() -> None:
 
 
 @pytest.mark.benchmark
+def test_apply_benchmark_arg_defaults_normalizes_legacy_decode_bench_config() -> None:
+    args = Namespace(
+        kv_transfer_config={
+            "kv_connector": "DecodeBenchConnector",
+            "kv_role": "kv_both",
+            "fill_mean": 0.015,
+            "fill_std": 0.0,
+            "kv_connector_extra_config": {
+                "dummy_prefill": True,
+                "dummy_output_token_id": 2,
+            },
+        },
+        cudagraph_capture_sizes=[1],
+        compilation_config=None,
+        max_num_seqs=None,
+    )
+
+    _apply_benchmark_arg_defaults(args)
+
+    assert "fill_mean" not in args.kv_transfer_config
+    assert "fill_std" not in args.kv_transfer_config
+    assert args.kv_transfer_config["kv_connector_extra_config"] == {
+        "fill_mean": 0.015,
+        "fill_std": 0.0,
+        "dummy_prefill": True,
+        "dummy_output_token_id": 2,
+    }
+
+
+@pytest.mark.benchmark
 def test_default_cudagraph_capture_sizes() -> None:
     assert default_cudagraph_capture_sizes(8) == [1, 2, 4, 8]
     assert default_cudagraph_capture_sizes(16) == [1, 2, 4, 8, 16]
     assert default_cudagraph_capture_sizes(48) == [1, 2, 4, 8, 16, 32, 48]
+
+
+@pytest.mark.benchmark
+def test_enforce_harness_observability_enables_step_and_ttft_timing() -> None:
+    args = Namespace(
+        disable_log_stats=False,
+        skip_tokenizer_init=False,
+        enable_logging_step_timing_details=False,
+        enable_graph_replay_timing=False,
+        logging_step_timing_interval=1,
+        enable_logging_ttft_timing_details=False,
+        logging_ttft_timing_interval=99,
+    )
+
+    _enforce_harness_observability(args)
+
+    assert args.disable_log_stats is False
+    assert args.enable_logging_step_timing_details is True
+    assert args.enable_graph_replay_timing is True
+    assert args.logging_step_timing_interval == 10
+    assert args.enable_logging_ttft_timing_details is True
+    assert args.logging_ttft_timing_interval == 1
 
 
 @pytest.mark.benchmark

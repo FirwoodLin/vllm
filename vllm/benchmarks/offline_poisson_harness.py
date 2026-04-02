@@ -37,6 +37,8 @@ DEFAULT_KV_TRANSFER_CONFIG = {
     "kv_connector_extra_config": {
         "fill_mean": 0.015,
         "fill_std": 0.0,
+        "dummy_prefill": True,
+        "dummy_output_token_id": 2,
     },
 }
 
@@ -49,6 +51,20 @@ DEFAULT_ENV_VARS = {
     "VLLM_RANDOMIZE_DP_DUMMY_INPUTS": "1",
     "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": "uniform_random",
 }
+
+DECODE_BENCH_EXTRA_CONFIG_KEYS = frozenset(
+    {
+        "fill_mean",
+        "fill_std",
+        "dummy_prefill",
+        "dummy_output_token_id",
+    }
+)
+
+TTFT_SEMANTICS_FIRST_REAL_TOKEN = "first_real_token_latency"
+TTFT_SEMANTICS_DECODE_BENCH_DUMMY_PREFILL = (
+    "decode_bench_dummy_prefill_pre_forward_schedule_boundary"
+)
 
 
 def _non_negative_int(value: str) -> int:
@@ -144,7 +160,39 @@ def _apply_benchmark_env_defaults() -> None:
         os.environ.setdefault(key, value)
 
 
+def _normalize_benchmark_kv_transfer_config(args: argparse.Namespace) -> None:
+    kv_transfer_config = getattr(args, "kv_transfer_config", None)
+    if not isinstance(kv_transfer_config, dict):
+        return
+
+    if kv_transfer_config.get("kv_connector") != "DecodeBenchConnector":
+        return
+
+    legacy_extra_keys = sorted(
+        key for key in DECODE_BENCH_EXTRA_CONFIG_KEYS if key in kv_transfer_config
+    )
+    if not legacy_extra_keys:
+        return
+
+    normalized_config = dict(kv_transfer_config)
+    extra_config = normalized_config.get("kv_connector_extra_config")
+    extra_config = dict(extra_config) if isinstance(extra_config, dict) else {}
+    for key in legacy_extra_keys:
+        extra_config.setdefault(key, normalized_config.pop(key))
+
+    normalized_config["kv_connector_extra_config"] = extra_config
+    args.kv_transfer_config = normalized_config
+
+    logger.warning(
+        "DecodeBenchConnector benchmark config uses legacy top-level keys %s; "
+        "moving them into kv_connector_extra_config.",
+        legacy_extra_keys,
+    )
+
+
 def _apply_benchmark_arg_defaults(args: argparse.Namespace) -> None:
+    _normalize_benchmark_kv_transfer_config(args)
+
     if args.cudagraph_capture_sizes is None:
         compilation_config = getattr(args, "compilation_config", None)
         existing_capture_sizes = None
@@ -183,6 +231,49 @@ def connector_mode_from_config(kv_transfer_config: Any) -> str:
         connector_name = getattr(kv_transfer_config, "kv_connector", None)
 
     return "decode_bench" if connector_name == "DecodeBenchConnector" else "none"
+
+
+def _get_config_value(config: Any, key: str) -> Any:
+    if isinstance(config, dict):
+        return config.get(key)
+    return getattr(config, key, None)
+
+
+def _is_decode_bench_dummy_prefill(kv_transfer_config: Any) -> bool:
+    if connector_mode_from_config(kv_transfer_config) != "decode_bench":
+        return False
+
+    extra_config = _get_config_value(kv_transfer_config, "kv_connector_extra_config")
+    dummy_prefill = _get_config_value(extra_config, "dummy_prefill")
+    if dummy_prefill is None:
+        dummy_prefill = _get_config_value(kv_transfer_config, "dummy_prefill")
+    return bool(dummy_prefill)
+
+
+def _ttft_semantics_from_config(kv_transfer_config: Any) -> str:
+    if _is_decode_bench_dummy_prefill(kv_transfer_config):
+        return TTFT_SEMANTICS_DECODE_BENCH_DUMMY_PREFILL
+    return TTFT_SEMANTICS_FIRST_REAL_TOKEN
+
+
+def _ttft_definition_from_config(kv_transfer_config: Any) -> dict[str, str]:
+    if _is_decode_bench_dummy_prefill(kv_transfer_config):
+        return {
+            "mode": "pre_forward_schedule_boundary",
+            "semantics": TTFT_SEMANTICS_DECODE_BENCH_DUMMY_PREFILL,
+            "applies_when": "DecodeBenchConnector && dummy_prefill",
+            "formula": (
+                "api_preprocess_ms + ipc_in_decode_ms + engine_preprocess_ms + "
+                "(scheduled_ts - queued_ts) * 1000"
+            ),
+        }
+
+    return {
+        "mode": "first_real_token_latency",
+        "semantics": TTFT_SEMANTICS_FIRST_REAL_TOKEN,
+        "applies_when": "otherwise",
+        "formula": "RequestOutput.metrics.first_token_latency * 1000",
+    }
 
 
 def build_poisson_arrival_deadlines_ns(
@@ -287,11 +378,34 @@ def validate_request_lengths(
     )
 
 
+def _compute_pre_forward_ttft_ms(metrics: Any) -> float | None:
+    if metrics is None:
+        return None
+
+    ttft_trace = getattr(metrics, "ttft_trace", None)
+    if ttft_trace is None:
+        return None
+
+    queued_ts = getattr(metrics, "queued_ts", 0.0)
+    scheduled_ts = getattr(metrics, "scheduled_ts", 0.0)
+    if queued_ts == 0.0 or scheduled_ts == 0.0:
+        return None
+
+    preprocess_ns = (
+        getattr(ttft_trace, "api_preprocess_ns", 0)
+        + getattr(ttft_trace, "ipc_in_decode_ns", 0)
+        + getattr(ttft_trace, "engine_preprocess_ns", 0)
+    )
+    queued_to_first_schedule_ms = max(scheduled_ts - queued_ts, 0.0) * 1000.0
+    return float(preprocess_ns / 1e6 + queued_to_first_schedule_ms)
+
+
 def build_success_record(
     request: SampleRequest,
     output: RequestOutput,
     submit_ts_ns: int,
     finish_ts_ns: int,
+    kv_transfer_config: Any = None,
 ) -> dict[str, Any]:
     if not output.finished or not output.outputs:
         raise ValueError("Received a finished request without final outputs.")
@@ -308,12 +422,23 @@ def build_success_record(
     decode_time_ms = None
     inference_time_ms = None
     ttft_ms = None
+    ttft_including_forward_ms = None
+    ttft_post_schedule_to_first_token_ms = None
     if metrics is not None:
         queued_time_ms = _interval_ms(metrics.queued_ts, metrics.scheduled_ts)
         prefill_time_ms = _interval_ms(metrics.scheduled_ts, metrics.first_token_ts)
         decode_time_ms = _interval_ms(metrics.first_token_ts, metrics.last_token_ts)
         inference_time_ms = _interval_ms(metrics.scheduled_ts, metrics.last_token_ts)
-        ttft_ms = float(metrics.first_token_latency * 1000.0)
+        ttft_including_forward_ms = float(metrics.first_token_latency * 1000.0)
+        ttft_ms = ttft_including_forward_ms
+        if _is_decode_bench_dummy_prefill(kv_transfer_config):
+            ttft_ms = _compute_pre_forward_ttft_ms(metrics)
+            if ttft_ms is None:
+                ttft_ms = ttft_including_forward_ms
+            else:
+                ttft_post_schedule_to_first_token_ms = max(
+                    ttft_including_forward_ms - ttft_ms, 0.0
+                )
 
     return {
         "request_id": request.request_id,
@@ -321,6 +446,10 @@ def build_success_record(
         "finish_ts_ns": finish_ts_ns,
         "e2e_ms": float((finish_ts_ns - submit_ts_ns) / 1e6),
         "ttft_ms": ttft_ms,
+        "ttft_including_forward_ms": ttft_including_forward_ms,
+        "ttft_post_schedule_to_first_token_ms": (
+            ttft_post_schedule_to_first_token_ms
+        ),
         "queued_time_ms": queued_time_ms,
         "kv_fill_ms": kv_fill_ms,
         "prefill_time_ms": prefill_time_ms,
@@ -348,6 +477,8 @@ def build_error_record(
         "finish_ts_ns": finish_ts_ns,
         "e2e_ms": float((finish_ts_ns - submit_ts_ns) / 1e6),
         "ttft_ms": None,
+        "ttft_including_forward_ms": None,
+        "ttft_post_schedule_to_first_token_ms": None,
         "queued_time_ms": None,
         "kv_fill_ms": 0.0,
         "prefill_time_ms": None,
@@ -385,6 +516,7 @@ def _metric_summary(records: list[dict[str, Any]], key: str) -> dict[str, float]
 def build_summary(
     records: list[dict[str, Any]],
     connector_mode: str,
+    ttft_semantics: str,
     first_submit_ts_ns: int | None,
     last_finish_ts_ns: int | None,
 ) -> dict[str, Any]:
@@ -408,8 +540,15 @@ def build_summary(
             float(total_requests / runtime_s) if runtime_s > 0 else 0.0
         ),
         "connector_mode": connector_mode,
+        "ttft_semantics": ttft_semantics,
         "e2e_ms": _metric_summary(records, "e2e_ms"),
         "ttft_ms": _metric_summary(records, "ttft_ms"),
+        "ttft_including_forward_ms": _metric_summary(
+            records, "ttft_including_forward_ms"
+        ),
+        "ttft_post_schedule_to_first_token_ms": _metric_summary(
+            records, "ttft_post_schedule_to_first_token_ms"
+        ),
         "queued_time_ms": _metric_summary(records, "queued_time_ms"),
     }
     if connector_mode == "decode_bench":
@@ -470,6 +609,9 @@ def _enforce_harness_observability(args: argparse.Namespace) -> None:
         )
 
     args.disable_log_stats = False
+    args.enable_logging_step_timing_details = True
+    args.enable_graph_replay_timing = True
+    args.logging_step_timing_interval = 10
     args.enable_logging_ttft_timing_details = True
     args.logging_ttft_timing_interval = 1
 
@@ -500,6 +642,7 @@ async def _submit_one_request(
     request: SampleRequest,
     recorder: RunRecorder | None,
     inflight: set[asyncio.Task[None]],
+    kv_transfer_config: Any = None,
 ) -> None:
     assert request.request_id is not None
     assert isinstance(request.prompt, list)
@@ -538,6 +681,7 @@ async def _submit_one_request(
                 output=final_output,
                 submit_ts_ns=submit_ts_ns,
                 finish_ts_ns=finish_ts_ns,
+                kv_transfer_config=kv_transfer_config,
             )
         except Exception as exc:
             if recorder is None:
@@ -690,6 +834,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
         validate_request_lengths(warmup_requests, async_llm.model_config.max_model_len)
 
         connector_mode = connector_mode_from_config(args.kv_transfer_config)
+        ttft_semantics = _ttft_semantics_from_config(args.kv_transfer_config)
         run_meta = {
             "model": args.model,
             "topology": {
@@ -709,6 +854,9 @@ async def run_frontend(args: argparse.Namespace) -> None:
             "request_rate": args.request_rate,
             "arrival_process": args.arrival_process,
             "seed": args.seed,
+            "ttft_definition": _ttft_definition_from_config(
+                args.kv_transfer_config
+            ),
             "warmup_requests": len(warmup_requests),
             "measured_requests": len(measured_requests),
             "benchmark_start_time": datetime.now().astimezone().isoformat(),
@@ -741,6 +889,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
                 request=request,
                 recorder=recorder,
                 inflight=inflight,
+                kv_transfer_config=args.kv_transfer_config,
             )
 
         while inflight:
@@ -749,6 +898,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
         summary = build_summary(
             records=recorder.records,
             connector_mode=connector_mode,
+            ttft_semantics=ttft_semantics,
             first_submit_ts_ns=recorder.first_submit_ts_ns,
             last_finish_ts_ns=recorder.last_finish_ts_ns,
         )
