@@ -2,6 +2,7 @@
 
 > These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
 > Breaching these guidelines can result in automatic banning.
+> In this environment, `/vllm` and `/mnt/nvme1n1/ml_research/linbinbin1/vllm-v0180` refer to the same directory.
 
 ## 1. Contribution Policy (Mandatory)
 

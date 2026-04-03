@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import json
 import math
 import os
@@ -97,6 +98,24 @@ RATE_PLAN_PHASES: dict[str, tuple[tuple[str, tuple[float, ...]], ...]] = {
         ("mid5", MID_SWEEP_REQUEST_RATES),
     ),
 }
+CASE_CSV_FIELDNAMES: tuple[str, ...] = (
+    "enabled",
+    "name",
+    "cluster",
+    "model",
+    "dataset",
+    "strategy",
+    "request_rate",
+    "rate_phase",
+    "max_num_seqs",
+    "gpu_memory_utilization",
+    "max_requests",
+    "warmup_requests",
+    "max_model_len",
+    "data_parallel_rpc_port",
+    "reason",
+    "historical_reference",
+)
 MODEL_SHORT_NAMES: dict[str, str] = {
     "deepseek_v3_1024k": "DPSK",
     "kimi_k2_instruct_0905": "KIMI",
@@ -377,6 +396,23 @@ def bench_duration_to_max_requests(request_rate: float,
     if bench_duration_sec <= 0.0:
         raise ValueError("bench_duration_sec must be > 0.")
     return max(1, int(round(request_rate * bench_duration_sec)))
+
+
+def unique_candidate_rates_for_rate_plan(rate_plan: str) -> tuple[float, ...]:
+    try:
+        rate_plan_phases = RATE_PLAN_PHASES[rate_plan]
+    except KeyError as exc:
+        supported = ", ".join(sorted(RATE_PLAN_PHASES))
+        raise ValueError(
+            f"Unknown rate plan '{rate_plan}'. Supported values: {supported}"
+        ) from exc
+
+    return tuple(
+        sorted({
+            float(rate)
+            for _phase_name, request_rates in rate_plan_phases
+            for rate in request_rates
+        }))
 
 
 def build_experiment_matrix(
@@ -1101,6 +1137,11 @@ def write_case_command_files(
 
 def select_cases(args: argparse.Namespace,
                  experiments: list[ExperimentCase]) -> list[ExperimentCase]:
+    if args.case_csv and (args.all or args.case):
+        raise SystemExit("Use either --case-csv or --all/--case, not both.")
+    if args.case_csv:
+        return load_cases_from_csv(Path(args.case_csv))
+
     available = experiments_by_name(experiments)
     if args.all and args.case:
         raise SystemExit("Use either --all or --case, not both.")
@@ -1157,6 +1198,104 @@ def describe_case(case: ExperimentCase) -> str:
         f"mem={stringify_gpu_memory_utilization(case.gpu_memory_utilization)}, "
         f"bs={case.max_num_seqs}"
     )
+
+
+def _csv_cell(row: Mapping[str, str], key: str) -> str:
+    return (row.get(key) or "").strip()
+
+
+def _csv_bool(row: Mapping[str, str], key: str, *,
+              default: bool) -> bool:
+    raw = _csv_cell(row, key)
+    if not raw:
+        return default
+    lowered = raw.lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value '{raw}' for column '{key}'")
+
+
+def _csv_int(row: Mapping[str, str], key: str, *,
+             default: int | None = None) -> int | None:
+    raw = _csv_cell(row, key)
+    if not raw:
+        return default
+    return int(raw)
+
+
+def _csv_float(row: Mapping[str, str], key: str, *,
+               default: float | None = None) -> float | None:
+    raw = _csv_cell(row, key)
+    if not raw:
+        return default
+    return float(raw)
+
+
+def load_cases_from_csv(path: Path) -> list[ExperimentCase]:
+    if not path.is_file():
+        raise SystemExit(f"Case CSV not found: {path}")
+
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                raise SystemExit(f"Case CSV has no header row: {path}")
+
+            rows = list(reader)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise SystemExit(f"Failed to read case CSV {path}: {exc}") from exc
+
+    cases: list[ExperimentCase] = []
+    for row_index, row in enumerate(rows, start=2):
+        try:
+            if not _csv_bool(row, "enabled", default=True):
+                continue
+
+            name = _csv_cell(row, "name")
+            cluster = _csv_cell(row, "cluster")
+            model = _csv_cell(row, "model")
+            dataset = _csv_cell(row, "dataset")
+            strategy = _csv_cell(row, "strategy")
+            request_rate_raw = _csv_cell(row, "request_rate")
+            if not all(
+                    (name, cluster, model, dataset, strategy, request_rate_raw)):
+                raise ValueError(
+                    "missing one of required columns: "
+                    "name, cluster, model, dataset, strategy, request_rate")
+
+            cases.append(
+                ExperimentCase(
+                    name=name,
+                    cluster=cluster,
+                    strategy=strategy,
+                    dataset=dataset,
+                    model=model,
+                    request_rate=float(request_rate_raw),
+                    rate_phase=_csv_cell(row, "rate_phase") or DEFAULT_RATE_PLAN,
+                    gpu_memory_utilization=_csv_float(
+                        row,
+                        "gpu_memory_utilization",
+                        default=DEFAULT_GPU_MEMORY_UTILIZATION,
+                    ) or DEFAULT_GPU_MEMORY_UTILIZATION,
+                    max_requests=_csv_int(row, "max_requests"),
+                    warmup_requests=_csv_int(row, "warmup_requests",
+                                             default=0) or 0,
+                    max_num_seqs=_csv_int(row, "max_num_seqs"),
+                    max_model_len=_csv_int(row, "max_model_len"),
+                    data_parallel_rpc_port=_csv_int(
+                        row,
+                        "data_parallel_rpc_port",
+                        default=29550,
+                    ) or 29550,
+                ))
+        except Exception as exc:
+            raise SystemExit(
+                f"Invalid case CSV row {row_index} in {path}: {exc}") from exc
+    return cases
 
 
 def _metric_summary(records: list[dict[str, Any]],
@@ -1448,6 +1587,15 @@ def latest_successful_case_dir(case_group_dir: Path) -> Path | None:
     return None
 
 
+def latest_case_dir(case_group_dir: Path) -> Path | None:
+    if not case_group_dir.is_dir():
+        return None
+
+    candidates = sorted((path for path in case_group_dir.iterdir() if path.is_dir()),
+                        reverse=True)
+    return candidates[0] if candidates else None
+
+
 def latest_successful_case_tpot_by_e2e_mean(case_group_dir: Path) -> tuple[
         Path, float | None] | None:
     case_dir = latest_successful_case_dir(case_group_dir)
@@ -1477,6 +1625,18 @@ def latest_successful_case_tpot_by_e2e_mean(case_group_dir: Path) -> tuple[
         return case_dir, None
 
     return case_dir, extract_summary_tpot_by_e2e_mean(summary)
+
+
+def latest_case_status(case_group_dir: Path) -> tuple[Path, str | None] | None:
+    case_dir = latest_case_dir(case_group_dir)
+    if case_dir is None:
+        return None
+
+    manifest = load_optional_json(case_dir / "case_manifest.json")
+    if manifest is None:
+        return case_dir, None
+    status = manifest.get("status")
+    return case_dir, status if isinstance(status, str) and status else None
 
 
 def historical_case_group_dirs(
@@ -1530,6 +1690,32 @@ def latest_successful_case_tpot_by_e2e_mean_for_case(
     return best_match
 
 
+def latest_case_status_for_case(
+    artifact_root: Path,
+    case: ExperimentCase,
+    *,
+    ignore_bs: bool,
+) -> tuple[Path, str | None] | None:
+    exact_group_dir = case_artifact_group_dir(artifact_root, case)
+    best_match: tuple[Path, str | None] | None = None
+    best_sort_key: tuple[str, int, str] | None = None
+    for case_group_dir in historical_case_group_dirs(artifact_root,
+                                                     case,
+                                                     ignore_bs=ignore_bs):
+        candidate = latest_case_status(case_group_dir)
+        if candidate is None:
+            continue
+        candidate_sort_key = (
+            candidate[0].name,
+            int(candidate[0].parent == exact_group_dir),
+            candidate[0].parent.name,
+        )
+        if best_sort_key is None or candidate_sort_key > best_sort_key:
+            best_match = candidate
+            best_sort_key = candidate_sort_key
+    return best_match
+
+
 def build_historical_skip_state(
     artifact_root: Path,
     selected_cases: list[ExperimentCase],
@@ -1540,39 +1726,64 @@ def build_historical_skip_state(
     blocked_group_rates: dict[str, tuple[float, str]] = {}
 
     for case in selected_cases:
+        group_key = case_group_key(case)
+        exact_group_dir = case_artifact_group_dir(artifact_root, case)
         historical = latest_successful_case_tpot_by_e2e_mean_for_case(
             artifact_root, case, ignore_bs=ignore_bs)
-        if historical is None:
+        if historical is not None:
+            case_dir, tpot_by_e2e_mean = historical
+            case_result_tag = case_dir.name
+            exact_reason = (
+                f"latest successful result already exists at {case_result_tag}")
+            matched_group_dir = case_dir.parent
+            if ignore_bs and matched_group_dir != exact_group_dir:
+                exact_reason += (f" under {matched_group_dir.name} "
+                                 "(matched with different bs)")
+            if tpot_by_e2e_mean is not None:
+                exact_reason += f" (tpot_by_e2e.mean={tpot_by_e2e_mean:.3f}ms)"
+            exact_case_skips[case.name] = exact_reason
+
+            if tpot_by_e2e_mean is not None:
+                if tpot_by_e2e_mean > TPOT_BY_E2E_EARLY_STOP_MS:
+                    existing = blocked_group_rates.get(group_key)
+                    reason = (
+                        "historical latest successful result for "
+                        f"rate={stringify_request_rate(case.request_rate)} at "
+                        f"{case_result_tag} has "
+                        f"tpot_by_e2e.mean={tpot_by_e2e_mean:.3f}ms "
+                        f"> {TPOT_BY_E2E_EARLY_STOP_MS:g}ms")
+                    if ignore_bs and matched_group_dir != exact_group_dir:
+                        reason += (
+                            f" under {matched_group_dir.name} "
+                            "(matched with different bs)")
+                    if existing is None or case.request_rate < existing[0]:
+                        blocked_group_rates[group_key] = (case.request_rate,
+                                                          reason)
+
+        latest_status = latest_case_status_for_case(
+            artifact_root,
+            case,
+            ignore_bs=ignore_bs,
+        )
+        if latest_status is None:
             continue
 
-        case_dir, tpot_by_e2e_mean = historical
-        case_result_tag = case_dir.name
-        exact_reason = (
-            f"latest successful result already exists at {case_result_tag}")
-        matched_group_dir = case_dir.parent
+        latest_case_dir_path, status = latest_status
+        if status not in {"timed_out", "failed"}:
+            continue
+
+        matched_group_dir = latest_case_dir_path.parent
         exact_group_dir = case_artifact_group_dir(artifact_root, case)
-        if ignore_bs and matched_group_dir != exact_group_dir:
-            exact_reason += (f" under {matched_group_dir.name} "
-                             "(matched with different bs)")
-        if tpot_by_e2e_mean is not None:
-            exact_reason += f" (tpot_by_e2e.mean={tpot_by_e2e_mean:.3f}ms)"
-        exact_case_skips[case.name] = exact_reason
-
-        if (tpot_by_e2e_mean is None
-                or tpot_by_e2e_mean <= TPOT_BY_E2E_EARLY_STOP_MS):
-            continue
-
-        group_key = case_group_key(case)
-        existing = blocked_group_rates.get(group_key)
-        reason = (
-            "historical latest successful result for "
+        status_reason = (
+            "historical latest case for "
             f"rate={stringify_request_rate(case.request_rate)} at "
-            f"{case_result_tag} has tpot_by_e2e.mean={tpot_by_e2e_mean:.3f}ms "
-            f"> {TPOT_BY_E2E_EARLY_STOP_MS:g}ms")
+            f"{latest_case_dir_path.name} ended with status={status}")
         if ignore_bs and matched_group_dir != exact_group_dir:
-            reason += f" under {matched_group_dir.name} (matched with different bs)"
+            status_reason += (
+                f" under {matched_group_dir.name} (matched with different bs)")
+        existing = blocked_group_rates.get(group_key)
         if existing is None or case.request_rate < existing[0]:
-            blocked_group_rates[group_key] = (case.request_rate, reason)
+            blocked_group_rates[group_key] = (case.request_rate, status_reason)
 
     return exact_case_skips, blocked_group_rates
 
@@ -2676,6 +2887,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="Run a specific case by name. May be repeated.",
     )
+    parser.add_argument(
+        "--case-csv",
+        default=None,
+        help=("Load cases from a CSV file. CSV row order is preserved and "
+              "rows with enabled=0 are ignored."),
+    )
     parser.add_argument("--all",
                         action="store_true",
                         help="Run all configured cases sequentially.")
@@ -2734,24 +2951,28 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    experiments = build_experiment_matrix(args.rate_plan)
-
-    if args.list:
-        for case in experiments:
-            print(describe_case(case))
-        return
-
+    experiments = ([] if args.case_csv else build_experiment_matrix(args.rate_plan))
     selected_cases = apply_bench_duration_override(
         select_cases(args, experiments),
         args.bench_duration_sec,
     )
+
+    if args.list:
+        for case in selected_cases if args.case_csv else experiments:
+            print(describe_case(case))
+        return
+
+    resolved_rate_plan = (f"case_csv:{Path(args.case_csv).name}"
+                          if args.case_csv else args.rate_plan)
     runner = ManualMultinodeRunner(
         Path(args.artifact_root),
         dry_run=args.dry_run,
         keep_going=args.keep_going,
         historical_skip_ignore_bs=args.historical_skip_ignore_bs,
     )
-    results = runner.run(selected_cases, args.run_label, rate_plan=args.rate_plan)
+    results = runner.run(selected_cases,
+                         args.run_label,
+                         rate_plan=resolved_rate_plan)
 
     failures = [result for result in results if result.status not in {"ok", "dry_run"}]
     if failures:

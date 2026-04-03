@@ -1317,3 +1317,111 @@ def test_run_writes_partial_manifest_when_aborted(
     assert manifest["aborted"]["type"] == "SystemExit"
     assert manifest["aborted"]["exit_code"] == 143
     assert manifest["aborted"]["detail"] == "143"
+
+
+@pytest.mark.benchmark
+def test_load_cases_from_csv_skips_disabled_rows_and_preserves_order(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    csv_path = tmp_path / "cases.csv"
+    csv_path.write_text(
+        "\n".join([
+            ",".join(runner.CASE_CSV_FIELDNAMES),
+            ("1,case_b,cluster_b,model_b,dataset_b,strategy_b,20,manual,"
+             "64,0.9,200,8,4096,29551,planned,ref_b"),
+            ("0,case_skip,cluster_b,model_b,dataset_b,strategy_b,25,manual,"
+             "64,0.9,250,8,4096,29551,planned,ref_skip"),
+            ("1,case_a,cluster_a,model_a,dataset_a,strategy_a,10,,32,0.85,"
+             "100,0,,29550,planned,ref_a"),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    cases = runner.load_cases_from_csv(csv_path)
+
+    assert [case.name for case in cases] == ["case_b", "case_a"]
+    assert cases[0].request_rate == pytest.approx(20.0)
+    assert cases[0].rate_phase == "manual"
+    assert cases[0].max_num_seqs == 64
+    assert cases[0].gpu_memory_utilization == pytest.approx(0.9)
+    assert cases[0].max_requests == 200
+    assert cases[0].warmup_requests == 8
+    assert cases[0].max_model_len == 4096
+    assert cases[0].data_parallel_rpc_port == 29551
+    assert cases[1].rate_phase == runner.DEFAULT_RATE_PLAN
+    assert cases[1].warmup_requests == 0
+    assert cases[1].max_model_len is None
+
+
+@pytest.mark.benchmark
+def test_select_cases_rejects_case_csv_with_all(tmp_path: Path) -> None:
+    runner = load_runner_module()
+    csv_path = tmp_path / "cases.csv"
+    csv_path.write_text(
+        "name,cluster,model,dataset,strategy,request_rate\n"
+        "case_a,cluster_a,model_a,dataset_a,strategy_a,10\n",
+        encoding="utf-8",
+    )
+    args = runner.build_parser().parse_args(
+        ["--case-csv", str(csv_path), "--all"])
+
+    with pytest.raises(SystemExit,
+                       match="Use either --case-csv or --all/--case, not both."):
+        runner.select_cases(args, [])
+
+
+@pytest.mark.benchmark
+def test_build_historical_skip_state_blocks_higher_rates_after_historical_timeout(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    artifact_root = tmp_path / "artifacts"
+    shared = dict(
+        cluster="cluster_a",
+        strategy="strategy_a",
+        dataset="dataset_a",
+        model="model_a",
+        max_num_seqs=64,
+        gpu_memory_utilization=0.85,
+        warmup_requests=0,
+    )
+    cases = [
+        runner.ExperimentCase(
+            name="group_rate30",
+            request_rate=30.0,
+            max_requests=300,
+            **shared,
+        ),
+        runner.ExperimentCase(
+            name="group_rate40",
+            request_rate=40.0,
+            max_requests=400,
+            **shared,
+        ),
+        runner.ExperimentCase(
+            name="group_rate50",
+            request_rate=50.0,
+            max_requests=500,
+            **shared,
+        ),
+    ]
+    timed_out_dir = (runner.case_artifact_group_dir(artifact_root, cases[1]) /
+                     "20260403-160000")
+    timed_out_dir.mkdir(parents=True, exist_ok=True)
+    (timed_out_dir / "case_manifest.json").write_text(
+        json.dumps({"status": "timed_out"}) + "\n",
+        encoding="utf-8",
+    )
+
+    exact_case_skips, blocked_group_rates = runner.build_historical_skip_state(
+        artifact_root,
+        cases,
+        ignore_bs=False,
+    )
+
+    group_key = runner.case_group_key(cases[1])
+    assert exact_case_skips == {}
+    assert blocked_group_rates[group_key][0] == pytest.approx(40.0)
+    assert "status=timed_out" in blocked_group_rates[group_key][1]
+    assert runner.block_reason_for_rate(blocked_group_rates, cases[2]) is not None
+    assert runner.block_reason_for_rate(blocked_group_rates, cases[1]) is not None
+    assert runner.block_reason_for_rate(blocked_group_rates, cases[0]) is None
