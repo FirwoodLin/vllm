@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import io
 import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +24,42 @@ def load_runner_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+class SequencedPollProcess:
+
+    def __init__(self, poll_results: list[int | None]) -> None:
+        self._poll_results = list(poll_results)
+        self._last_result: int | None = None
+
+    def poll(self) -> int | None:
+        if self._poll_results:
+            self._last_result = self._poll_results.pop(0)
+        return self._last_result
+
+
+def make_node_runtime(
+    runner,
+    tmp_path: Path,
+    *,
+    node_rank: int,
+    host: str,
+    poll_results: list[int | None],
+    launch_log: str = "",
+    runtime_log: str = "",
+):
+    launch_log_path = tmp_path / f"rank{node_rank}.launch.log"
+    runtime_log_path = tmp_path / f"rank{node_rank}.log"
+    launch_log_path.write_text(launch_log, encoding="utf-8")
+    runtime_log_path.write_text(runtime_log, encoding="utf-8")
+    return runner.NodeRuntime(
+        node_rank=node_rank,
+        host=host,
+        process=SequencedPollProcess(poll_results),
+        launch_log_path=launch_log_path,
+        launch_log_handle=io.StringIO(),
+        runtime_log_path=runtime_log_path,
+    )
 
 
 @pytest.mark.benchmark
@@ -67,6 +105,15 @@ def test_resolve_case_uses_overridden_remote_hosts(tmp_path: Path) -> None:
     assert resolved.cluster.remote_hosts == ("node-b", "node-c", "node-d")
     assert resolved.dataset_path == dataset_path.resolve()
     assert resolved.model_path == model_dir.resolve()
+
+
+@pytest.mark.benchmark
+def test_build_parser_keeps_going_by_default() -> None:
+    runner = load_runner_module()
+    parser = runner.build_parser()
+
+    assert parser.parse_args(["--list"]).keep_going is True
+    assert parser.parse_args(["--list", "--no-keep-going"]).keep_going is False
 
 
 @pytest.mark.benchmark
@@ -196,8 +243,11 @@ def test_launch_and_cleanup_commands_use_shared_artifact_paths(
         datasets={"dataset_alias": str(dataset_path)},
         models={"model_alias": str(model_dir)},
     )
-    artifacts = runner.prepare_artifact_paths(tmp_path / "run", resolved.case.name,
-                                              resolved.cluster.remote_hosts)
+    artifacts = runner.prepare_artifact_paths(
+        tmp_path / "run",
+        resolved.cluster.remote_hosts,
+        run_tag=resolved.case.name,
+    )
 
     frontend_command = runner.build_local_launch_command(
         resolved,
@@ -216,6 +266,11 @@ def test_launch_and_cleanup_commands_use_shared_artifact_paths(
     assert "offline_poisson_harness.py frontend" in cleanup_command
     assert "--data-parallel-rpc-port 29550" in cleanup_command
     assert "--master-port 29579" in cleanup_command
+    assert ("pgrep -f -- '^python3 /vllm/offline_poisson_harness.py frontend"
+            "( |$)'" in cleanup_command)
+    assert ("pkill -KILL -f -- '^python3 "
+            "/vllm/offline_poisson_harness.py frontend( |$)'"
+            in cleanup_command)
     assert "VLLM::Worker_" in cleanup_command
 
 
@@ -255,8 +310,11 @@ def test_write_case_manifest_includes_commands_and_paths(tmp_path: Path) -> None
         datasets={"dataset_alias": str(dataset_path)},
         models={"model_alias": str(model_dir)},
     )
-    artifacts = runner.prepare_artifact_paths(tmp_path / "run", resolved.case.name,
-                                              resolved.cluster.remote_hosts)
+    artifacts = runner.prepare_artifact_paths(
+        tmp_path / "run",
+        resolved.cluster.remote_hosts,
+        run_tag=resolved.case.name,
+    )
     artifacts.case_dir.mkdir(parents=True, exist_ok=True)
     runner.write_case_manifest(
         resolved,
@@ -365,3 +423,394 @@ def test_augment_benchmark_outputs_adds_tpot_metrics(tmp_path: Path) -> None:
     assert summary["tpot_by_e2e"]["p95"] == pytest.approx(46.2)
     assert summary["tpot_by_e2e"]["p99"] == pytest.approx(49.24)
     assert "tpot_with_initial_queue_ms" not in summary
+
+
+@pytest.mark.benchmark
+def test_wait_for_frontend_allows_clean_headless_shutdown(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=False)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+
+    frontend = make_node_runtime(
+        runner,
+        tmp_path,
+        node_rank=0,
+        host="local",
+        poll_results=[None, None, 0],
+    )
+    headless = make_node_runtime(
+        runner,
+        tmp_path,
+        node_rank=1,
+        host="node-a",
+        poll_results=[None, 0],
+    )
+    runtime = SimpleNamespace(
+        frontend=frontend,
+        headless_nodes=[headless],
+        resolved=SimpleNamespace(
+            case=SimpleNamespace(max_bench_duration_sec=60.0)),
+    )
+
+    assert launcher.wait_for_frontend(runtime) == 0
+
+
+@pytest.mark.benchmark
+def test_wait_for_frontend_still_fails_for_nonzero_headless_exit(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=False)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+
+    frontend = make_node_runtime(
+        runner,
+        tmp_path,
+        node_rank=0,
+        host="local",
+        poll_results=[None],
+    )
+    headless = make_node_runtime(
+        runner,
+        tmp_path,
+        node_rank=1,
+        host="node-a",
+        poll_results=[7],
+        runtime_log="remote rank failed\n",
+    )
+    runtime = SimpleNamespace(
+        frontend=frontend,
+        headless_nodes=[headless],
+        resolved=SimpleNamespace(
+            case=SimpleNamespace(max_bench_duration_sec=60.0)),
+    )
+
+    with pytest.raises(RuntimeError, match="rank 1 on node-a exited early"):
+        launcher.wait_for_frontend(runtime)
+
+
+@pytest.mark.benchmark
+def test_wait_for_frontend_times_out_after_case_limit(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=False)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    monotonic_values = iter([100.0, 103.0])
+    monkeypatch.setattr(runner.time, "monotonic",
+                        lambda: next(monotonic_values))
+
+    frontend = make_node_runtime(
+        runner,
+        tmp_path,
+        node_rank=0,
+        host="local",
+        poll_results=[None],
+    )
+    headless = make_node_runtime(
+        runner,
+        tmp_path,
+        node_rank=1,
+        host="node-a",
+        poll_results=[None],
+    )
+    runtime = SimpleNamespace(
+        frontend=frontend,
+        headless_nodes=[headless],
+        resolved=SimpleNamespace(
+            case=SimpleNamespace(max_bench_duration_sec=2.0)),
+    )
+
+    with pytest.raises(runner.BenchTimeoutError,
+                       match="max_bench_duration_sec=2s"):
+        launcher.wait_for_frontend(runtime)
+
+
+@pytest.mark.benchmark
+def test_run_preclean_retries_until_local_ports_clear(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=True)
+    frontend_cleanup = tmp_path / "frontend.cleanup.command.sh"
+    frontend_cleanup.write_text("frontend cleanup\n", encoding="utf-8")
+    rank1_cleanup = tmp_path / "rank1.cleanup.command.sh"
+    rank1_cleanup.write_text("rank1 cleanup\n", encoding="utf-8")
+
+    calls: list[tuple[str, str]] = []
+    waits: list[tuple[int, ...]] = []
+    busy_states = iter([(29550, ), ()])
+
+    monkeypatch.setattr(
+        launcher,
+        "run_local_shell",
+        lambda _cluster, command: calls.append(("local", command)),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "run_remote_shell",
+        lambda _cluster, host, command: calls.append((host, command)),
+    )
+
+    def fake_wait(ports, *, timeout_sec, poll_interval_sec):
+        waits.append(ports)
+        assert timeout_sec == runner.PRESTART_CLEANUP_WAIT_SEC
+        assert poll_interval_sec == runner.PRESTART_CLEANUP_POLL_INTERVAL_SEC
+        return next(busy_states)
+
+    monkeypatch.setattr(runner, "wait_for_local_ports_to_clear", fake_wait)
+
+    resolved = SimpleNamespace(
+        cluster=SimpleNamespace(remote_hosts=("node-a", ), master_port=29579),
+        case=SimpleNamespace(data_parallel_rpc_port=29550),
+    )
+    artifacts = SimpleNamespace(
+        frontend_cleanup_command_path=frontend_cleanup,
+        rank_cleanup_command_paths={1: rank1_cleanup},
+    )
+
+    launcher.run_preclean(resolved, artifacts)
+
+    assert calls == [
+        ("local", "frontend cleanup\n"),
+        ("node-a", "rank1 cleanup\n"),
+        ("local", "frontend cleanup\n"),
+        ("node-a", "rank1 cleanup\n"),
+    ]
+    assert waits == [(29550, 29579), (29550, 29579)]
+
+
+@pytest.mark.benchmark
+def test_run_preclean_fails_if_local_ports_remain_busy(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=True)
+    frontend_cleanup = tmp_path / "frontend.cleanup.command.sh"
+    frontend_cleanup.write_text("frontend cleanup\n", encoding="utf-8")
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        launcher,
+        "run_local_shell",
+        lambda _cluster, command: calls.append(command),
+    )
+    monkeypatch.setattr(launcher, "run_remote_shell", lambda *_args: None)
+    monkeypatch.setattr(runner, "PRESTART_CLEANUP_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(
+        runner,
+        "wait_for_local_ports_to_clear",
+        lambda *_args, **_kwargs: (29550, ),
+    )
+
+    resolved = SimpleNamespace(
+        cluster=SimpleNamespace(remote_hosts=(), master_port=29579),
+        case=SimpleNamespace(data_parallel_rpc_port=29550),
+    )
+    artifacts = SimpleNamespace(
+        frontend_cleanup_command_path=frontend_cleanup,
+        rank_cleanup_command_paths={},
+    )
+
+    with pytest.raises(RuntimeError,
+                       match="preclean could not free local ports"):
+        launcher.run_preclean(resolved, artifacts)
+
+    assert calls == ["frontend cleanup\n", "frontend cleanup\n"]
+
+
+@pytest.mark.benchmark
+def test_run_continues_after_failed_case_when_keep_going_enabled(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=True)
+    monkeypatch.setattr(runner, "build_historical_skip_state",
+                        lambda *_args, **_kwargs: ({}, {}))
+    monkeypatch.setattr(runner, "current_run_tag",
+                        lambda: "20260403-000000")
+    monkeypatch.setattr(runner, "current_iso_timestamp",
+                        lambda: "2026-04-03T00:00:00+08:00")
+    monkeypatch.setattr(launcher, "install_signal_handlers", lambda: None)
+    monkeypatch.setattr(launcher, "restore_signal_handlers", lambda: None)
+
+    executed_cases: list[str] = []
+
+    def fake_run_case(case, _run_dir):
+        executed_cases.append(case.name)
+        case_dir = tmp_path / case.name
+        benchmark_dir = case_dir / "benchmark"
+        summary_json = benchmark_dir / "summary.json"
+        benchmark_dir.mkdir(parents=True, exist_ok=True)
+
+        status = "failed" if case.name == "group_a_rate10" else "ok"
+        if status == "ok":
+            summary_json.write_text(
+                json.dumps({
+                    "tpot_by_e2e": {
+                        "mean": 10.0,
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+        return runner.CaseResult(
+            case_name=case.name,
+            status=status,
+            exit_code=1 if status == "failed" else 0,
+            started_at="2026-04-03T00:00:00+08:00",
+            finished_at="2026-04-03T00:10:00+08:00",
+            case_dir=case_dir,
+            benchmark_dir=benchmark_dir,
+            summary_json=summary_json,
+            detail=status,
+        )
+
+    monkeypatch.setattr(launcher, "run_case", fake_run_case)
+
+    cases = [
+        runner.ExperimentCase(
+            name="group_a_rate10",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=10.0,
+        ),
+        runner.ExperimentCase(
+            name="group_a_rate20",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=20.0,
+        ),
+        runner.ExperimentCase(
+            name="group_b_rate10",
+            cluster="cluster_a",
+            strategy="strategy_b",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=10.0,
+        ),
+    ]
+
+    results = launcher.run(cases,
+                           run_label="failed_sweep",
+                           rate_plan="coarse10")
+
+    assert executed_cases == ["group_a_rate10", "group_b_rate10"]
+    assert [result.case_name for result in results] == [
+        "group_a_rate10",
+        "group_b_rate10",
+    ]
+
+    run_manifest_path = (tmp_path / "_runs" / "20260403-000000__failed_sweep" /
+                         "run_manifest.json")
+    manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    blocked = manifest["runtime_blocked_groups"]["MODEL_A/dataset_a/strategy_a"]
+    assert blocked["blocked_from_rate"] == 10.0
+    assert blocked["reason"] == "case status=failed"
+
+
+@pytest.mark.benchmark
+def test_run_continues_after_timeout_and_skips_higher_rates_in_group(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=False)
+    monkeypatch.setattr(runner, "build_historical_skip_state",
+                        lambda *_args, **_kwargs: ({}, {}))
+    monkeypatch.setattr(runner, "current_run_tag",
+                        lambda: "20260403-000000")
+    monkeypatch.setattr(runner, "current_iso_timestamp",
+                        lambda: "2026-04-03T00:00:00+08:00")
+    monkeypatch.setattr(launcher, "install_signal_handlers", lambda: None)
+    monkeypatch.setattr(launcher, "restore_signal_handlers", lambda: None)
+
+    executed_cases: list[str] = []
+
+    def fake_run_case(case, _run_dir):
+        executed_cases.append(case.name)
+        case_dir = tmp_path / case.name
+        benchmark_dir = case_dir / "benchmark"
+        summary_json = benchmark_dir / "summary.json"
+        benchmark_dir.mkdir(parents=True, exist_ok=True)
+
+        status = "timed_out" if case.name == "group_a_rate10" else "ok"
+        if status == "ok":
+            summary_json.write_text(
+                json.dumps({
+                    "tpot_by_e2e": {
+                        "mean": 10.0,
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+        return runner.CaseResult(
+            case_name=case.name,
+            status=status,
+            exit_code=124 if status == "timed_out" else 0,
+            started_at="2026-04-03T00:00:00+08:00",
+            finished_at="2026-04-03T00:10:00+08:00",
+            case_dir=case_dir,
+            benchmark_dir=benchmark_dir,
+            summary_json=summary_json,
+            detail=status,
+        )
+
+    monkeypatch.setattr(launcher, "run_case", fake_run_case)
+
+    cases = [
+        runner.ExperimentCase(
+            name="group_a_rate10",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=10.0,
+        ),
+        runner.ExperimentCase(
+            name="group_a_rate20",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=20.0,
+        ),
+        runner.ExperimentCase(
+            name="group_b_rate10",
+            cluster="cluster_a",
+            strategy="strategy_b",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=10.0,
+        ),
+    ]
+
+    results = launcher.run(cases,
+                           run_label="timeout_sweep",
+                           rate_plan="coarse10")
+
+    assert executed_cases == ["group_a_rate10", "group_b_rate10"]
+    assert [result.case_name for result in results] == [
+        "group_a_rate10",
+        "group_b_rate10",
+    ]
+
+    run_manifest_path = (tmp_path / "_runs" / "20260403-000000__timeout_sweep" /
+                         "run_manifest.json")
+    manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    blocked = manifest["runtime_blocked_groups"]["MODEL_A/dataset_a/strategy_a"]
+    assert blocked["blocked_from_rate"] == 10.0
+    assert blocked["reason"] == "case status=timed_out"
