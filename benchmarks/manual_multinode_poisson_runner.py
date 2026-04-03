@@ -16,6 +16,7 @@ import math
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -64,7 +65,43 @@ DEFAULT_ENV_OVERRIDES = {
     "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": "uniform_random",
     "VLLM_RANDOMIZE_DP_DUMMY_INPUTS": "1",
 }
-DEFAULT_SHARED_CLI_ARGS = ("--no-enable-prefix-caching",)
+DEFAULT_SHARED_CLI_ARGS = (
+    "--no-enable-prefix-caching",
+    "--trust-remote-code",
+)
+DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
+DEFAULT_BENCH_TIMEOUT_SEC = 35 * 60
+DEFAULT_SWEEP_BENCH_DURATION_SEC = 600.0
+PRESTART_CLEANUP_MAX_ATTEMPTS = 3
+PRESTART_CLEANUP_WAIT_SEC = 10.0
+PRESTART_CLEANUP_POLL_INTERVAL_SEC = 1.0
+TPOT_BY_E2E_EARLY_STOP_MS = 100.0
+RATE_SWEEP_START = 10
+RATE_SWEEP_STOP = 90
+RATE_SWEEP_STEP = 10
+MID_RATE_SWEEP_OFFSET = RATE_SWEEP_STEP // 2
+SWEEP_REQUEST_RATES: tuple[float, ...] = tuple(
+    float(rate) for rate in range(RATE_SWEEP_START, RATE_SWEEP_STOP + 1,
+                                  RATE_SWEEP_STEP))
+MID_SWEEP_REQUEST_RATES: tuple[float, ...] = tuple(
+    float(rate)
+    for rate in range(RATE_SWEEP_START + MID_RATE_SWEEP_OFFSET,
+                      RATE_SWEEP_STOP, RATE_SWEEP_STEP))
+DEFAULT_RATE_PLAN = "coarse10"
+RATE_PLAN_PHASES: dict[str, tuple[tuple[str, tuple[float, ...]], ...]] = {
+    "coarse10": (("coarse10", SWEEP_REQUEST_RATES), ),
+    "coarse10_then_mid5": (
+        ("coarse10", SWEEP_REQUEST_RATES),
+        ("mid5", MID_SWEEP_REQUEST_RATES),
+    ),
+}
+MODEL_SHORT_NAMES: dict[str, str] = {
+    "deepseek_v3_1024k": "DPSK",
+    "kimi_k2_instruct_0905": "KIMI",
+}
+DATASET_SHORT_NAMES: dict[str, str] = {
+    "issue01_random": "issue01_random",
+}
 
 
 @dataclass(frozen=True)
@@ -108,6 +145,8 @@ class ExperimentCase:
     dataset: str
     model: str = "deepseek_v3_1024k"
     request_rate: float = 100.0
+    rate_phase: str = DEFAULT_RATE_PLAN
+    gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
     max_requests: int | None = None
     warmup_requests: int = 0
     max_num_seqs: int | None = None
@@ -129,6 +168,7 @@ class ExperimentCase:
     start_grace_sec: float = 8.0
     remote_shutdown_grace_sec: float = 30.0
     cleanup_worker_processes: bool = True
+    max_bench_duration_sec: float | None = DEFAULT_BENCH_TIMEOUT_SEC
 
 
 @dataclass(frozen=True)
@@ -191,6 +231,10 @@ class CaseResult:
     detail: str
 
 
+class BenchTimeoutError(TimeoutError):
+    pass
+
+
 # -----------------------------------------------------------------------------
 # Manual config block: edit these directly for your cluster and experiments.
 # -----------------------------------------------------------------------------
@@ -245,46 +289,19 @@ CLUSTERS: dict[str, ClusterSpec] = {
 }
 
 STRATEGIES: dict[str, StrategySpec] = {
-    ### 2node strategies
-    "dp16_tp1_dcp1_ep":
+    "dp4dcp8":
     StrategySpec(
-        data_parallel_size=16,
-        data_parallel_size_local=8,
-        tensor_parallel_size=1,
-        decode_context_parallel_size=1,
-        data_parallel_backend="mp",
-        enable_expert_parallel=True,
-        attention_backend="FLASHMLA",
-        all2all_backend="deepep_low_latency",
-    ),
-    "dp8_tp2_dcp2_ep":
-    StrategySpec(
-        data_parallel_size=8,
-        data_parallel_size_local=4,
-        tensor_parallel_size=2,
-        decode_context_parallel_size=2,
+        data_parallel_size=4,
+        data_parallel_size_local=1,
+        tensor_parallel_size=8,
+        decode_context_parallel_size=8,
         data_parallel_backend="mp",
         enable_expert_parallel=True,
         attention_backend="FLASHMLA",
         all2all_backend="deepep_low_latency",
         dcp_comm_backend="a2a",
     ),
-    
-    
-    ### 4node strategies
-    "dp32_tp1_dcp1_ep":
-    StrategySpec(
-        data_parallel_size=32,
-        data_parallel_size_local=8,
-        tensor_parallel_size=1,
-        decode_context_parallel_size=1,
-        data_parallel_backend="mp",
-        enable_expert_parallel=True,
-        attention_backend="FLASHMLA",
-        all2all_backend="deepep_low_latency",
-    ),
-    
-    "dp8_tp4_dcp4_ep":
+    "dp8dcp4":
     StrategySpec(
         data_parallel_size=8,
         data_parallel_size_local=2,
@@ -296,23 +313,114 @@ STRATEGIES: dict[str, StrategySpec] = {
         all2all_backend="deepep_low_latency",
         dcp_comm_backend="a2a",
     ),
+    "dp16cp2":
+    StrategySpec(
+        data_parallel_size=16,
+        data_parallel_size_local=4,
+        tensor_parallel_size=2,
+        decode_context_parallel_size=2,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASHMLA",
+        all2all_backend="deepep_low_latency",
+        dcp_comm_backend="a2a",
+    ),
+    "dp32":
+    StrategySpec(
+        data_parallel_size=32,
+        data_parallel_size_local=8,
+        tensor_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASHMLA",
+        all2all_backend="deepep_low_latency",
+    ),
 }
 
-EXPERIMENTS: list[ExperimentCase] = [
-    ExperimentCase(
-        name="async_dp8_tp4_1k1k_r30_bs384",
-        cluster="4node_h200",
-        strategy="dp8_tp4_dcp4_ep",
-        dataset="issue01_random",
-        model="deepseek_v3_1024k",
-        request_rate=30.0,
-        max_requests=9000,
-        warmup_requests=32,
-        max_num_seqs=386,
-        max_model_len=1000000,
-        data_parallel_rpc_port=29550,
-    ),
-]
+SWEEP_CLUSTER = "4node_h200"
+SWEEP_DATASET = "issue01_random"
+SWEEP_MODELS: tuple[str, ...] = (
+    "kimi_k2_instruct_0905",
+    "deepseek_v3_1024k",
+)
+SWEEP_STRATEGIES: tuple[str, ...] = (
+    "dp4dcp8",
+    "dp8dcp4",
+    "dp16cp2",
+    "dp32",
+)
+STRATEGY_MAX_NUM_SEQS: dict[str, int] = {
+    "dp4dcp8": 768,
+    "dp8dcp4": 512,
+    "dp16cp2": 384,
+    "dp32": 256,
+}
+STRATEGY_GPU_MEMORY_UTILIZATION: dict[str, float] = {
+    strategy_name: DEFAULT_GPU_MEMORY_UTILIZATION
+    for strategy_name in SWEEP_STRATEGIES
+}
+STRATEGY_GPU_MEMORY_UTILIZATION["dp32"] = 0.9
+
+
+def bench_duration_to_max_requests(request_rate: float,
+                                   bench_duration_sec: float) -> int:
+    if math.isinf(request_rate):
+        raise ValueError(
+            "bench_duration_to_max_requests does not support inf request_rate."
+        )
+    if bench_duration_sec <= 0.0:
+        raise ValueError("bench_duration_sec must be > 0.")
+    return max(1, int(round(request_rate * bench_duration_sec)))
+
+
+def build_experiment_matrix(
+    rate_plan: str = DEFAULT_RATE_PLAN,
+) -> list[ExperimentCase]:
+    try:
+        rate_plan_phases = RATE_PLAN_PHASES[rate_plan]
+    except KeyError as exc:
+        supported = ", ".join(sorted(RATE_PLAN_PHASES))
+        raise ValueError(
+            f"Unknown rate plan '{rate_plan}'. Supported values: {supported}"
+        ) from exc
+
+    experiments: list[ExperimentCase] = []
+    dataset_tag = DATASET_SHORT_NAMES.get(SWEEP_DATASET, SWEEP_DATASET)
+    for rate_phase, request_rates in rate_plan_phases:
+        for model_name in SWEEP_MODELS:
+            model_tag = MODEL_SHORT_NAMES.get(model_name, model_name)
+            for strategy_name in SWEEP_STRATEGIES:
+                max_num_seqs = STRATEGY_MAX_NUM_SEQS[strategy_name]
+                gpu_memory_utilization = STRATEGY_GPU_MEMORY_UTILIZATION[
+                    strategy_name]
+                for request_rate in request_rates:
+                    rate_tag = f"{request_rate:g}"
+                    max_requests = bench_duration_to_max_requests(
+                        request_rate,
+                        DEFAULT_SWEEP_BENCH_DURATION_SEC,
+                    )
+                    experiments.append(
+                        ExperimentCase(
+                            name=(f"{model_tag}__{dataset_tag}__{strategy_name}"
+                                  f"__rate{rate_tag}__bs{max_num_seqs}"),
+                            cluster=SWEEP_CLUSTER,
+                            strategy=strategy_name,
+                            dataset=SWEEP_DATASET,
+                            model=model_name,
+                            request_rate=request_rate,
+                            rate_phase=rate_phase,
+                            gpu_memory_utilization=gpu_memory_utilization,
+                            max_requests=max_requests,
+                            warmup_requests=32,
+                            max_num_seqs=max_num_seqs,
+                            max_model_len=1000000,
+                            data_parallel_rpc_port=29550,
+                        ))
+    return experiments
+
+
+EXPERIMENTS: list[ExperimentCase] = build_experiment_matrix()
 
 
 # -----------------------------------------------------------------------------
@@ -355,6 +463,59 @@ def stringify_request_rate(value: float) -> str:
     if math.isinf(value):
         return "inf"
     return f"{value:g}"
+
+
+def infer_bench_duration_sec(case: ExperimentCase) -> float:
+    if case.max_requests is not None and not math.isinf(case.request_rate):
+        return case.max_requests / case.request_rate
+    return DEFAULT_SWEEP_BENCH_DURATION_SEC
+
+
+def stringify_bench_duration_sec(value: float) -> str:
+    if math.isclose(value, round(value)):
+        return f"{int(round(value))}"
+    return f"{value:g}"
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0.0:
+        raise argparse.ArgumentTypeError("Expected a positive float.")
+    return parsed
+
+
+def model_short_name(model: str) -> str:
+    return MODEL_SHORT_NAMES.get(model, sanitize_tag(model).upper())
+
+
+def dataset_short_name(dataset: str) -> str:
+    return DATASET_SHORT_NAMES.get(dataset, sanitize_tag(dataset))
+
+
+def stringify_gpu_memory_utilization(value: float) -> str:
+    percentage = value * 100.0
+    if math.isclose(percentage, round(percentage)):
+        return f"mem{int(round(percentage))}"
+    return f"mem{percentage:g}".replace(".", "_")
+
+
+def case_group_key(case: ExperimentCase) -> str:
+    return "/".join(
+        (model_short_name(case.model), dataset_short_name(case.dataset),
+         sanitize_tag(case.strategy)))
+
+
+def case_artifact_group_dir(artifact_root: Path, case: ExperimentCase) -> Path:
+    batch_size_tag = (f"bs{case.max_num_seqs}"
+                      if case.max_num_seqs is not None else "bsauto")
+    duration_tag = f"dur{stringify_bench_duration_sec(infer_bench_duration_sec(case))}"
+    rate_tag = f"rate{stringify_request_rate(case.request_rate)}-{duration_tag}"
+    scenario_tag = (
+        f"{sanitize_tag(case.strategy)}-"
+        f"{stringify_gpu_memory_utilization(case.gpu_memory_utilization)}-"
+        f"{batch_size_tag}-{rate_tag}")
+    return (artifact_root / model_short_name(case.model) /
+            dataset_short_name(case.dataset) / scenario_tag)
 
 
 def bool_flag(name: str, enabled: bool) -> str:
@@ -449,7 +610,7 @@ def resolve_alias_path(
 
 
 def experiments_by_name(
-    experiments: list[ExperimentCase] = EXPERIMENTS,
+    experiments: list[ExperimentCase],
 ) -> dict[str, ExperimentCase]:
     return {case.name: case for case in experiments}
 
@@ -523,10 +684,11 @@ def resolve_case(
     )
 
 
-def prepare_artifact_paths(run_dir: Path, case_name: str,
-                           remote_hosts: tuple[str, ...]) -> ArtifactPaths:
-    safe_case_name = sanitize_tag(case_name)
-    case_dir = run_dir / safe_case_name
+def prepare_artifact_paths(case_group_dir: Path,
+                           remote_hosts: tuple[str, ...],
+                           *,
+                           run_tag: str) -> ArtifactPaths:
+    case_dir = case_group_dir / run_tag
     benchmark_dir = case_dir / "benchmark"
     rank_command_paths: dict[int, Path] = {}
     rank_cleanup_command_paths: dict[int, Path] = {}
@@ -543,7 +705,7 @@ def prepare_artifact_paths(run_dir: Path, case_name: str,
         rank_launch_log_paths[offset] = case_dir / f"rank{offset}.launch.log"
 
     return ArtifactPaths(
-        run_dir=run_dir,
+        run_dir=case_group_dir,
         case_dir=case_dir,
         benchmark_dir=benchmark_dir,
         case_manifest_path=case_dir / "case_manifest.json",
@@ -608,6 +770,10 @@ def build_common_harness_argv(
         argv.extend(["--all2all-backend", resolved.strategy.all2all_backend])
     if resolved.strategy.dcp_comm_backend is not None:
         argv.extend(["--dcp-comm-backend", resolved.strategy.dcp_comm_backend])
+    argv.extend([
+        "--gpu-memory-utilization",
+        f"{resolved.case.gpu_memory_utilization:g}",
+    ])
     if resolved.case.max_num_seqs is not None:
         argv.extend(["--max-num-seqs", str(resolved.case.max_num_seqs)])
     if resolved.case.max_model_len is not None:
@@ -707,6 +873,24 @@ def build_node_cleanup_command(
     pid_path: Path,
     include_frontend_pattern: bool,
 ) -> str:
+    def append_pattern_cleanup(
+        pattern: str,
+        *,
+        wait_pattern: str | None = None,
+    ) -> None:
+        wait_pattern = wait_pattern or pattern
+        lines.append(
+            f"pkill -TERM -f -- {shlex.quote(pattern)} >/dev/null 2>&1 || true")
+        lines.extend([
+            "for _ in 1 2 3 4 5; do",
+            f"  if ! pgrep -f -- {shlex.quote(wait_pattern)} >/dev/null 2>&1; then",
+            "    break",
+            "  fi",
+            "  sleep 1",
+            "done",
+            f"pkill -KILL -f -- {shlex.quote(wait_pattern)} >/dev/null 2>&1 || true",
+        ])
+
     lines = [
         "set +e",
         f"if [ -f {shlex.quote(str(pid_path))} ]; then",
@@ -722,18 +906,23 @@ def build_node_cleanup_command(
         f"rm -f {shlex.quote(str(pid_path))} >/dev/null 2>&1 || true",
     ]
 
-    patterns = [
+    append_pattern_cleanup(
         f"python3 {HARNESS_ENTRYPOINT} headless-engine",
-        f"--master-port {resolved.cluster.master_port}",
-        f"--data-parallel-rpc-port {resolved.case.data_parallel_rpc_port}",
-    ]
+        wait_pattern=f"^python3 {HARNESS_ENTRYPOINT} headless-engine( |$)",
+    )
     if include_frontend_pattern:
-        patterns.append(f"python3 {HARNESS_ENTRYPOINT} frontend")
-    for pattern in patterns:
+        append_pattern_cleanup(
+            f"python3 {HARNESS_ENTRYPOINT} frontend",
+            wait_pattern=f"^python3 {HARNESS_ENTRYPOINT} frontend( |$)",
+        )
+
+    for pattern in (
+            f"--master-port {resolved.cluster.master_port}",
+            f"--data-parallel-rpc-port {resolved.case.data_parallel_rpc_port}"):
         lines.append(
             f"pkill -f -- {shlex.quote(pattern)} >/dev/null 2>&1 || true")
     if resolved.case.cleanup_worker_processes:
-        lines.append("pkill -f '^VLLM::Worker_' >/dev/null 2>&1 || true")
+        append_pattern_cleanup("^VLLM::Worker_")
     return "\n".join(lines)
 
 
@@ -838,14 +1027,15 @@ def write_case_command_files(
         write_shell_script(artifacts.rank_cleanup_command_paths[node_rank], command)
 
 
-def select_cases(args: argparse.Namespace) -> list[ExperimentCase]:
-    available = experiments_by_name()
+def select_cases(args: argparse.Namespace,
+                 experiments: list[ExperimentCase]) -> list[ExperimentCase]:
+    available = experiments_by_name(experiments)
     if args.all and args.case:
         raise SystemExit("Use either --all or --case, not both.")
     if not args.all and not args.case and not args.list:
         raise SystemExit("Select at least one case via --case or use --all.")
     if args.all:
-        return list(EXPERIMENTS)
+        return list(experiments)
     selected: list[ExperimentCase] = []
     seen: set[str] = set()
     for case_name in args.case or []:
@@ -862,10 +1052,38 @@ def select_cases(args: argparse.Namespace) -> list[ExperimentCase]:
     return selected
 
 
+def apply_bench_duration_override(
+    cases: list[ExperimentCase],
+    bench_duration_sec: float | None,
+) -> list[ExperimentCase]:
+    if bench_duration_sec is None:
+        return cases
+
+    overridden: list[ExperimentCase] = []
+    for case in cases:
+        if math.isinf(case.request_rate):
+            raise SystemExit(
+                "--bench-duration-sec does not support cases with request_rate=inf."
+            )
+        overridden.append(
+            replace(
+                case,
+                max_requests=bench_duration_to_max_requests(
+                    case.request_rate,
+                    bench_duration_sec,
+                ),
+            ))
+    return overridden
+
+
 def describe_case(case: ExperimentCase) -> str:
     return (
-        f"{case.name}: cluster={case.cluster}, strategy={case.strategy}, "
-        f"dataset={case.dataset}, rate={stringify_request_rate(case.request_rate)}"
+        f"{case.name}: model={model_short_name(case.model)}, "
+        f"cluster={case.cluster}, strategy={case.strategy}, "
+        f"dataset={case.dataset}, phase={case.rate_phase}, "
+        f"rate={stringify_request_rate(case.request_rate)}, "
+        f"mem={stringify_gpu_memory_utilization(case.gpu_memory_utilization)}, "
+        f"bs={case.max_num_seqs}"
     )
 
 
@@ -940,10 +1158,183 @@ def augment_benchmark_outputs(benchmark_dir: Path) -> None:
     write_json(summary_path, summary)
 
 
+def extract_summary_tpot_by_e2e_mean(summary: Mapping[str, Any]) -> float | None:
+    metric = summary.get("tpot_by_e2e")
+    if not isinstance(metric, Mapping):
+        return None
+
+    mean_value = metric.get("mean")
+    if mean_value is None:
+        return None
+
+    try:
+        parsed = float(mean_value)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def should_stop_followup_rates(result: CaseResult) -> tuple[bool, str | None]:
+    if result.status == "dry_run":
+        return False, None
+
+    if result.status != "ok":
+        return True, f"case status={result.status}"
+
+    try:
+        summary = load_json(result.summary_json)
+    except Exception as exc:
+        return True, f"unable to read summary.json: {exc}"
+
+    tpot_by_e2e_mean = extract_summary_tpot_by_e2e_mean(summary)
+    if tpot_by_e2e_mean is None:
+        return True, "missing tpot_by_e2e.mean"
+
+    if tpot_by_e2e_mean > TPOT_BY_E2E_EARLY_STOP_MS:
+        return (
+            True,
+            ("tpot_by_e2e.mean="
+             f"{tpot_by_e2e_mean:.3f}ms > {TPOT_BY_E2E_EARLY_STOP_MS:g}ms"),
+        )
+
+    return False, None
+
+
+def latest_successful_case_dir(case_group_dir: Path) -> Path | None:
+    if not case_group_dir.is_dir():
+        return None
+
+    candidates = sorted((path for path in case_group_dir.iterdir() if path.is_dir()),
+                        reverse=True)
+    for case_dir in candidates:
+        manifest_path = case_dir / "case_manifest.json"
+        if not manifest_path.is_file():
+            continue
+
+        try:
+            manifest = load_json(manifest_path)
+        except Exception:
+            continue
+
+        if manifest.get("status") == "ok":
+            return case_dir
+    return None
+
+
+def latest_successful_case_tpot_by_e2e_mean(case_group_dir: Path) -> tuple[
+        Path, float | None] | None:
+    case_dir = latest_successful_case_dir(case_group_dir)
+    if case_dir is None:
+        return None
+
+    summary_path = case_dir / "benchmark" / "summary.json"
+    if not summary_path.is_file():
+        return case_dir, None
+
+    try:
+        summary = load_json(summary_path)
+    except Exception:
+        return case_dir, None
+
+    return case_dir, extract_summary_tpot_by_e2e_mean(summary)
+
+
+def build_historical_skip_state(
+    artifact_root: Path,
+    selected_cases: list[ExperimentCase],
+) -> tuple[dict[str, str], dict[str, tuple[float, str]]]:
+    exact_case_skips: dict[str, str] = {}
+    blocked_group_rates: dict[str, tuple[float, str]] = {}
+
+    for case in selected_cases:
+        historical = latest_successful_case_tpot_by_e2e_mean(
+            case_artifact_group_dir(artifact_root, case))
+        if historical is None:
+            continue
+
+        case_dir, tpot_by_e2e_mean = historical
+        case_result_tag = case_dir.name
+        exact_reason = (
+            f"latest successful result already exists at {case_result_tag}")
+        if tpot_by_e2e_mean is not None:
+            exact_reason += f" (tpot_by_e2e.mean={tpot_by_e2e_mean:.3f}ms)"
+        exact_case_skips[case.name] = exact_reason
+
+        if (tpot_by_e2e_mean is None
+                or tpot_by_e2e_mean <= TPOT_BY_E2E_EARLY_STOP_MS):
+            continue
+
+        group_key = case_group_key(case)
+        existing = blocked_group_rates.get(group_key)
+        reason = (
+            "historical latest successful result for "
+            f"rate={stringify_request_rate(case.request_rate)} at "
+            f"{case_result_tag} has tpot_by_e2e.mean={tpot_by_e2e_mean:.3f}ms "
+            f"> {TPOT_BY_E2E_EARLY_STOP_MS:g}ms")
+        if existing is None or case.request_rate < existing[0]:
+            blocked_group_rates[group_key] = (case.request_rate, reason)
+
+    return exact_case_skips, blocked_group_rates
+
+
+def block_reason_for_rate(
+    blocked_group_rates: Mapping[str, tuple[float, str]],
+    case: ExperimentCase,
+) -> str | None:
+    blocked = blocked_group_rates.get(case_group_key(case))
+    if blocked is None:
+        return None
+
+    blocked_rate, reason = blocked
+    if case.request_rate >= blocked_rate:
+        return reason
+    return None
+
+
+def local_ports_for_case(resolved: ResolvedCase) -> tuple[int, ...]:
+    return tuple(
+        sorted({
+            resolved.cluster.master_port,
+            resolved.case.data_parallel_rpc_port,
+        }))
+
+
+def can_bind_local_tcp_port(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("", port))
+        except OSError:
+            return False
+    return True
+
+
+def wait_for_local_ports_to_clear(
+    ports: tuple[int, ...],
+    *,
+    timeout_sec: float,
+    poll_interval_sec: float,
+) -> tuple[int, ...]:
+    if not ports:
+        return ()
+
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        busy_ports = tuple(
+            port for port in ports if not can_bind_local_tcp_port(port))
+        if not busy_ports:
+            return ()
+        if time.monotonic() >= deadline:
+            return busy_ports
+        time.sleep(poll_interval_sec)
+
+
 class ManualMultinodeRunner:
 
     def __init__(self, artifact_root: Path, *, dry_run: bool,
-                 keep_going: bool) -> None:
+                 keep_going: bool = True) -> None:
         self.artifact_root = artifact_root.expanduser().resolve()
         self.dry_run = dry_run
         self.keep_going = keep_going
@@ -975,10 +1366,10 @@ class ManualMultinodeRunner:
         finally:
             raise SystemExit(128 + signum)
 
-    def run(self, selected_cases: list[ExperimentCase],
-            run_label: str | None) -> list[CaseResult]:
+    def run(self, selected_cases: list[ExperimentCase], run_label: str | None,
+            *, rate_plan: str) -> list[CaseResult]:
         run_name = f"{current_run_tag()}__{sanitize_tag(run_label or 'manual_poisson')}"
-        run_dir = self.artifact_root / run_name
+        run_dir = self.artifact_root / "_runs" / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         run_manifest_path = run_dir / "run_manifest.json"
         write_json(
@@ -988,17 +1379,46 @@ class ManualMultinodeRunner:
                 "created_at": current_iso_timestamp(),
                 "dry_run": self.dry_run,
                 "keep_going": self.keep_going,
+                "rate_plan": rate_plan,
                 "cases": [case.name for case in selected_cases],
             },
         )
 
         results: list[CaseResult] = []
+        exact_case_skips, historical_blocked_groups = build_historical_skip_state(
+            self.artifact_root, selected_cases)
+        runtime_blocked_groups: dict[str, tuple[float, str]] = {}
         self.install_signal_handlers()
         try:
             for case in selected_cases:
+                historical_group_reason = block_reason_for_rate(
+                    historical_blocked_groups, case)
+                if historical_group_reason is not None:
+                    print(f"[skip] {case.name}: {historical_group_reason}")
+                    continue
+
+                runtime_group_reason = block_reason_for_rate(
+                    runtime_blocked_groups, case)
+                if runtime_group_reason is not None:
+                    print(f"[skip] {case.name}: {runtime_group_reason}")
+                    continue
+
+                exact_skip_reason = exact_case_skips.get(case.name)
+                if exact_skip_reason is not None:
+                    print(f"[skip] {case.name}: {exact_skip_reason}")
+                    continue
+
                 result = self.run_case(case, run_dir)
                 results.append(result)
-                if result.status != "ok" and not self.keep_going:
+                should_stop, stop_reason = should_stop_followup_rates(result)
+                if should_stop:
+                    reason = stop_reason or "blocked by previous case result"
+                    group_key = case_group_key(case)
+                    runtime_blocked_groups[group_key] = (case.request_rate,
+                                                         reason)
+                    print(f"[sweep] stop higher rates for {group_key}: {reason}")
+                if (result.status not in {"ok", "dry_run", "timed_out"}
+                        and not self.keep_going):
                     break
         finally:
             self.restore_signal_handlers()
@@ -1010,16 +1430,35 @@ class ManualMultinodeRunner:
                 "created_at": current_iso_timestamp(),
                 "dry_run": self.dry_run,
                 "keep_going": self.keep_going,
+                "rate_plan": rate_plan,
                 "cases": [case.name for case in selected_cases],
+                "historical_exact_case_skips": exact_case_skips,
+                "historical_blocked_groups": {
+                    key: {
+                        "blocked_from_rate": rate,
+                        "reason": reason,
+                    }
+                    for key, (rate, reason) in historical_blocked_groups.items()
+                },
+                "runtime_blocked_groups": {
+                    key: {
+                        "blocked_from_rate": rate,
+                        "reason": reason,
+                    }
+                    for key, (rate, reason) in runtime_blocked_groups.items()
+                },
                 "results": [jsonify(result) for result in results],
             },
         )
         return results
 
-    def run_case(self, case: ExperimentCase, run_dir: Path) -> CaseResult:
+    def run_case(self, case: ExperimentCase, _run_dir: Path) -> CaseResult:
         resolved = resolve_case(case)
-        artifacts = prepare_artifact_paths(run_dir, case.name,
-                                           resolved.cluster.remote_hosts)
+        artifacts = prepare_artifact_paths(
+            case_artifact_group_dir(self.artifact_root, case),
+            resolved.cluster.remote_hosts,
+            run_tag=current_run_tag(),
+        )
         artifacts.case_dir.mkdir(parents=True, exist_ok=True)
         artifacts.benchmark_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1117,6 +1556,10 @@ class ManualMultinodeRunner:
             self.wait_for_headless_shutdown(runtime)
             augment_benchmark_outputs(artifacts.benchmark_dir)
             detail = "completed"
+        except BenchTimeoutError as exc:
+            status = "timed_out"
+            detail = str(exc)
+            exit_code = 124
         except Exception as exc:
             status = "failed"
             detail = str(exc)
@@ -1155,17 +1598,43 @@ class ManualMultinodeRunner:
 
     def run_preclean(self, resolved: ResolvedCase,
                      artifacts: ArtifactPaths) -> None:
-        self.run_local_shell(
-            resolved.cluster,
-            artifacts.frontend_cleanup_command_path.read_text(encoding="utf-8"),
-        )
-        for node_rank, host in enumerate(resolved.cluster.remote_hosts, start=1):
-            self.run_remote_shell(
+        ports = local_ports_for_case(resolved)
+        busy_ports: tuple[int, ...] = ()
+
+        for attempt in range(1, PRESTART_CLEANUP_MAX_ATTEMPTS + 1):
+            self.run_local_shell(
                 resolved.cluster,
-                host,
-                artifacts.rank_cleanup_command_paths[node_rank].read_text(
+                artifacts.frontend_cleanup_command_path.read_text(
                     encoding="utf-8"),
             )
+            for node_rank, host in enumerate(resolved.cluster.remote_hosts,
+                                             start=1):
+                self.run_remote_shell(
+                    resolved.cluster,
+                    host,
+                    artifacts.rank_cleanup_command_paths[node_rank].read_text(
+                        encoding="utf-8"),
+                )
+
+            busy_ports = wait_for_local_ports_to_clear(
+                ports,
+                timeout_sec=PRESTART_CLEANUP_WAIT_SEC,
+                poll_interval_sec=PRESTART_CLEANUP_POLL_INTERVAL_SEC,
+            )
+            if not busy_ports:
+                return
+
+            ports_text = ", ".join(str(port) for port in busy_ports)
+            print(
+                ("[preclean] local ports still busy after cleanup "
+                 f"attempt {attempt}/{PRESTART_CLEANUP_MAX_ATTEMPTS}: "
+                 f"{ports_text}"),
+                file=sys.stderr,
+            )
+
+        ports_text = ", ".join(str(port) for port in busy_ports)
+        raise RuntimeError("preclean could not free local ports before launch: "
+                           f"{ports_text}")
 
     def launch_headless_nodes(self, runtime: ActiveCaseRuntime,
                               remote_launch_commands: dict[int, str]) -> None:
@@ -1238,6 +1707,11 @@ class ManualMultinodeRunner:
 
     def wait_for_frontend(self, runtime: ActiveCaseRuntime) -> int:
         assert runtime.frontend is not None
+        timeout_sec = runtime.resolved.case.max_bench_duration_sec
+        deadline = None
+        if timeout_sec is not None:
+            deadline = time.monotonic() + timeout_sec
+        pending_headless_nodes = list(runtime.headless_nodes)
         while True:
             exit_code = runtime.frontend.process.poll()
             if exit_code is not None:
@@ -1249,14 +1723,29 @@ class ManualMultinodeRunner:
                         f"frontend exited with code {exit_code}.\n{detail}")
                 return exit_code
 
-            for node in runtime.headless_nodes:
+            if deadline is not None and time.monotonic() >= deadline:
+                detail = tail_file(runtime.frontend.runtime_log_path) or tail_file(
+                    runtime.frontend.launch_log_path)
+                message = ("frontend exceeded "
+                           f"max_bench_duration_sec={timeout_sec:g}s "
+                           f"({timeout_sec / 60.0:g}min)")
+                if detail:
+                    message = f"{message}.\n{detail}"
+                raise BenchTimeoutError(message)
+
+            still_running_headless_nodes = []
+            for node in pending_headless_nodes:
                 node_exit_code = node.process.poll()
-                if node_exit_code is not None:
+                if node_exit_code is None:
+                    still_running_headless_nodes.append(node)
+                    continue
+                if node_exit_code != 0:
                     detail = tail_file(node.launch_log_path) or tail_file(
                         node.runtime_log_path)
                     raise RuntimeError(
                         f"rank {node.node_rank} on {node.host} exited early "
                         f"with code {node_exit_code}.\n{detail}")
+            pending_headless_nodes = still_running_headless_nodes
             time.sleep(1.0)
 
     def wait_for_headless_shutdown(self, runtime: ActiveCaseRuntime) -> None:
@@ -1354,6 +1843,16 @@ def build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         help="Run all configured cases sequentially.")
     parser.add_argument(
+        "--rate-plan",
+        default=DEFAULT_RATE_PLAN,
+        choices=sorted(RATE_PLAN_PHASES),
+        help=(
+            "Request-rate sweep plan to use for --list, --all, and --case "
+            "name resolution. 'coarse10' runs only 10-point spacing; "
+            "'coarse10_then_mid5' appends 15/25/.../85 after the coarse pass."
+        ),
+    )
+    parser.add_argument(
         "--artifact-root",
         default=str(DEFAULT_ARTIFACT_ROOT),
         help="Shared artifact root for run directories.",
@@ -1363,13 +1862,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional suffix for the timestamped run directory.",
     )
+    parser.add_argument(
+        "--bench-duration-sec",
+        type=positive_float,
+        default=None,
+        help=(
+            "Override measured benchmark duration in seconds for selected "
+            "cases. Default configured case duration is "
+            f"{DEFAULT_SWEEP_BENCH_DURATION_SEC:g}s."
+        ),
+    )
     parser.add_argument("--dry-run",
                         action="store_true",
                         help="Write commands and manifests without execution.")
     parser.add_argument(
         "--keep-going",
-        action="store_true",
-        help="Continue to later cases even if one case fails.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=("Continue to later cases even if one case fails. "
+              "Use --no-keep-going to stop after the first failed case."),
     )
     return parser
 
@@ -1377,19 +1888,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    experiments = build_experiment_matrix(args.rate_plan)
 
     if args.list:
-        for case in EXPERIMENTS:
+        for case in experiments:
             print(describe_case(case))
         return
 
-    selected_cases = select_cases(args)
+    selected_cases = apply_bench_duration_override(
+        select_cases(args, experiments),
+        args.bench_duration_sec,
+    )
     runner = ManualMultinodeRunner(
         Path(args.artifact_root),
         dry_run=args.dry_run,
         keep_going=args.keep_going,
     )
-    results = runner.run(selected_cases, args.run_label)
+    results = runner.run(selected_cases, args.run_label, rate_plan=args.rate_plan)
 
     failures = [result for result in results if result.status not in {"ok", "dry_run"}]
     if failures:
