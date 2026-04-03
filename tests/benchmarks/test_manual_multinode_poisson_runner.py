@@ -62,6 +62,40 @@ def make_node_runtime(
     )
 
 
+def write_case_benchmark_artifacts(case_dir: Path, *, manifest_status: str,
+                                   summary: dict[str, object] | None,
+                                   requests_present: bool = True,
+                                   requests: list[dict[str, object]] | None = None,
+                                   run_meta: dict[str, object] | None = None) -> None:
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / "case_manifest.json").write_text(
+        json.dumps({"status": manifest_status}) + "\n",
+        encoding="utf-8",
+    )
+    benchmark_dir = case_dir / "benchmark"
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    if summary is not None:
+        (benchmark_dir / "summary.json").write_text(
+            json.dumps(summary) + "\n",
+            encoding="utf-8",
+        )
+    if run_meta is not None:
+        (benchmark_dir / "run_meta.json").write_text(
+            json.dumps(run_meta) + "\n",
+            encoding="utf-8",
+        )
+    if requests_present:
+        (benchmark_dir / "requests.jsonl").write_text(
+            "".join(
+                json.dumps(record) + "\n" for record in (requests or [{
+                    "request_id": "r0",
+                    "is_error": False,
+                }])
+            ),
+            encoding="utf-8",
+        )
+
+
 @pytest.mark.benchmark
 def test_resolve_case_uses_overridden_remote_hosts(tmp_path: Path) -> None:
     runner = load_runner_module()
@@ -257,12 +291,20 @@ def test_launch_and_cleanup_commands_use_shared_artifact_paths(
     cleanup_command = runner.build_node_cleanup_command(
         resolved=resolved,
         pid_path=artifacts.frontend_pid_path,
+        pgid_path=artifacts.frontend_pgid_path,
         include_frontend_pattern=True,
     )
 
-    assert "set -o pipefail" in frontend_command
+    assert "child_pid=$!" in frontend_command
+    assert "printf '%s\\n' \"$$\"" in frontend_command
     assert str(artifacts.frontend_log_path) in frontend_command
     assert str(artifacts.frontend_pid_path) in frontend_command
+    assert str(artifacts.frontend_pgid_path) in frontend_command
+    assert "wait \"$child_pid\"" in frontend_command
+    assert "child_exit_code=$?" in frontend_command
+    assert "status=$?" not in frontend_command
+    assert str(artifacts.frontend_pgid_path) in cleanup_command
+    assert "kill -TERM -- \"-$pgid\"" in cleanup_command
     assert "offline_poisson_harness.py frontend" in cleanup_command
     assert "--data-parallel-rpc-port 29550" in cleanup_command
     assert "--master-port 29579" in cleanup_command
@@ -426,6 +468,185 @@ def test_augment_benchmark_outputs_adds_tpot_metrics(tmp_path: Path) -> None:
 
 
 @pytest.mark.benchmark
+def test_latest_successful_case_dir_falls_back_to_complete_benchmark_when_manifest_not_ok(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    case_group_dir = tmp_path / "case_group"
+    older_ok = case_group_dir / "20260403-150000"
+    newer_prepared = case_group_dir / "20260403-160000"
+
+    write_case_benchmark_artifacts(
+        older_ok,
+        manifest_status="ok",
+        summary=None,
+        requests_present=False,
+    )
+    write_case_benchmark_artifacts(
+        newer_prepared,
+        manifest_status="prepared",
+        summary={
+            "total_requests": 2,
+            "successful_requests": 2,
+            "failed_requests": 0,
+            "failure_ratio": 0.0,
+        },
+        requests=[
+            {
+                "request_id": "r0",
+                "is_error": False,
+                "actual_output_tokens": 5,
+                "decode_time_ms": 40.0,
+                "e2e_ms": 60.0,
+            },
+            {
+                "request_id": "r1",
+                "is_error": False,
+                "actual_output_tokens": 4,
+                "decode_time_ms": 12.0,
+                "e2e_ms": 18.0,
+            },
+        ],
+        run_meta={
+            "benchmark_start_time": "2026-04-03T16:37:06+08:00",
+        },
+    )
+
+    assert runner.latest_successful_case_dir(case_group_dir) == newer_prepared
+    assert runner.latest_successful_case_tpot_by_e2e_mean(case_group_dir) == (
+        newer_prepared,
+        pytest.approx(8.25),
+    )
+
+    repaired_manifest = json.loads(
+        (newer_prepared / "case_manifest.json").read_text(encoding="utf-8"))
+    assert repaired_manifest["status"] == "ok"
+    assert repaired_manifest["exit_code"] == 0
+    assert repaired_manifest["detail"] == (
+        "completed (recovered from successful benchmark artifacts)")
+    assert repaired_manifest["started_at"] == "2026-04-03T16:37:06+08:00"
+    assert repaired_manifest["finished_at"] is not None
+
+    repaired_summary = json.loads(
+        (newer_prepared / "benchmark" / "summary.json").read_text(
+            encoding="utf-8"))
+    assert repaired_summary["tpot_by_e2e"]["mean"] == pytest.approx(8.25)
+
+
+@pytest.mark.benchmark
+def test_latest_successful_case_dir_ignores_incomplete_benchmark_fallback(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    case_group_dir = tmp_path / "case_group"
+    older_ok = case_group_dir / "20260403-150000"
+    newer_failed = case_group_dir / "20260403-160000"
+
+    write_case_benchmark_artifacts(
+        older_ok,
+        manifest_status="ok",
+        summary=None,
+        requests_present=False,
+    )
+    write_case_benchmark_artifacts(
+        newer_failed,
+        manifest_status="failed",
+        summary={
+            "total_requests": 3,
+            "successful_requests": 2,
+            "failed_requests": 1,
+            "failure_ratio": 1.0 / 3.0,
+        },
+    )
+
+    assert runner.latest_successful_case_dir(case_group_dir) == older_ok
+
+
+@pytest.mark.benchmark
+def test_maybe_finalize_interrupted_case_manifest_recovers_success(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    case_dir = tmp_path / "case"
+
+    write_case_benchmark_artifacts(
+        case_dir,
+        manifest_status="prepared",
+        summary={
+            "total_requests": 2,
+            "successful_requests": 2,
+            "failed_requests": 0,
+            "failure_ratio": 0.0,
+        },
+        requests=[
+            {
+                "request_id": "r0",
+                "is_error": False,
+                "actual_output_tokens": 5,
+                "decode_time_ms": 40.0,
+                "e2e_ms": 60.0,
+            },
+            {
+                "request_id": "r1",
+                "is_error": False,
+                "actual_output_tokens": 4,
+                "decode_time_ms": 12.0,
+                "e2e_ms": 18.0,
+            },
+        ],
+        run_meta={
+            "benchmark_start_time": "2026-04-03T16:37:06+08:00",
+        },
+    )
+
+    manifest = runner.load_json(case_dir / "case_manifest.json")
+    runner.maybe_finalize_interrupted_case_manifest(
+        case_dir,
+        manifest=manifest,
+        signal_name="SIGTERM",
+        exit_code=143,
+        finished_at="2026-04-03T16:48:00+08:00",
+    )
+
+    repaired_manifest = json.loads(
+        (case_dir / "case_manifest.json").read_text(encoding="utf-8"))
+    assert repaired_manifest["status"] == "ok"
+    assert repaired_manifest["exit_code"] == 0
+    assert repaired_manifest["detail"] == (
+        "completed (recovered from successful benchmark artifacts)")
+    assert repaired_manifest["started_at"] == "2026-04-03T16:37:06+08:00"
+    assert repaired_manifest["finished_at"] is not None
+
+
+@pytest.mark.benchmark
+def test_maybe_finalize_interrupted_case_manifest_marks_interrupted(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    case_dir = tmp_path / "case"
+
+    write_case_benchmark_artifacts(
+        case_dir,
+        manifest_status="running",
+        summary=None,
+        requests_present=False,
+    )
+
+    manifest = runner.load_json(case_dir / "case_manifest.json")
+    runner.maybe_finalize_interrupted_case_manifest(
+        case_dir,
+        manifest=manifest,
+        signal_name="SIGHUP",
+        exit_code=129,
+        finished_at="2026-04-03T16:48:00+08:00",
+    )
+
+    interrupted_manifest = json.loads(
+        (case_dir / "case_manifest.json").read_text(encoding="utf-8"))
+    assert interrupted_manifest["status"] == "interrupted"
+    assert interrupted_manifest["exit_code"] == 129
+    assert interrupted_manifest["detail"] == "interrupted by SIGHUP"
+    assert interrupted_manifest["started_at"] is not None
+    assert interrupted_manifest["finished_at"] == "2026-04-03T16:48:00+08:00"
+
+
+@pytest.mark.benchmark
 def test_wait_for_frontend_allows_clean_headless_shutdown(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runner = load_runner_module()
@@ -456,6 +677,40 @@ def test_wait_for_frontend_allows_clean_headless_shutdown(
     )
 
     assert launcher.wait_for_frontend(runtime) == 0
+
+
+@pytest.mark.benchmark
+def test_wait_for_headless_shutdown_checks_remote_pidfiles(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=False)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+
+    headless = make_node_runtime(
+        runner,
+        tmp_path,
+        node_rank=1,
+        host="node-a",
+        poll_results=[0, 0],
+    )
+    pid_states = iter([True, False])
+    monkeypatch.setattr(
+        launcher,
+        "remote_pidfile_is_running",
+        lambda *_args, **_kwargs: next(pid_states),
+    )
+    runtime = SimpleNamespace(
+        headless_nodes=[headless],
+        resolved=SimpleNamespace(
+            case=SimpleNamespace(remote_shutdown_grace_sec=30.0),
+            cluster=SimpleNamespace(),
+        ),
+        artifacts=SimpleNamespace(rank_pid_paths={1: tmp_path / "rank1.pid"}),
+    )
+
+    launcher.wait_for_headless_shutdown(runtime)
 
 
 @pytest.mark.benchmark
@@ -624,6 +879,167 @@ def test_run_preclean_fails_if_local_ports_remain_busy(
         launcher.run_preclean(resolved, artifacts)
 
     assert calls == ["frontend cleanup\n", "frontend cleanup\n"]
+
+
+@pytest.mark.benchmark
+def test_wait_for_local_shutdown_times_out_with_local_diagnostics(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=True)
+    frontend_pid_path = tmp_path / "frontend.pid"
+    frontend_pgid_path = tmp_path / "frontend.pgid"
+    frontend_pid_path.write_text("123\n", encoding="utf-8")
+    frontend_pgid_path.write_text("456\n", encoding="utf-8")
+
+    monotonic_values = iter([100.0, 131.0])
+    monkeypatch.setattr(runner.time, "monotonic",
+                        lambda: next(monotonic_values))
+    monkeypatch.setattr(runner.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(runner, "local_pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(runner, "local_process_group_is_running",
+                        lambda _pgid: True)
+    monkeypatch.setattr(runner, "can_bind_local_tcp_port", lambda _port: False)
+    monkeypatch.setattr(runner, "describe_local_port_diagnostics",
+                        lambda port: f"{port} [busy]")
+
+    runtime = SimpleNamespace(
+        artifacts=SimpleNamespace(
+            frontend_pid_path=frontend_pid_path,
+            frontend_pgid_path=frontend_pgid_path,
+        ),
+        resolved=SimpleNamespace(
+            case=SimpleNamespace(
+                data_parallel_rpc_port=29550,
+                local_shutdown_grace_sec=30.0,
+            ),
+            cluster=SimpleNamespace(master_port=29579),
+        ),
+    )
+
+    with pytest.raises(RuntimeError,
+                       match="node 0 local shutdown did not complete") as exc_info:
+        launcher.wait_for_local_shutdown(runtime)
+
+    message = str(exc_info.value)
+    assert "frontend pidfile still points to a live pid" in message
+    assert "frontend process group still has live processes" in message
+    assert "local ports still busy" in message
+
+
+@pytest.mark.benchmark
+def test_verify_case_cleanup_checks_remote_pidfiles(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=True)
+    monotonic_values = iter([10.0, 41.0])
+    monkeypatch.setattr(runner.time, "monotonic",
+                        lambda: next(monotonic_values))
+    monkeypatch.setattr(runner.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(launcher, "local_shutdown_failures", lambda _runtime: [])
+    monkeypatch.setattr(launcher, "remote_pidfile_is_running",
+                        lambda *_args, **_kwargs: True)
+
+    runtime = SimpleNamespace(
+        headless_nodes=[
+            SimpleNamespace(node_rank=1, host="node-a"),
+        ],
+        artifacts=SimpleNamespace(rank_pid_paths={1: tmp_path / "rank1.pid"}),
+        resolved=SimpleNamespace(
+            case=SimpleNamespace(local_shutdown_grace_sec=30.0),
+            cluster=SimpleNamespace(),
+        ),
+    )
+
+    with pytest.raises(RuntimeError,
+                       match="post-cleanup verification failed") as exc_info:
+        launcher.verify_case_cleanup(runtime)
+
+    assert "rank 1 on node-a pidfile still points to a live pid" in str(
+        exc_info.value)
+
+
+@pytest.mark.benchmark
+def test_run_case_fails_if_cleanup_verification_fails(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=True)
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="case_a",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=10.0,
+        ),
+        clusters={
+            "cluster_a":
+            runner.ClusterSpec(
+                master_addr="10.0.0.1",
+                master_port=29579,
+                remote_hosts=(),
+            ),
+        },
+        strategies={
+            "strategy_a":
+            runner.StrategySpec(
+                data_parallel_size=1,
+                data_parallel_size_local=1,
+                tensor_parallel_size=1,
+            ),
+        },
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    monkeypatch.setattr(runner, "resolve_case", lambda _case: resolved)
+    monkeypatch.setattr(launcher, "run_preclean", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "launch_headless_nodes",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "wait_for_headless_startup",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "launch_frontend",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "wait_for_frontend",
+                        lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(launcher, "wait_for_headless_shutdown",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "wait_for_local_shutdown",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "cleanup_case_runtime",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "verify_case_cleanup",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            RuntimeError("cleanup dirty")))
+    monkeypatch.setattr(runner, "augment_benchmark_outputs",
+                        lambda *_args, **_kwargs: None)
+
+    result = launcher.run_case(
+        runner.ExperimentCase(
+            name="case_a",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=10.0,
+        ),
+        tmp_path / "run",
+    )
+
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert result.detail == "cleanup dirty"
 
 
 @pytest.mark.benchmark
@@ -814,3 +1230,90 @@ def test_run_continues_after_timeout_and_skips_higher_rates_in_group(
     blocked = manifest["runtime_blocked_groups"]["MODEL_A/dataset_a/strategy_a"]
     assert blocked["blocked_from_rate"] == 10.0
     assert blocked["reason"] == "case status=timed_out"
+
+
+@pytest.mark.benchmark
+def test_run_writes_partial_manifest_when_aborted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=True)
+    monkeypatch.setattr(runner, "build_historical_skip_state",
+                        lambda *_args, **_kwargs: ({}, {}))
+    monkeypatch.setattr(runner, "current_run_tag",
+                        lambda: "20260403-000000")
+    timestamps = iter([
+        "2026-04-03T00:00:00+08:00",
+        "2026-04-03T00:20:00+08:00",
+    ])
+    monkeypatch.setattr(runner, "current_iso_timestamp",
+                        lambda: next(timestamps))
+    monkeypatch.setattr(launcher, "install_signal_handlers", lambda: None)
+    monkeypatch.setattr(launcher, "restore_signal_handlers", lambda: None)
+
+    def fake_run_case(case, _run_dir):
+        case_dir = tmp_path / case.name
+        benchmark_dir = case_dir / "benchmark"
+        summary_json = benchmark_dir / "summary.json"
+        benchmark_dir.mkdir(parents=True, exist_ok=True)
+
+        if case.name == "group_a_rate10":
+            summary_json.write_text(
+                json.dumps({
+                    "tpot_by_e2e": {
+                        "mean": 10.0,
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            return runner.CaseResult(
+                case_name=case.name,
+                status="ok",
+                exit_code=0,
+                started_at="2026-04-03T00:00:00+08:00",
+                finished_at="2026-04-03T00:10:00+08:00",
+                case_dir=case_dir,
+                benchmark_dir=benchmark_dir,
+                summary_json=summary_json,
+                detail="ok",
+            )
+
+        raise SystemExit(143)
+
+    monkeypatch.setattr(launcher, "run_case", fake_run_case)
+
+    cases = [
+        runner.ExperimentCase(
+            name="group_a_rate10",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=10.0,
+        ),
+        runner.ExperimentCase(
+            name="group_b_rate10",
+            cluster="cluster_a",
+            strategy="strategy_b",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=10.0,
+        ),
+    ]
+
+    with pytest.raises(SystemExit) as exc_info:
+        launcher.run(cases, run_label="aborted_sweep", rate_plan="coarse10")
+
+    assert exc_info.value.code == 143
+
+    run_manifest_path = (tmp_path / "_runs" / "20260403-000000__aborted_sweep" /
+                         "run_manifest.json")
+    manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["finished_at"] == "2026-04-03T00:20:00+08:00"
+    assert [result["case_name"] for result in manifest["results"]] == [
+        "group_a_rate10",
+    ]
+    assert manifest["aborted"]["type"] == "SystemExit"
+    assert manifest["aborted"]["exit_code"] == 143
+    assert manifest["aborted"]["detail"] == "143"

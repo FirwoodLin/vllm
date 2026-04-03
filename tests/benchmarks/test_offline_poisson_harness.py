@@ -7,12 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
+import vllm.benchmarks.offline_poisson_harness as harness_mod
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.benchmarks.offline_poisson_harness import (
     _apply_benchmark_arg_defaults,
     _compute_pre_forward_ttft_ms,
     _enforce_harness_observability,
     _request_clean_cluster_shutdown,
+    _shutdown_frontend_async_llm,
     _submit_one_request,
     build_success_record,
     build_poisson_arrival_deadlines_ns,
@@ -492,8 +494,65 @@ def test_request_clean_cluster_shutdown_targets_remote_dp_engines() -> None:
             self.engine_core = _EngineCore()
 
     async_llm = _AsyncLLM()
-    asyncio.run(_request_clean_cluster_shutdown(async_llm))
-    assert async_llm.engine_core.calls == ["request_shutdown"]
+    assert asyncio.run(_request_clean_cluster_shutdown(async_llm)) is True
+    assert async_llm.engine_core.calls == ["request_shutdown_and_wait"]
+
+
+@pytest.mark.benchmark
+def test_request_clean_cluster_shutdown_logs_frontend_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _EngineCore:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def call_utility_async(self, method: str) -> None:
+            self.calls.append(method)
+            await asyncio.sleep(0.01)
+
+    class _ParallelConfig:
+        data_parallel_size = 16
+        data_parallel_size_local = 8
+
+    class _VllmConfig:
+        parallel_config = _ParallelConfig()
+
+    class _AsyncLLM:
+        vllm_config = _VllmConfig()
+
+        def __init__(self) -> None:
+            self.engine_core = _EngineCore()
+
+    args = Namespace(
+        request_rate=12.5,
+        data_parallel_size=16,
+        data_parallel_size_local=8,
+        save_merged_parquet=False,
+    )
+    async_llm = _AsyncLLM()
+    messages: list[str] = []
+    monkeypatch.setattr(harness_mod, "FRONTEND_TEARDOWN_HEARTBEAT_SEC", 0.001)
+    monkeypatch.setattr(
+        harness_mod.logger,
+        "info",
+        lambda message, *args, **_kwargs: messages.append(
+            message % args if args else message),
+    )
+
+    asyncio.run(
+        harness_mod._request_clean_cluster_shutdown(
+            async_llm,
+            frontend_args=args,
+            output_dir=tmp_path,
+            frontend_started_at_s=0.0,
+            measured_requests=64,
+        ))
+
+    joined = "\n".join(messages)
+    assert "phase=clean_cluster_shutdown_request_start" in joined
+    assert "phase=clean_cluster_shutdown_waiting" in joined
+    assert "phase=clean_cluster_shutdown_request_done" in joined
 
 
 @pytest.mark.benchmark
@@ -519,5 +578,138 @@ def test_request_clean_cluster_shutdown_skips_local_only_runs() -> None:
             self.engine_core = _EngineCore()
 
     async_llm = _AsyncLLM()
-    asyncio.run(_request_clean_cluster_shutdown(async_llm))
+    assert asyncio.run(_request_clean_cluster_shutdown(async_llm)) is True
     assert async_llm.engine_core.calls == []
+
+
+@pytest.mark.benchmark
+def test_request_clean_cluster_shutdown_times_out_and_falls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _EngineCore:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.cancelled = False
+
+        async def call_utility_async(self, method: str) -> None:
+            self.calls.append(method)
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    class _ParallelConfig:
+        data_parallel_size = 16
+        data_parallel_size_local = 8
+
+    class _VllmConfig:
+        parallel_config = _ParallelConfig()
+
+    class _AsyncLLM:
+        vllm_config = _VllmConfig()
+
+        def __init__(self) -> None:
+            self.engine_core = _EngineCore()
+
+    args = Namespace(
+        request_rate=12.5,
+        data_parallel_size=16,
+        data_parallel_size_local=8,
+        save_merged_parquet=False,
+    )
+    async_llm = _AsyncLLM()
+    info_messages: list[str] = []
+    warning_messages: list[str] = []
+    monkeypatch.setattr(harness_mod, "FRONTEND_TEARDOWN_HEARTBEAT_SEC", 0.001)
+    monkeypatch.setattr(harness_mod, "FRONTEND_TEARDOWN_TIMEOUT_SEC", 0.003)
+    monkeypatch.setattr(
+        harness_mod.logger,
+        "info",
+        lambda message, *args, **_kwargs: info_messages.append(
+            message % args if args else message),
+    )
+    monkeypatch.setattr(
+        harness_mod.logger,
+        "warning",
+        lambda message, *args, **_kwargs: warning_messages.append(
+            message % args if args else message),
+    )
+
+    graceful = asyncio.run(
+        harness_mod._request_clean_cluster_shutdown(
+            async_llm,
+            frontend_args=args,
+            output_dir=tmp_path,
+            frontend_started_at_s=0.0,
+            measured_requests=64,
+        ))
+
+    assert graceful is False
+    assert async_llm.engine_core.calls == ["request_shutdown_and_wait"]
+    assert async_llm.engine_core.cancelled is True
+    assert "phase=clean_cluster_shutdown_timeout" in "\n".join(info_messages)
+    assert any(
+        "falling back to forced local cleanup" in message
+        for message in warning_messages
+    )
+
+
+@pytest.mark.benchmark
+def test_shutdown_frontend_async_llm_uses_forced_cleanup_after_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _AsyncLLM:
+        def __init__(self) -> None:
+            self.begin_shutdown_calls = 0
+            self.shutdown_calls: list[float | None] = []
+
+        def begin_shutdown(self) -> None:
+            self.begin_shutdown_calls += 1
+
+        def shutdown(self, timeout: float | None = None) -> None:
+            self.shutdown_calls.append(timeout)
+
+    args = Namespace(
+        request_rate=12.5,
+        data_parallel_size=16,
+        data_parallel_size_local=8,
+        save_merged_parquet=False,
+    )
+    async_llm = _AsyncLLM()
+    messages: list[str] = []
+
+    async def _timeout_shutdown(*_args, **_kwargs) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        harness_mod,
+        "_request_clean_cluster_shutdown",
+        _timeout_shutdown,
+    )
+    monkeypatch.setattr(
+        harness_mod.logger,
+        "info",
+        lambda message, *args, **_kwargs: messages.append(
+            message % args if args else message),
+    )
+
+    asyncio.run(
+        _shutdown_frontend_async_llm(
+            async_llm,
+            args=args,
+            output_dir=tmp_path,
+            frontend_started_at_s=0.0,
+            measured_requests=64,
+            summary_written=True,
+            parquet_written=False,
+        ))
+
+    joined = "\n".join(messages)
+    assert async_llm.begin_shutdown_calls == 1
+    assert async_llm.shutdown_calls == [0.0]
+    assert "phase=clean_cluster_shutdown_fallback" in joined
+    assert "phase=async_llm_shutdown_start" in joined
+    assert "timeout_s=0.000" in joined

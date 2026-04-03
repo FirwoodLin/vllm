@@ -75,6 +75,8 @@ DEFAULT_SWEEP_BENCH_DURATION_SEC = 600.0
 PRESTART_CLEANUP_MAX_ATTEMPTS = 3
 PRESTART_CLEANUP_WAIT_SEC = 10.0
 PRESTART_CLEANUP_POLL_INTERVAL_SEC = 1.0
+LOCAL_SHUTDOWN_POLL_INTERVAL_SEC = 1.0
+WAIT_STATUS_LOG_INTERVAL_SEC = 15.0
 TPOT_BY_E2E_EARLY_STOP_MS = 100.0
 RATE_SWEEP_START = 10
 RATE_SWEEP_STOP = 90
@@ -167,6 +169,7 @@ class ExperimentCase:
     remote_hosts_override: tuple[str, ...] | None = None
     start_grace_sec: float = 8.0
     remote_shutdown_grace_sec: float = 30.0
+    local_shutdown_grace_sec: float = 30.0
     cleanup_worker_processes: bool = True
     max_bench_duration_sec: float | None = DEFAULT_BENCH_TIMEOUT_SEC
 
@@ -191,11 +194,13 @@ class ArtifactPaths:
     frontend_command_path: Path
     frontend_cleanup_command_path: Path
     frontend_pid_path: Path
+    frontend_pgid_path: Path
     frontend_log_path: Path
     frontend_launch_log_path: Path
     rank_command_paths: dict[int, Path]
     rank_cleanup_command_paths: dict[int, Path]
     rank_pid_paths: dict[int, Path]
+    rank_pgid_paths: dict[int, Path]
     rank_log_paths: dict[int, Path]
     rank_launch_log_paths: dict[int, Path]
 
@@ -351,8 +356,8 @@ SWEEP_STRATEGIES: tuple[str, ...] = (
     "dp32",
 )
 STRATEGY_MAX_NUM_SEQS: dict[str, int] = {
-    "dp4dcp8": 768,
-    "dp8dcp4": 512,
+    "dp4dcp8": 1024,
+    "dp8dcp4": 768,
     "dp16cp2": 384,
     "dp32": 256,
 }
@@ -556,6 +561,15 @@ def load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def load_optional_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        return load_json(path)
+    except Exception:
+        return None
+
+
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
@@ -693,6 +707,7 @@ def prepare_artifact_paths(case_group_dir: Path,
     rank_command_paths: dict[int, Path] = {}
     rank_cleanup_command_paths: dict[int, Path] = {}
     rank_pid_paths: dict[int, Path] = {}
+    rank_pgid_paths: dict[int, Path] = {}
     rank_log_paths: dict[int, Path] = {}
     rank_launch_log_paths: dict[int, Path] = {}
 
@@ -701,6 +716,7 @@ def prepare_artifact_paths(case_group_dir: Path,
         rank_cleanup_command_paths[offset] = (
             case_dir / f"rank{offset}.cleanup.command.sh")
         rank_pid_paths[offset] = case_dir / f"rank{offset}.pid"
+        rank_pgid_paths[offset] = case_dir / f"rank{offset}.pgid"
         rank_log_paths[offset] = case_dir / f"rank{offset}.log"
         rank_launch_log_paths[offset] = case_dir / f"rank{offset}.launch.log"
 
@@ -712,11 +728,13 @@ def prepare_artifact_paths(case_group_dir: Path,
         frontend_command_path=case_dir / "frontend.command.sh",
         frontend_cleanup_command_path=case_dir / "frontend.cleanup.command.sh",
         frontend_pid_path=case_dir / "frontend.pid",
+        frontend_pgid_path=case_dir / "frontend.pgid",
         frontend_log_path=case_dir / "frontend.log",
         frontend_launch_log_path=case_dir / "frontend.launch.log",
         rank_command_paths=rank_command_paths,
         rank_cleanup_command_paths=rank_cleanup_command_paths,
         rank_pid_paths=rank_pid_paths,
+        rank_pgid_paths=rank_pgid_paths,
         rank_log_paths=rank_log_paths,
         rank_launch_log_paths=rank_launch_log_paths,
     )
@@ -850,27 +868,39 @@ def build_runtime_shell_command(
     env_script: str | None,
     log_path: Path,
     pid_path: Path,
+    pgid_path: Path,
 ) -> str:
     env_prefix = " ".join(
         f"{key}={shlex.quote(str(value))}" for key, value in env.items())
     command = shell_join(argv)
     if env_prefix:
         command = f"env {env_prefix} {command}"
-    run_command = (
-        f"echo $$ > {shlex.quote(str(pid_path))} && exec {command} "
-        f"2>&1 | tee {shlex.quote(str(log_path))} >/dev/null")
 
-    steps = [f"cd {shlex.quote(cwd)}"]
+    steps = [
+        f"cd {shlex.quote(cwd)}",
+        f"rm -f {shlex.quote(str(pid_path))} >/dev/null 2>&1 || true",
+        f"rm -f {shlex.quote(str(pgid_path))} >/dev/null 2>&1 || true",
+    ]
     if env_script:
         steps.append(f"source {shlex.quote(env_script)}")
-    steps.append(f"set -o pipefail && {run_command}")
-    return " && ".join(steps)
+    steps.extend([
+        "set +e",
+        f"{command} > {shlex.quote(str(log_path))} 2>&1 &",
+        "child_pid=$!",
+        f"printf '%s\\n' \"$child_pid\" > {shlex.quote(str(pid_path))}",
+        f"printf '%s\\n' \"$$\" > {shlex.quote(str(pgid_path))}",
+        "wait \"$child_pid\"",
+        "child_exit_code=$?",
+        "exit \"$child_exit_code\"",
+    ])
+    return "\n".join(steps)
 
 
 def build_node_cleanup_command(
     *,
     resolved: ResolvedCase,
     pid_path: Path,
+    pgid_path: Path,
     include_frontend_pattern: bool,
 ) -> str:
     def append_pattern_cleanup(
@@ -893,6 +923,16 @@ def build_node_cleanup_command(
 
     lines = [
         "set +e",
+        f"if [ -f {shlex.quote(str(pgid_path))} ]; then",
+        f"  pgid=$(cat {shlex.quote(str(pgid_path))} 2>/dev/null || true)",
+        "  if [ -n \"$pgid\" ] && kill -0 -- \"-$pgid\" >/dev/null 2>&1; then",
+        "    kill -TERM -- \"-$pgid\" >/dev/null 2>&1 || true",
+        "    sleep 5",
+        "    if kill -0 -- \"-$pgid\" >/dev/null 2>&1; then",
+        "      kill -KILL -- \"-$pgid\" >/dev/null 2>&1 || true",
+        "    fi",
+        "  fi",
+        "fi",
         f"if [ -f {shlex.quote(str(pid_path))} ]; then",
         f"  pid=$(cat {shlex.quote(str(pid_path))} 2>/dev/null || true)",
         "  if [ -n \"$pid\" ] && kill -0 \"$pid\" >/dev/null 2>&1; then",
@@ -903,7 +943,6 @@ def build_node_cleanup_command(
         "    fi",
         "  fi",
         "fi",
-        f"rm -f {shlex.quote(str(pid_path))} >/dev/null 2>&1 || true",
     ]
 
     append_pattern_cleanup(
@@ -916,6 +955,13 @@ def build_node_cleanup_command(
             wait_pattern=f"^python3 {HARNESS_ENTRYPOINT} frontend( |$)",
         )
 
+    append_pattern_cleanup("^VLLM::EngineCore")
+    append_pattern_cleanup("^VLLM::DPCoordinator$")
+    append_pattern_cleanup("^VLLM::APIServer$")
+    append_pattern_cleanup("^VLLM::Worker_")
+    append_pattern_cleanup(
+        ("vllm serve .*--data-parallel-rpc-port "
+         f"{resolved.case.data_parallel_rpc_port}([[:space:]]|$)"))
     for pattern in (
             f"--master-port {resolved.cluster.master_port}",
             f"--data-parallel-rpc-port {resolved.case.data_parallel_rpc_port}"):
@@ -924,6 +970,19 @@ def build_node_cleanup_command(
     if resolved.case.cleanup_worker_processes:
         append_pattern_cleanup("^VLLM::Worker_")
     return "\n".join(lines)
+
+
+def build_pidfile_probe_command(pid_path: Path) -> str:
+    return "\n".join([
+        "set +e",
+        f"if [ -f {shlex.quote(str(pid_path))} ]; then",
+        f"  pid=$(cat {shlex.quote(str(pid_path))} 2>/dev/null || true)",
+        "  if [ -n \"$pid\" ] && kill -0 \"$pid\" >/dev/null 2>&1; then",
+        "    exit 0",
+        "  fi",
+        "fi",
+        "exit 1",
+    ])
 
 
 def build_local_launch_command(resolved: ResolvedCase, artifacts: ArtifactPaths,
@@ -935,6 +994,7 @@ def build_local_launch_command(resolved: ResolvedCase, artifacts: ArtifactPaths,
         env_script=resolved.cluster.local_env_script,
         log_path=artifacts.frontend_log_path,
         pid_path=artifacts.frontend_pid_path,
+        pgid_path=artifacts.frontend_pgid_path,
     )
 
 
@@ -951,6 +1011,7 @@ def build_remote_launch_command(
         env_script=resolved.cluster.remote_env_script,
         log_path=artifacts.rank_log_paths[node_rank],
         pid_path=artifacts.rank_pid_paths[node_rank],
+        pgid_path=artifacts.rank_pgid_paths[node_rank],
     )
 
 
@@ -1203,6 +1264,155 @@ def should_stop_followup_rates(result: CaseResult) -> tuple[bool, str | None]:
     return False, None
 
 
+def benchmark_summary_indicates_success(summary: Mapping[str, Any]) -> bool:
+    try:
+        total_requests = int(summary.get("total_requests"))
+        successful_requests = int(summary.get("successful_requests"))
+        failed_requests = int(summary.get("failed_requests", 0))
+        failure_ratio = float(summary.get("failure_ratio", 0.0))
+    except (TypeError, ValueError):
+        return False
+
+    if total_requests <= 0:
+        return False
+    if successful_requests != total_requests:
+        return False
+    if failed_requests != 0:
+        return False
+    if not math.isclose(failure_ratio, 0.0, abs_tol=1e-12):
+        return False
+    return True
+
+
+def iso_timestamp_for_path(path: Path) -> str | None:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return datetime.fromtimestamp(stat_result.st_mtime).astimezone().isoformat(
+        timespec="seconds")
+
+
+def benchmark_started_at_from_run_meta(benchmark_dir: Path) -> str | None:
+    run_meta_path = benchmark_dir / "run_meta.json"
+    if not run_meta_path.is_file():
+        return None
+
+    try:
+        run_meta = load_json(run_meta_path)
+    except Exception:
+        return None
+
+    started_at = run_meta.get("benchmark_start_time")
+    return started_at if isinstance(started_at, str) and started_at else None
+
+
+def maybe_repair_case_manifest_as_success(case_dir: Path,
+                                          manifest: dict[str, Any] | None) -> None:
+    if manifest is None:
+        return
+
+    updated_manifest = dict(manifest)
+    benchmark_dir = case_dir / "benchmark"
+    manifest_was_ok = updated_manifest.get("status") == "ok"
+    if not manifest_was_ok:
+        updated_manifest["status"] = "ok"
+        updated_manifest["exit_code"] = 0
+        updated_manifest["detail"] = (
+            "completed (recovered from successful benchmark artifacts)")
+    if not updated_manifest.get("started_at"):
+        updated_manifest["started_at"] = (benchmark_started_at_from_run_meta(
+            benchmark_dir) or iso_timestamp_for_path(case_dir))
+    if not updated_manifest.get("finished_at"):
+        updated_manifest["finished_at"] = (iso_timestamp_for_path(
+            benchmark_dir / "summary.json") or iso_timestamp_for_path(
+                benchmark_dir / "requests.jsonl") or iso_timestamp_for_path(
+                    case_dir))
+
+    if updated_manifest != manifest:
+        write_json(case_dir / "case_manifest.json", updated_manifest)
+
+
+def maybe_finalize_interrupted_case_manifest(
+    case_dir: Path,
+    *,
+    manifest: dict[str, Any] | None,
+    signal_name: str,
+    exit_code: int,
+    finished_at: str,
+) -> None:
+    if complete_successful_benchmark_tpot_by_e2e_mean(case_dir,
+                                                      manifest=manifest) is not None:
+        return
+    if manifest is None:
+        return
+    if manifest.get("status") not in {"prepared", "running"}:
+        return
+
+    updated_manifest = dict(manifest)
+    updated_manifest["status"] = "interrupted"
+    updated_manifest["exit_code"] = exit_code
+
+    interrupt_detail = f"interrupted by {signal_name}"
+    detail = updated_manifest.get("detail")
+    if not detail:
+        updated_manifest["detail"] = interrupt_detail
+    elif interrupt_detail not in str(detail):
+        updated_manifest["detail"] = f"{detail}\n{interrupt_detail}"
+
+    if not updated_manifest.get("started_at"):
+        updated_manifest["started_at"] = (benchmark_started_at_from_run_meta(
+            case_dir / "benchmark") or iso_timestamp_for_path(case_dir))
+    updated_manifest["finished_at"] = finished_at
+    write_json(case_dir / "case_manifest.json", updated_manifest)
+
+
+def complete_successful_benchmark_tpot_by_e2e_mean(
+        case_dir: Path,
+        *,
+        manifest: dict[str, Any] | None = None) -> float | None:
+    benchmark_dir = case_dir / "benchmark"
+    summary_path = benchmark_dir / "summary.json"
+    requests_path = benchmark_dir / "requests.jsonl"
+    if not summary_path.is_file() or not requests_path.is_file():
+        return None
+
+    try:
+        summary = load_json(summary_path)
+    except Exception:
+        return None
+
+    if not benchmark_summary_indicates_success(summary):
+        return None
+
+    tpot_by_e2e_mean = extract_summary_tpot_by_e2e_mean(summary)
+    if tpot_by_e2e_mean is None:
+        try:
+            augment_benchmark_outputs(benchmark_dir)
+            summary = load_json(summary_path)
+        except Exception:
+            pass
+        tpot_by_e2e_mean = extract_summary_tpot_by_e2e_mean(summary)
+
+    maybe_repair_case_manifest_as_success(case_dir, manifest)
+    return tpot_by_e2e_mean
+
+
+def case_dir_has_complete_successful_benchmark(case_dir: Path) -> bool:
+    benchmark_dir = case_dir / "benchmark"
+    summary_path = benchmark_dir / "summary.json"
+    requests_path = benchmark_dir / "requests.jsonl"
+    if not summary_path.is_file() or not requests_path.is_file():
+        return False
+
+    try:
+        summary = load_json(summary_path)
+    except Exception:
+        return False
+
+    return benchmark_summary_indicates_success(summary)
+
+
 def latest_successful_case_dir(case_group_dir: Path) -> Path | None:
     if not case_group_dir.is_dir():
         return None
@@ -1211,15 +1421,18 @@ def latest_successful_case_dir(case_group_dir: Path) -> Path | None:
                         reverse=True)
     for case_dir in candidates:
         manifest_path = case_dir / "case_manifest.json"
-        if not manifest_path.is_file():
-            continue
+        if manifest_path.is_file():
+            try:
+                manifest = load_json(manifest_path)
+            except Exception:
+                manifest = None
+            if manifest is not None and manifest.get("status") == "ok":
+                return case_dir
 
-        try:
-            manifest = load_json(manifest_path)
-        except Exception:
-            continue
-
-        if manifest.get("status") == "ok":
+        # Interrupted runs can leave a non-ok manifest behind even when the
+        # benchmark itself finished cleanly. Accept those directories as
+        # historical successes so exact-case reruns still skip them.
+        if case_dir_has_complete_successful_benchmark(case_dir):
             return case_dir
     return None
 
@@ -1229,6 +1442,19 @@ def latest_successful_case_tpot_by_e2e_mean(case_group_dir: Path) -> tuple[
     case_dir = latest_successful_case_dir(case_group_dir)
     if case_dir is None:
         return None
+
+    manifest_path = case_dir / "case_manifest.json"
+    manifest: dict[str, Any] | None = None
+    if manifest_path.is_file():
+        try:
+            manifest = load_json(manifest_path)
+        except Exception:
+            manifest = None
+
+    recovered_tpot_by_e2e_mean = complete_successful_benchmark_tpot_by_e2e_mean(
+        case_dir, manifest=manifest)
+    if recovered_tpot_by_e2e_mean is not None:
+        return case_dir, recovered_tpot_by_e2e_mean
 
     summary_path = case_dir / "benchmark" / "summary.json"
     if not summary_path.is_file():
@@ -1294,12 +1520,195 @@ def block_reason_for_rate(
     return None
 
 
+def write_run_manifest(
+    path: Path,
+    *,
+    run_name: str,
+    created_at: str,
+    dry_run: bool,
+    keep_going: bool,
+    rate_plan: str,
+    cases: list[str],
+    finished_at: str | None = None,
+    historical_exact_case_skips: Mapping[str, str] | None = None,
+    historical_blocked_groups: Mapping[str, tuple[float, str]] | None = None,
+    runtime_blocked_groups: Mapping[str, tuple[float, str]] | None = None,
+    results: list[CaseResult] | None = None,
+    aborted: Mapping[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "run_name": run_name,
+        "created_at": created_at,
+        "dry_run": dry_run,
+        "keep_going": keep_going,
+        "rate_plan": rate_plan,
+        "cases": cases,
+    }
+    if finished_at is not None:
+        payload["finished_at"] = finished_at
+    if historical_exact_case_skips is not None:
+        payload["historical_exact_case_skips"] = historical_exact_case_skips
+    if historical_blocked_groups is not None:
+        payload["historical_blocked_groups"] = {
+            key: {
+                "blocked_from_rate": rate,
+                "reason": reason,
+            }
+            for key, (rate, reason) in historical_blocked_groups.items()
+        }
+    if runtime_blocked_groups is not None:
+        payload["runtime_blocked_groups"] = {
+            key: {
+                "blocked_from_rate": rate,
+                "reason": reason,
+            }
+            for key, (rate, reason) in runtime_blocked_groups.items()
+        }
+    if results is not None:
+        payload["results"] = [jsonify(result) for result in results]
+    if aborted is not None:
+        payload["aborted"] = dict(aborted)
+    write_json(path, payload)
+
+
+def describe_abort(exc: BaseException) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": type(exc).__name__,
+    }
+    detail = str(exc)
+    if detail:
+        payload["detail"] = detail
+    if isinstance(exc, SystemExit):
+        payload["exit_code"] = exc.code
+    return payload
+
+
 def local_ports_for_case(resolved: ResolvedCase) -> tuple[int, ...]:
     return tuple(
         sorted({
             resolved.cluster.master_port,
             resolved.case.data_parallel_rpc_port,
         }))
+
+
+TCP_STATE_NAMES = {
+    "01": "ESTABLISHED",
+    "02": "SYN_SENT",
+    "03": "SYN_RECV",
+    "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2",
+    "06": "TIME_WAIT",
+    "07": "CLOSE",
+    "08": "CLOSE_WAIT",
+    "09": "LAST_ACK",
+    "0A": "LISTEN",
+    "0B": "CLOSING",
+}
+
+
+def _iter_proc_net_tcp_rows() -> list[tuple[str, str, str, str]]:
+    rows: list[tuple[str, str, str, str]] = []
+    for table_path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        if not table_path.is_file():
+            continue
+        try:
+            lines = table_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines[1:]:
+            fields = line.split()
+            if len(fields) < 10:
+                continue
+            rows.append((fields[1], fields[2], fields[3], fields[9]))
+    return rows
+
+
+def _local_address_matches_port(local_address: str, port: int) -> bool:
+    try:
+        _host_hex, port_hex = local_address.rsplit(":", 1)
+    except ValueError:
+        return False
+    return port_hex.upper() == f"{port:04X}"
+
+
+def local_tcp_state_counts_for_port(port: int) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for local_address, _remote_address, state_hex, _inode in _iter_proc_net_tcp_rows():
+        if not _local_address_matches_port(local_address, port):
+            continue
+        state_name = TCP_STATE_NAMES.get(state_hex, state_hex)
+        counts[state_name] = counts.get(state_name, 0) + 1
+    return counts
+
+
+def local_tcp_listener_details_for_port(port: int) -> list[str]:
+    listener_inodes = {
+        inode
+        for local_address, _remote_address, state_hex, inode in _iter_proc_net_tcp_rows()
+        if state_hex == "0A" and _local_address_matches_port(local_address, port)
+    }
+    if not listener_inodes:
+        return []
+
+    details: list[str] = []
+    seen_pids: set[int] = set()
+    target_links = {f"socket:[{inode}]" for inode in listener_inodes}
+    for proc_path in Path("/proc").iterdir():
+        if not proc_path.name.isdigit():
+            continue
+        pid = int(proc_path.name)
+        if pid in seen_pids:
+            continue
+
+        fd_path = proc_path / "fd"
+        try:
+            fd_entries = list(fd_path.iterdir())
+        except OSError:
+            continue
+
+        matched = False
+        for fd_entry in fd_entries:
+            try:
+                link_target = os.readlink(fd_entry)
+            except OSError:
+                continue
+            if link_target in target_links:
+                matched = True
+                break
+        if not matched:
+            continue
+
+        seen_pids.add(pid)
+        cmdline_path = proc_path / "cmdline"
+        cmdline = ""
+        try:
+            cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode(
+                "utf-8", errors="replace").strip()
+        except OSError:
+            cmdline = ""
+        if not cmdline:
+            try:
+                cmdline = f"[{(proc_path / 'comm').read_text(encoding='utf-8').strip()}]"
+            except OSError:
+                cmdline = "[unknown]"
+        details.append(f"pid {pid} ({cmdline})")
+    return sorted(details)
+
+
+def describe_local_port_diagnostics(port: int) -> str:
+    listeners = local_tcp_listener_details_for_port(port)
+    states = local_tcp_state_counts_for_port(port)
+    parts = []
+    if listeners:
+        parts.append("listeners: " + "; ".join(listeners))
+    else:
+        parts.append("listeners: none")
+    if states:
+        parts.append("states: " + ", ".join(
+            f"{state}={count}" for state, count in sorted(states.items())))
+    else:
+        parts.append("states: none")
+    return f"{port} [{'; '.join(parts)}]"
 
 
 def can_bind_local_tcp_port(port: int) -> bool:
@@ -1313,6 +1722,44 @@ def can_bind_local_tcp_port(port: int) -> bool:
             sock.bind(("", port))
         except OSError:
             return False
+    return True
+
+
+def read_tracked_process_id(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def local_pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def local_process_group_is_running(pgid: int) -> bool:
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
     return True
 
 
@@ -1347,8 +1794,47 @@ class ManualMultinodeRunner:
         self._previous_handlers: dict[int, Any] = {}
         self._handling_signal = False
 
+    def log(self, message: str, *, stream: TextIO = sys.stdout) -> None:
+        print(f"[runner] {current_iso_timestamp()} {message}",
+              file=stream,
+              flush=True)
+
+    def log_case(self,
+                 case_name: str,
+                 message: str,
+                 *,
+                 stream: TextIO = sys.stdout) -> None:
+        self.log(f"{case_name}: {message}", stream=stream)
+
+    def runtime_case_name(self, runtime: ActiveCaseRuntime) -> str:
+        return getattr(runtime.resolved.case, "name", "<unnamed-case>")
+
+    def log_waiting(self,
+                    case_name: str,
+                    message: str,
+                    *,
+                    next_log_at: float,
+                    now: float | None = None,
+                    deadline: float | None = None,
+                    stream: TextIO = sys.stdout) -> float:
+        if now is None:
+            now = time.monotonic()
+        if now < next_log_at:
+            return next_log_at
+
+        if deadline is None:
+            rendered_message = message
+        else:
+            remaining = max(0.0, deadline - now)
+            rendered_message = f"{message} (remaining ~{remaining:.0f}s)"
+        self.log_case(case_name, rendered_message, stream=stream)
+        return now + WAIT_STATUS_LOG_INTERVAL_SEC
+
     def install_signal_handlers(self) -> None:
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        handled_signals = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):
+            handled_signals.append(signal.SIGHUP)
+        for sig in handled_signals:
             self._previous_handlers[sig] = signal.getsignal(sig)
             signal.signal(sig, self._handle_signal)
 
@@ -1361,15 +1847,44 @@ class ManualMultinodeRunner:
         if self._handling_signal:
             raise SystemExit(128 + signum)
         self._handling_signal = True
+        exit_code = 128 + signum
+        signal_name = signal.Signals(signum).name
         try:
             if self._active_runtime is not None:
-                print(
-                    f"[signal] received {signal.Signals(signum).name}, cleaning up active case...",
-                    file=sys.stderr,
-                )
-                self.cleanup_case_runtime(self._active_runtime)
+                case_name = self.runtime_case_name(self._active_runtime)
+                self.log_case(case_name,
+                              (f"received {signal_name}; cleaning up active "
+                               "case and repairing manifest if possible"),
+                              stream=sys.stderr)
+                with contextlib.suppress(Exception):
+                    self.cleanup_case_runtime(self._active_runtime)
+                with contextlib.suppress(Exception):
+                    self.finalize_active_case_manifest_after_signal(
+                        self._active_runtime,
+                        signum=signum,
+                    )
         finally:
-            raise SystemExit(128 + signum)
+            raise SystemExit(exit_code)
+
+    def finalize_active_case_manifest_after_signal(
+            self, runtime: ActiveCaseRuntime, *, signum: int) -> None:
+        signal_name = signal.Signals(signum).name
+        manifest = load_optional_json(runtime.artifacts.case_manifest_path)
+        maybe_finalize_interrupted_case_manifest(
+            runtime.artifacts.case_dir,
+            manifest=manifest,
+            signal_name=signal_name,
+            exit_code=128 + signum,
+            finished_at=current_iso_timestamp(),
+        )
+        repaired_manifest = load_optional_json(runtime.artifacts.case_manifest_path)
+        if repaired_manifest is not None:
+            self.log_case(
+                self.runtime_case_name(runtime),
+                ("persisted manifest after signal with "
+                 f"status={repaired_manifest.get('status')}"),
+                stream=sys.stderr,
+            )
 
     def run(self, selected_cases: list[ExperimentCase], run_label: str | None,
             *, rate_plan: str) -> list[CaseResult]:
@@ -1377,40 +1892,43 @@ class ManualMultinodeRunner:
         run_dir = self.artifact_root / "_runs" / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         run_manifest_path = run_dir / "run_manifest.json"
-        write_json(
+        created_at = current_iso_timestamp()
+        case_names = [case.name for case in selected_cases]
+        write_run_manifest(
             run_manifest_path,
-            {
-                "run_name": run_name,
-                "created_at": current_iso_timestamp(),
-                "dry_run": self.dry_run,
-                "keep_going": self.keep_going,
-                "rate_plan": rate_plan,
-                "cases": [case.name for case in selected_cases],
-            },
+            run_name=run_name,
+            created_at=created_at,
+            dry_run=self.dry_run,
+            keep_going=self.keep_going,
+            rate_plan=rate_plan,
+            cases=case_names,
         )
 
         results: list[CaseResult] = []
         exact_case_skips, historical_blocked_groups = build_historical_skip_state(
             self.artifact_root, selected_cases)
         runtime_blocked_groups: dict[str, tuple[float, str]] = {}
+        aborted: dict[str, Any] | None = None
         self.install_signal_handlers()
         try:
             for case in selected_cases:
                 historical_group_reason = block_reason_for_rate(
                     historical_blocked_groups, case)
                 if historical_group_reason is not None:
-                    print(f"[skip] {case.name}: {historical_group_reason}")
+                    print(f"[skip] {case.name}: {historical_group_reason}",
+                          flush=True)
                     continue
 
                 runtime_group_reason = block_reason_for_rate(
                     runtime_blocked_groups, case)
                 if runtime_group_reason is not None:
-                    print(f"[skip] {case.name}: {runtime_group_reason}")
+                    print(f"[skip] {case.name}: {runtime_group_reason}",
+                          flush=True)
                     continue
 
                 exact_skip_reason = exact_case_skips.get(case.name)
                 if exact_skip_reason is not None:
-                    print(f"[skip] {case.name}: {exact_skip_reason}")
+                    print(f"[skip] {case.name}: {exact_skip_reason}", flush=True)
                     continue
 
                 result = self.run_case(case, run_dir)
@@ -1421,40 +1939,31 @@ class ManualMultinodeRunner:
                     group_key = case_group_key(case)
                     runtime_blocked_groups[group_key] = (case.request_rate,
                                                          reason)
-                    print(f"[sweep] stop higher rates for {group_key}: {reason}")
+                    print(f"[sweep] stop higher rates for {group_key}: {reason}",
+                          flush=True)
                 if (result.status not in {"ok", "dry_run", "timed_out"}
                         and not self.keep_going):
                     break
+        except BaseException as exc:
+            aborted = describe_abort(exc)
+            raise
         finally:
             self.restore_signal_handlers()
-
-        write_json(
-            run_manifest_path,
-            {
-                "run_name": run_name,
-                "created_at": current_iso_timestamp(),
-                "dry_run": self.dry_run,
-                "keep_going": self.keep_going,
-                "rate_plan": rate_plan,
-                "cases": [case.name for case in selected_cases],
-                "historical_exact_case_skips": exact_case_skips,
-                "historical_blocked_groups": {
-                    key: {
-                        "blocked_from_rate": rate,
-                        "reason": reason,
-                    }
-                    for key, (rate, reason) in historical_blocked_groups.items()
-                },
-                "runtime_blocked_groups": {
-                    key: {
-                        "blocked_from_rate": rate,
-                        "reason": reason,
-                    }
-                    for key, (rate, reason) in runtime_blocked_groups.items()
-                },
-                "results": [jsonify(result) for result in results],
-            },
-        )
+            write_run_manifest(
+                run_manifest_path,
+                run_name=run_name,
+                created_at=created_at,
+                dry_run=self.dry_run,
+                keep_going=self.keep_going,
+                rate_plan=rate_plan,
+                cases=case_names,
+                finished_at=current_iso_timestamp(),
+                historical_exact_case_skips=exact_case_skips,
+                historical_blocked_groups=historical_blocked_groups,
+                runtime_blocked_groups=runtime_blocked_groups,
+                results=results,
+                aborted=aborted,
+            )
         return results
 
     def run_case(self, case: ExperimentCase, _run_dir: Path) -> CaseResult:
@@ -1484,12 +1993,14 @@ class ManualMultinodeRunner:
         local_cleanup_command = build_node_cleanup_command(
             resolved=resolved,
             pid_path=artifacts.frontend_pid_path,
+            pgid_path=artifacts.frontend_pgid_path,
             include_frontend_pattern=True,
         )
         remote_cleanup_commands = {
             node_rank: build_node_cleanup_command(
                 resolved=resolved,
                 pid_path=artifacts.rank_pid_paths[node_rank],
+                pgid_path=artifacts.rank_pgid_paths[node_rank],
                 include_frontend_pattern=False,
             )
             for node_rank in range(1, resolved.cluster.nnodes)
@@ -1518,7 +2029,21 @@ class ManualMultinodeRunner:
         )
 
         started_at = current_iso_timestamp()
-        print(f"[case] starting {case.name}")
+        write_case_manifest(
+            resolved,
+            artifacts,
+            frontend_launch_command=frontend_launch_command,
+            remote_launch_commands=remote_launch_commands,
+            local_cleanup_command=local_cleanup_command,
+            remote_cleanup_commands=remote_cleanup_commands,
+            status="running",
+            started_at=started_at,
+            finished_at=None,
+            exit_code=None,
+            detail="launch sequence started",
+        )
+        print(f"[case] starting {case.name}", flush=True)
+        self.log_case(case.name, "precleaning existing processes and ports")
         if self.dry_run:
             finished_at = current_iso_timestamp()
             write_case_manifest(
@@ -1534,6 +2059,8 @@ class ManualMultinodeRunner:
                 exit_code=0,
                 detail="dry run: commands were written, nothing was executed",
             )
+            self.log_case(case.name, "dry run complete; commands were written only")
+            print(f"[case] {case.name}: dry_run", flush=True)
             return CaseResult(
                 case_name=case.name,
                 status="dry_run",
@@ -1552,13 +2079,27 @@ class ManualMultinodeRunner:
         exit_code: int | None = None
         detail = ""
         status = "ok"
+        cleanup_error: Exception | None = None
+        launched_runtime = False
         try:
             self.run_preclean(resolved, artifacts)
+            self.log_case(case.name, "launching remote headless nodes")
             self.launch_headless_nodes(runtime, remote_launch_commands)
+            launched_runtime = bool(runtime.headless_nodes)
+            self.log_case(case.name, "waiting for remote headless startup")
             self.wait_for_headless_startup(runtime)
+            self.log_case(case.name, "launching frontend benchmark process")
             self.launch_frontend(runtime, frontend_launch_command)
+            launched_runtime = True
+            self.log_case(case.name, "frontend launched; waiting for benchmark completion")
             exit_code = self.wait_for_frontend(runtime)
+            self.log_case(case.name,
+                          "frontend exited cleanly; waiting for remote headless shutdown")
             self.wait_for_headless_shutdown(runtime)
+            self.log_case(case.name,
+                          "remote headless nodes exited; waiting for local shutdown")
+            self.wait_for_local_shutdown(runtime)
+            self.log_case(case.name, "local shutdown finished; augmenting benchmark outputs")
             augment_benchmark_outputs(artifacts.benchmark_dir)
             detail = "completed"
         except BenchTimeoutError as exc:
@@ -1570,8 +2111,43 @@ class ManualMultinodeRunner:
             detail = str(exc)
             exit_code = exit_code if exit_code is not None else 1
         finally:
-            self.cleanup_case_runtime(runtime)
+            try:
+                self.log_case(case.name, "running cleanup commands")
+                self.cleanup_case_runtime(runtime)
+            except Exception as exc:
+                cleanup_error = exc
             self._active_runtime = None
+
+        if cleanup_error is not None:
+            self.log_case(case.name, f"cleanup reported an error: {cleanup_error}",
+                          stream=sys.stderr)
+            cleanup_detail = f"cleanup failed: {cleanup_error}"
+            if status == "ok":
+                status = "failed"
+                detail = cleanup_detail
+                exit_code = 1 if exit_code in (None, 0) else exit_code
+            elif detail:
+                detail = f"{detail}\n{cleanup_detail}"
+            else:
+                detail = cleanup_detail
+
+        if launched_runtime:
+            try:
+                self.log_case(case.name, "verifying post-cleanup process and port state")
+                self.verify_case_cleanup(runtime)
+            except Exception as exc:
+                self.log_case(case.name,
+                              f"post-cleanup verification failed: {exc}",
+                              stream=sys.stderr)
+                cleanup_detail = str(exc)
+                if status == "ok":
+                    status = "failed"
+                    detail = cleanup_detail
+                    exit_code = 1 if exit_code in (None, 0) else exit_code
+                elif detail:
+                    detail = f"{detail}\n{cleanup_detail}"
+                else:
+                    detail = cleanup_detail
 
         finished_at = current_iso_timestamp()
         write_case_manifest(
@@ -1588,7 +2164,8 @@ class ManualMultinodeRunner:
             detail=detail,
         )
 
-        print(f"[case] {case.name}: {status}")
+        self.log_case(case.name, f"final status={status} exit_code={exit_code}")
+        print(f"[case] {case.name}: {status}", flush=True)
         return CaseResult(
             case_name=case.name,
             status=status,
@@ -1630,16 +2207,24 @@ class ManualMultinodeRunner:
                 return
 
             ports_text = ", ".join(str(port) for port in busy_ports)
+            diagnostics = "; ".join(
+                describe_local_port_diagnostics(port) for port in busy_ports)
             print(
                 ("[preclean] local ports still busy after cleanup "
                  f"attempt {attempt}/{PRESTART_CLEANUP_MAX_ATTEMPTS}: "
                  f"{ports_text}"),
                 file=sys.stderr,
+                flush=True,
             )
+            print(f"[preclean] diagnostics: {diagnostics}",
+                  file=sys.stderr,
+                  flush=True)
 
         ports_text = ", ".join(str(port) for port in busy_ports)
+        diagnostics = "; ".join(
+            describe_local_port_diagnostics(port) for port in busy_ports)
         raise RuntimeError("preclean could not free local ports before launch: "
-                           f"{ports_text}")
+                           f"{ports_text}. diagnostics: {diagnostics}")
 
     def launch_headless_nodes(self, runtime: ActiveCaseRuntime,
                               remote_launch_commands: dict[int, str]) -> None:
@@ -1714,10 +2299,14 @@ class ManualMultinodeRunner:
         assert runtime.frontend is not None
         timeout_sec = runtime.resolved.case.max_bench_duration_sec
         deadline = None
+        wait_started_at = time.monotonic()
         if timeout_sec is not None:
-            deadline = time.monotonic() + timeout_sec
+            deadline = wait_started_at + timeout_sec
         pending_headless_nodes = list(runtime.headless_nodes)
+        case_name = self.runtime_case_name(runtime)
+        next_log_at = wait_started_at + WAIT_STATUS_LOG_INTERVAL_SEC
         while True:
+            now = time.monotonic()
             exit_code = runtime.frontend.process.poll()
             if exit_code is not None:
                 if exit_code != 0:
@@ -1726,9 +2315,10 @@ class ManualMultinodeRunner:
                             runtime.frontend.launch_log_path)
                     raise RuntimeError(
                         f"frontend exited with code {exit_code}.\n{detail}")
+                self.log_case(case_name, "frontend process exited with code 0")
                 return exit_code
 
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline is not None and now >= deadline:
                 detail = tail_file(runtime.frontend.runtime_log_path) or tail_file(
                     runtime.frontend.launch_log_path)
                 message = ("frontend exceeded "
@@ -1751,32 +2341,175 @@ class ManualMultinodeRunner:
                         f"rank {node.node_rank} on {node.host} exited early "
                         f"with code {node_exit_code}.\n{detail}")
             pending_headless_nodes = still_running_headless_nodes
+            pending_ranks = ", ".join(
+                str(node.node_rank) for node in pending_headless_nodes) or "none"
+            next_log_at = self.log_waiting(
+                case_name,
+                ("still waiting for frontend benchmark to finish; "
+                 f"remote wrappers still running on ranks: {pending_ranks}"),
+                next_log_at=next_log_at,
+                now=now,
+                deadline=deadline,
+            )
             time.sleep(1.0)
 
     def wait_for_headless_shutdown(self, runtime: ActiveCaseRuntime) -> None:
-        deadline = (time.monotonic() +
+        wait_started_at = time.monotonic()
+        deadline = (wait_started_at +
                     runtime.resolved.case.remote_shutdown_grace_sec)
         pending = list(runtime.headless_nodes)
-        while pending and time.monotonic() < deadline:
-            pending = [node for node in pending if node.process.poll() is None]
+        case_name = self.runtime_case_name(runtime)
+        next_log_at = wait_started_at + WAIT_STATUS_LOG_INTERVAL_SEC
+        while pending:
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            still_pending = []
+            pending_statuses: list[str] = []
+            for node in pending:
+                wrapper_running = node.process.poll() is None
+                remote_pid_running = self.remote_pidfile_is_running(
+                    runtime.resolved.cluster,
+                    node.host,
+                    runtime.artifacts.rank_pid_paths[node.node_rank],
+                )
+                if wrapper_running or remote_pid_running:
+                    still_pending.append(node)
+                    state_bits = []
+                    if wrapper_running:
+                        state_bits.append("wrapper")
+                    if remote_pid_running:
+                        state_bits.append("pidfile")
+                    pending_statuses.append(
+                        f"rank {node.node_rank}@{node.host} ({'/'.join(state_bits)})")
+            pending = still_pending
             if pending:
+                next_log_at = self.log_waiting(
+                    case_name,
+                    "waiting for remote headless shutdown: " +
+                    "; ".join(pending_statuses),
+                    next_log_at=next_log_at,
+                    now=now,
+                    deadline=deadline,
+                )
                 time.sleep(1.0)
 
         if pending:
             details = []
             for node in pending:
-                details.append(
-                    f"rank {node.node_rank} on {node.host} did not exit in time.")
+                pid_running = self.remote_pidfile_is_running(
+                    runtime.resolved.cluster,
+                    node.host,
+                    runtime.artifacts.rank_pid_paths[node.node_rank],
+                )
+                pid_path = runtime.artifacts.rank_pid_paths[node.node_rank]
+                detail = f"rank {node.node_rank} on {node.host} did not exit in time."
+                if pid_running:
+                    detail += f" remote pidfile still points to a live pid at {pid_path}."
+                details.append(detail)
             raise RuntimeError("\n".join(details))
 
+    def wait_for_local_shutdown(self, runtime: ActiveCaseRuntime) -> None:
+        wait_started_at = time.monotonic()
+        deadline = wait_started_at + self.local_shutdown_timeout_sec(runtime)
+        details = self.local_shutdown_failures(runtime)
+        case_name = self.runtime_case_name(runtime)
+        next_log_at = wait_started_at + WAIT_STATUS_LOG_INTERVAL_SEC
+        while details:
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            next_log_at = self.log_waiting(
+                case_name,
+                "waiting for local shutdown: " + " | ".join(details),
+                next_log_at=next_log_at,
+                now=now,
+                deadline=deadline,
+            )
+            time.sleep(LOCAL_SHUTDOWN_POLL_INTERVAL_SEC)
+            details = self.local_shutdown_failures(runtime)
+
+        if details:
+            raise RuntimeError("node 0 local shutdown did not complete in time.\n" +
+                               "\n".join(details))
+
+    def verify_case_cleanup(self, runtime: ActiveCaseRuntime) -> None:
+        wait_started_at = time.monotonic()
+        deadline = wait_started_at + self.local_shutdown_timeout_sec(runtime)
+        details = self.case_cleanup_failures(runtime)
+        case_name = self.runtime_case_name(runtime)
+        next_log_at = wait_started_at + WAIT_STATUS_LOG_INTERVAL_SEC
+        while details:
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            next_log_at = self.log_waiting(
+                case_name,
+                "waiting for post-cleanup verification: " + " | ".join(details),
+                next_log_at=next_log_at,
+                now=now,
+                deadline=deadline,
+            )
+            time.sleep(LOCAL_SHUTDOWN_POLL_INTERVAL_SEC)
+            details = self.case_cleanup_failures(runtime)
+
+        if details:
+            raise RuntimeError("post-cleanup verification failed.\n" +
+                               "\n".join(details))
+
+    def local_shutdown_timeout_sec(self, runtime: ActiveCaseRuntime) -> float:
+        timeout = getattr(runtime.resolved.case, "local_shutdown_grace_sec", None)
+        if timeout is not None:
+            return timeout
+        return getattr(runtime.resolved.case, "remote_shutdown_grace_sec", 30.0)
+
+    def local_shutdown_failures(self, runtime: ActiveCaseRuntime) -> list[str]:
+        details: list[str] = []
+
+        pid = read_tracked_process_id(runtime.artifacts.frontend_pid_path)
+        if pid is not None and local_pid_is_running(pid):
+            details.append("frontend pidfile still points to a live pid at "
+                           f"{runtime.artifacts.frontend_pid_path} (pid {pid}).")
+
+        pgid = read_tracked_process_id(runtime.artifacts.frontend_pgid_path)
+        if pgid is not None and local_process_group_is_running(pgid):
+            details.append("frontend process group still has live processes at "
+                           f"{runtime.artifacts.frontend_pgid_path} (pgid {pgid}).")
+
+        busy_ports = tuple(
+            port for port in local_ports_for_case(runtime.resolved)
+            if not can_bind_local_tcp_port(port))
+        if busy_ports:
+            diagnostics = "; ".join(
+                describe_local_port_diagnostics(port) for port in busy_ports)
+            details.append("local ports still busy: " + diagnostics)
+
+        return details
+
+    def case_cleanup_failures(self, runtime: ActiveCaseRuntime) -> list[str]:
+        details = list(self.local_shutdown_failures(runtime))
+        for node in runtime.headless_nodes:
+            pid_path = runtime.artifacts.rank_pid_paths[node.node_rank]
+            if self.remote_pidfile_is_running(runtime.resolved.cluster, node.host,
+                                              pid_path):
+                details.append("rank "
+                               f"{node.node_rank} on {node.host} pidfile still "
+                               f"points to a live pid at {pid_path}.")
+        return details
+
     def cleanup_case_runtime(self, runtime: ActiveCaseRuntime) -> None:
+        case_name = self.runtime_case_name(runtime)
         if runtime.frontend is not None:
+            self.log_case(case_name, "terminating frontend wrapper process")
             self.terminate_process(runtime.frontend.process, "frontend")
             runtime.frontend.launch_log_handle.close()
         for node in runtime.headless_nodes:
+            self.log_case(case_name,
+                          f"terminating rank {node.node_rank} wrapper process")
             self.terminate_process(node.process, f"rank {node.node_rank}")
             node.launch_log_handle.close()
 
+        self.log_case(case_name, "running local cleanup command on node 0")
         self.run_local_shell(
             runtime.resolved.cluster,
             runtime.artifacts.frontend_cleanup_command_path.read_text(
@@ -1784,6 +2517,8 @@ class ManualMultinodeRunner:
         )
         for node_rank, host in enumerate(runtime.resolved.cluster.remote_hosts,
                                          start=1):
+            self.log_case(case_name,
+                          f"running remote cleanup command on rank {node_rank} host {host}")
             self.run_remote_shell(
                 runtime.resolved.cluster,
                 host,
@@ -1808,7 +2543,25 @@ class ManualMultinodeRunner:
                     proc.kill()
                 with contextlib.suppress(Exception):
                     proc.wait(timeout=5)
-            print(f"[cleanup] terminated {label}", file=sys.stderr)
+            print(f"[cleanup] terminated {label}",
+                  file=sys.stderr,
+                  flush=True)
+
+    def remote_pidfile_is_running(self, cluster: ClusterSpec, host: str,
+                                  pid_path: Path) -> bool:
+        ssh_command = build_remote_ssh_command(
+            cluster,
+            host,
+            build_pidfile_probe_command(pid_path),
+        )
+        completed = subprocess.run(
+            ssh_command,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return completed.returncode == 0
 
     def run_local_shell(self, cluster: ClusterSpec, command: str) -> None:
         subprocess.run(

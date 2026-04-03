@@ -6,15 +6,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import signal
+import sys
 import time
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 import numpy as np
 import uvloop
@@ -65,6 +67,8 @@ TTFT_SEMANTICS_FIRST_REAL_TOKEN = "first_real_token_latency"
 TTFT_SEMANTICS_DECODE_BENCH_DUMMY_PREFILL = (
     "decode_bench_dummy_prefill_pre_forward_schedule_boundary"
 )
+FRONTEND_TEARDOWN_HEARTBEAT_SEC = 15.0
+FRONTEND_TEARDOWN_TIMEOUT_SEC = 60.0
 
 
 def _non_negative_int(value: str) -> int:
@@ -93,6 +97,60 @@ def _json_dump(path: Path, payload: dict[str, Any]) -> None:
         json.dumps(_jsonify(payload), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _format_frontend_log_value(value: Any) -> str:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float):
+        if np.isfinite(value):
+            return f"{value:.3f}"
+        return str(value)
+    return str(value)
+
+
+def _format_frontend_log_fields(fields: Mapping[str, Any]) -> str:
+    return " ".join(
+        f"{key}={_format_frontend_log_value(value)}"
+        for key, value in fields.items()
+        if value is not None
+    )
+
+
+def _log_frontend_phase(
+    phase: str,
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    frontend_started_at_s: float,
+    measured_requests: int | None = None,
+    summary_written: bool | None = None,
+    parquet_written: bool | None = None,
+    exception: BaseException | None = None,
+    extra_fields: Mapping[str, Any] | None = None,
+) -> None:
+    fields: dict[str, Any] = {
+        "phase": phase,
+        "pid": os.getpid(),
+        "output_dir": output_dir,
+        "request_rate": getattr(args, "request_rate", None),
+        "measured_requests": (
+            measured_requests if measured_requests is not None else "pending"
+        ),
+        "dp_size": getattr(args, "data_parallel_size", None),
+        "dp_size_local": getattr(args, "data_parallel_size_local", None),
+        "save_parquet": getattr(args, "save_merged_parquet", False),
+        "elapsed_s": time.monotonic() - frontend_started_at_s,
+    }
+    if summary_written is not None:
+        fields["summary_written"] = summary_written
+    if parquet_written is not None:
+        fields["parquet_written"] = parquet_written
+    if exception is not None:
+        fields["exception_type"] = type(exception).__name__
+    if extra_fields:
+        fields.update(extra_fields)
+    logger.info("poisson_frontend %s", _format_frontend_log_fields(fields))
 
 
 def _jsonify(value: Any) -> Any:
@@ -733,10 +791,39 @@ def _write_parquet_if_requested(
     pd.DataFrame(records).to_parquet(parquet_path, index=False)
 
 
-async def _request_clean_cluster_shutdown(async_llm: Any) -> None:
+async def _request_clean_cluster_shutdown(
+    async_llm: Any,
+    *,
+    frontend_args: argparse.Namespace | None = None,
+    output_dir: Path | None = None,
+    frontend_started_at_s: float | None = None,
+    measured_requests: int | None = None,
+) -> bool:
+    def log_phase(
+        phase: str,
+        *,
+        exception: BaseException | None = None,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> None:
+        if (frontend_args is not None and output_dir is not None
+                and frontend_started_at_s is not None):
+            _log_frontend_phase(
+                phase,
+                args=frontend_args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests,
+                exception=exception,
+                extra_fields=extra_fields,
+            )
+
     parallel_config = getattr(async_llm.vllm_config, "parallel_config", None)
     if parallel_config is None:
-        return
+        log_phase(
+            "clean_cluster_shutdown_skipped",
+            extra_fields={"reason": "missing_parallel_config"},
+        )
+        return True
 
     # In pure internal DPLB multi-node runs, the frontend manages both local
     # and remote EngineCore sockets. Ask every EngineCore to enter its normal
@@ -746,28 +833,210 @@ async def _request_clean_cluster_shutdown(async_llm: Any) -> None:
         parallel_config.data_parallel_size > parallel_config.data_parallel_size_local
     )
     if not has_remote_dp_engines:
-        return
+        log_phase(
+            "clean_cluster_shutdown_skipped",
+            extra_fields={"reason": "local_only_run"},
+        )
+        return True
 
     engine_core = getattr(async_llm, "engine_core", None)
     call_utility_async = getattr(engine_core, "call_utility_async", None)
     if not callable(call_utility_async):
+        log_phase(
+            "clean_cluster_shutdown_skipped",
+            extra_fields={"reason": "missing_call_utility_async"},
+        )
         logger.warning(
             "Skipping clean multi-node shutdown request because EngineCore "
             "client does not expose call_utility_async()."
         )
-        return
+        return True
 
+    log_phase(
+        "clean_cluster_shutdown_request_start",
+        extra_fields={
+            "remote_dp": True,
+            "heartbeat_s": FRONTEND_TEARDOWN_HEARTBEAT_SEC,
+            "max_wait_s": FRONTEND_TEARDOWN_TIMEOUT_SEC,
+        },
+    )
     logger.info("Requesting shutdown across all managed EngineCore processes.")
+    wait_started_at_s = time.monotonic()
+    deadline = wait_started_at_s + FRONTEND_TEARDOWN_TIMEOUT_SEC
+    wait_task = asyncio.create_task(
+        call_utility_async("request_shutdown_and_wait"),
+    )
     try:
-        # Request the EngineCore busy loops to exit gracefully. Calling the
-        # shutdown() utility directly tears down the executor immediately while
-        # the loop may still execute one final dummy batch.
-        await call_utility_async("request_shutdown")
-    except Exception:
+        # Request the EngineCore busy loops to exit gracefully and wait for each
+        # managed EngineCore to acknowledge that its shutdown path completed
+        # before tearing down the local client resources.
+        while True:
+            now = time.monotonic()
+            elapsed_s = now - wait_started_at_s
+            remaining_s = deadline - now
+            if remaining_s <= 0:
+                log_phase(
+                    "clean_cluster_shutdown_timeout",
+                    extra_fields={
+                        "wait_elapsed_s": elapsed_s,
+                        "max_wait_s": FRONTEND_TEARDOWN_TIMEOUT_SEC,
+                    },
+                )
+                logger.warning(
+                    "Timed out waiting %.1fs for clean multi-node shutdown "
+                    "acknowledgement; falling back to forced local cleanup.",
+                    FRONTEND_TEARDOWN_TIMEOUT_SEC,
+                )
+                wait_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await wait_task
+                return False
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(wait_task),
+                    timeout=min(FRONTEND_TEARDOWN_HEARTBEAT_SEC, remaining_s),
+                )
+            except asyncio.TimeoutError:
+                elapsed_s = time.monotonic() - wait_started_at_s
+                log_phase(
+                    "clean_cluster_shutdown_waiting",
+                    extra_fields={
+                        "wait_elapsed_s": elapsed_s,
+                        "max_wait_s": FRONTEND_TEARDOWN_TIMEOUT_SEC,
+                    },
+                )
+                continue
+            break
+
+        log_phase(
+            "clean_cluster_shutdown_request_done",
+            extra_fields={
+                "wait_elapsed_s": time.monotonic() - wait_started_at_s,
+            },
+        )
+        return True
+    except Exception as exc:
+        log_phase(
+            "clean_cluster_shutdown_failed",
+            exception=exc,
+            extra_fields={
+                "wait_elapsed_s": time.monotonic() - wait_started_at_s,
+                "max_wait_s": FRONTEND_TEARDOWN_TIMEOUT_SEC,
+            },
+        )
         logger.warning(
             "Failed to request clean multi-node shutdown before local cleanup.",
             exc_info=True,
         )
+        wait_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await wait_task
+        return False
+
+
+async def _shutdown_frontend_async_llm(
+    async_llm: Any,
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    frontend_started_at_s: float,
+    measured_requests: int | None,
+    summary_written: bool,
+    parquet_written: bool,
+) -> None:
+    # Mark the frontend as intentionally shutting down before asking managed
+    # EngineCore processes to exit so local liveness monitors do not misclassify
+    # the expected teardown as an engine failure.
+    begin_shutdown = getattr(async_llm, "begin_shutdown", None)
+    if callable(begin_shutdown):
+        _log_frontend_phase(
+            "begin_shutdown_start",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests,
+            summary_written=summary_written,
+            parquet_written=parquet_written,
+        )
+        begin_shutdown()
+        _log_frontend_phase(
+            "begin_shutdown_done",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests,
+            summary_written=summary_written,
+            parquet_written=parquet_written,
+        )
+
+    _log_frontend_phase(
+        "clean_cluster_shutdown_start",
+        args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
+        measured_requests=measured_requests,
+        summary_written=summary_written,
+        parquet_written=parquet_written,
+    )
+    graceful_shutdown = await _request_clean_cluster_shutdown(
+        async_llm,
+        frontend_args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
+        measured_requests=measured_requests,
+    )
+    _log_frontend_phase(
+        "clean_cluster_shutdown_done",
+        args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
+        measured_requests=measured_requests,
+        summary_written=summary_written,
+        parquet_written=parquet_written,
+        extra_fields={"graceful": graceful_shutdown},
+    )
+
+    shutdown_timeout: float | None = None
+    if not graceful_shutdown:
+        shutdown_timeout = 0.0
+        _log_frontend_phase(
+            "clean_cluster_shutdown_fallback",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests,
+            summary_written=summary_written,
+            parquet_written=parquet_written,
+            extra_fields={"engine_shutdown_timeout_s": shutdown_timeout},
+        )
+
+    _log_frontend_phase(
+        "async_llm_shutdown_start",
+        args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
+        measured_requests=measured_requests,
+        summary_written=summary_written,
+        parquet_written=parquet_written,
+        extra_fields={
+            "graceful": graceful_shutdown,
+            "timeout_s": shutdown_timeout,
+        },
+    )
+    async_llm.shutdown(timeout=shutdown_timeout)
+    _log_frontend_phase(
+        "async_llm_shutdown_done",
+        args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
+        measured_requests=measured_requests,
+        summary_written=summary_written,
+        parquet_written=parquet_written,
+        extra_fields={
+            "graceful": graceful_shutdown,
+            "timeout_s": shutdown_timeout,
+        },
+    )
 
 
 async def run_frontend(args: argparse.Namespace) -> None:
@@ -781,18 +1050,34 @@ async def run_frontend(args: argparse.Namespace) -> None:
     engine_args = AsyncEngineArgs.from_cli_args(args)
     output_dir = Path(args.output_dir).expanduser().resolve()
     _prepare_output_dir(output_dir)
+    frontend_started_at_s = time.monotonic()
 
     async_llm: Any | None = None
+    measured_requests_count: int | None = None
+    summary_written = False
+    parquet_written = False
     recorder = RunRecorder(
         requests_path=output_dir / "requests.jsonl",
         progress_log_interval=args.progress_log_interval,
         records=[],
+    )
+    _log_frontend_phase(
+        "frontend_start",
+        args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
     )
 
     try:
         async_llm = AsyncLLM.from_engine_args(
             engine_args,
             usage_context=UsageContext.OPENAI_API_SERVER,
+        )
+        _log_frontend_phase(
+            "async_llm_created",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
         )
         tokenizer = async_llm.renderer.tokenizer
         if tokenizer is None:
@@ -829,6 +1114,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
                 "Increase --csv-repeat, reduce --warmup-requests, or reduce "
                 "--max-requests."
             )
+        measured_requests_count = len(measured_requests)
 
         validate_request_lengths(measured_requests, async_llm.model_config.max_model_len)
         validate_request_lengths(warmup_requests, async_llm.model_config.max_model_len)
@@ -869,6 +1155,14 @@ async def run_frontend(args: argparse.Namespace) -> None:
         _json_dump(output_dir / "run_meta.json", run_meta)
 
         await _run_warmup(async_llm, warmup_requests)
+        _log_frontend_phase(
+            "warmup_done",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+            extra_fields={"warmup_requests": len(warmup_requests)},
+        )
 
         arrival_deadlines_ns = build_poisson_arrival_deadlines_ns(
             num_requests=len(measured_requests),
@@ -891,9 +1185,23 @@ async def run_frontend(args: argparse.Namespace) -> None:
                 inflight=inflight,
                 kv_transfer_config=args.kv_transfer_config,
             )
+        _log_frontend_phase(
+            "submission_done",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+        )
 
         while inflight:
             await asyncio.gather(*tuple(inflight))
+        _log_frontend_phase(
+            "inflight_drained",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+        )
 
         summary = build_summary(
             records=recorder.records,
@@ -902,17 +1210,99 @@ async def run_frontend(args: argparse.Namespace) -> None:
             first_submit_ts_ns=recorder.first_submit_ts_ns,
             last_finish_ts_ns=recorder.last_finish_ts_ns,
         )
+        _log_frontend_phase(
+            "summary_write_start",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+        )
         _json_dump(output_dir / "summary.json", summary)
+        summary_written = True
+        _log_frontend_phase(
+            "summary_write_done",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+            summary_written=summary_written,
+        )
+        if args.save_merged_parquet:
+            _log_frontend_phase(
+                "parquet_write_start",
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
+                summary_written=summary_written,
+            )
         _write_parquet_if_requested(
             output_dir=output_dir,
             records=recorder.records,
             enabled=args.save_merged_parquet,
         )
+        if args.save_merged_parquet:
+            parquet_written = True
+            _log_frontend_phase(
+                "parquet_write_done",
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
+                summary_written=summary_written,
+                parquet_written=parquet_written,
+            )
     finally:
+        active_exception = sys.exc_info()[1]
+        _log_frontend_phase(
+            "teardown_enter",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+            summary_written=summary_written,
+            parquet_written=parquet_written,
+            exception=active_exception,
+        )
+        _log_frontend_phase(
+            "recorder_close_start",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+            summary_written=summary_written,
+            parquet_written=parquet_written,
+        )
         recorder.close()
+        _log_frontend_phase(
+            "recorder_close_done",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+            summary_written=summary_written,
+            parquet_written=parquet_written,
+        )
         if async_llm is not None:
-            await _request_clean_cluster_shutdown(async_llm)
-            async_llm.shutdown()
+            await _shutdown_frontend_async_llm(
+                async_llm,
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
+                summary_written=summary_written,
+                parquet_written=parquet_written,
+            )
+        _log_frontend_phase(
+            "frontend_exit",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+            summary_written=summary_written,
+            parquet_written=parquet_written,
+            exception=active_exception,
+        )
 
 
 def run_headless_engine(args: argparse.Namespace) -> None:
