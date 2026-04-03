@@ -510,17 +510,28 @@ def case_group_key(case: ExperimentCase) -> str:
          sanitize_tag(case.strategy)))
 
 
+def case_artifact_dataset_dir(artifact_root: Path, case: ExperimentCase) -> Path:
+    return (artifact_root / model_short_name(case.model) /
+            dataset_short_name(case.dataset))
+
+
+def case_artifact_rate_duration_tag(case: ExperimentCase) -> str:
+    duration_tag = f"dur{stringify_bench_duration_sec(infer_bench_duration_sec(case))}"
+    return f"rate{stringify_request_rate(case.request_rate)}-{duration_tag}"
+
+
+def case_artifact_scenario_prefix(case: ExperimentCase) -> str:
+    return (f"{sanitize_tag(case.strategy)}-"
+            f"{stringify_gpu_memory_utilization(case.gpu_memory_utilization)}")
+
+
 def case_artifact_group_dir(artifact_root: Path, case: ExperimentCase) -> Path:
     batch_size_tag = (f"bs{case.max_num_seqs}"
                       if case.max_num_seqs is not None else "bsauto")
-    duration_tag = f"dur{stringify_bench_duration_sec(infer_bench_duration_sec(case))}"
-    rate_tag = f"rate{stringify_request_rate(case.request_rate)}-{duration_tag}"
-    scenario_tag = (
-        f"{sanitize_tag(case.strategy)}-"
-        f"{stringify_gpu_memory_utilization(case.gpu_memory_utilization)}-"
-        f"{batch_size_tag}-{rate_tag}")
-    return (artifact_root / model_short_name(case.model) /
-            dataset_short_name(case.dataset) / scenario_tag)
+    scenario_tag = (f"{case_artifact_scenario_prefix(case)}-"
+                    f"{batch_size_tag}-"
+                    f"{case_artifact_rate_duration_tag(case)}")
+    return case_artifact_dataset_dir(artifact_root, case) / scenario_tag
 
 
 def bool_flag(name: str, enabled: bool) -> str:
@@ -1468,16 +1479,69 @@ def latest_successful_case_tpot_by_e2e_mean(case_group_dir: Path) -> tuple[
     return case_dir, extract_summary_tpot_by_e2e_mean(summary)
 
 
+def historical_case_group_dirs(
+    artifact_root: Path,
+    case: ExperimentCase,
+    *,
+    ignore_bs: bool,
+) -> tuple[Path, ...]:
+    exact_group_dir = case_artifact_group_dir(artifact_root, case)
+    if not ignore_bs:
+        return (exact_group_dir, )
+
+    dataset_dir = case_artifact_dataset_dir(artifact_root, case)
+    if not dataset_dir.is_dir():
+        return (exact_group_dir, )
+
+    scenario_prefix = f"{case_artifact_scenario_prefix(case)}-bs"
+    scenario_suffix = f"-{case_artifact_rate_duration_tag(case)}"
+    matching_group_dirs = tuple(
+        sorted((path for path in dataset_dir.iterdir()
+                if path.is_dir() and path.name.startswith(scenario_prefix)
+                and path.name.endswith(scenario_suffix)),
+               key=lambda path: path.name,
+               reverse=True))
+    return matching_group_dirs or (exact_group_dir, )
+
+
+def latest_successful_case_tpot_by_e2e_mean_for_case(
+    artifact_root: Path,
+    case: ExperimentCase,
+    *,
+    ignore_bs: bool,
+) -> tuple[Path, float | None] | None:
+    exact_group_dir = case_artifact_group_dir(artifact_root, case)
+    best_match: tuple[Path, float | None] | None = None
+    best_sort_key: tuple[str, int, str] | None = None
+    for case_group_dir in historical_case_group_dirs(artifact_root,
+                                                     case,
+                                                     ignore_bs=ignore_bs):
+        candidate = latest_successful_case_tpot_by_e2e_mean(case_group_dir)
+        if candidate is None:
+            continue
+        candidate_sort_key = (
+            candidate[0].name,
+            int(candidate[0].parent == exact_group_dir),
+            candidate[0].parent.name,
+        )
+        if best_sort_key is None or candidate_sort_key > best_sort_key:
+            best_match = candidate
+            best_sort_key = candidate_sort_key
+    return best_match
+
+
 def build_historical_skip_state(
     artifact_root: Path,
     selected_cases: list[ExperimentCase],
+    *,
+    ignore_bs: bool,
 ) -> tuple[dict[str, str], dict[str, tuple[float, str]]]:
     exact_case_skips: dict[str, str] = {}
     blocked_group_rates: dict[str, tuple[float, str]] = {}
 
     for case in selected_cases:
-        historical = latest_successful_case_tpot_by_e2e_mean(
-            case_artifact_group_dir(artifact_root, case))
+        historical = latest_successful_case_tpot_by_e2e_mean_for_case(
+            artifact_root, case, ignore_bs=ignore_bs)
         if historical is None:
             continue
 
@@ -1485,6 +1549,11 @@ def build_historical_skip_state(
         case_result_tag = case_dir.name
         exact_reason = (
             f"latest successful result already exists at {case_result_tag}")
+        matched_group_dir = case_dir.parent
+        exact_group_dir = case_artifact_group_dir(artifact_root, case)
+        if ignore_bs and matched_group_dir != exact_group_dir:
+            exact_reason += (f" under {matched_group_dir.name} "
+                             "(matched with different bs)")
         if tpot_by_e2e_mean is not None:
             exact_reason += f" (tpot_by_e2e.mean={tpot_by_e2e_mean:.3f}ms)"
         exact_case_skips[case.name] = exact_reason
@@ -1500,6 +1569,8 @@ def build_historical_skip_state(
             f"rate={stringify_request_rate(case.request_rate)} at "
             f"{case_result_tag} has tpot_by_e2e.mean={tpot_by_e2e_mean:.3f}ms "
             f"> {TPOT_BY_E2E_EARLY_STOP_MS:g}ms")
+        if ignore_bs and matched_group_dir != exact_group_dir:
+            reason += f" under {matched_group_dir.name} (matched with different bs)"
         if existing is None or case.request_rate < existing[0]:
             blocked_group_rates[group_key] = (case.request_rate, reason)
 
@@ -1527,6 +1598,7 @@ def write_run_manifest(
     created_at: str,
     dry_run: bool,
     keep_going: bool,
+    historical_skip_ignore_bs: bool,
     rate_plan: str,
     cases: list[str],
     finished_at: str | None = None,
@@ -1541,6 +1613,7 @@ def write_run_manifest(
         "created_at": created_at,
         "dry_run": dry_run,
         "keep_going": keep_going,
+        "historical_skip_ignore_bs": historical_skip_ignore_bs,
         "rate_plan": rate_plan,
         "cases": cases,
     }
@@ -1786,10 +1859,12 @@ def wait_for_local_ports_to_clear(
 class ManualMultinodeRunner:
 
     def __init__(self, artifact_root: Path, *, dry_run: bool,
-                 keep_going: bool = True) -> None:
+                 keep_going: bool = True,
+                 historical_skip_ignore_bs: bool = True) -> None:
         self.artifact_root = artifact_root.expanduser().resolve()
         self.dry_run = dry_run
         self.keep_going = keep_going
+        self.historical_skip_ignore_bs = historical_skip_ignore_bs
         self._active_runtime: ActiveCaseRuntime | None = None
         self._previous_handlers: dict[int, Any] = {}
         self._handling_signal = False
@@ -1900,13 +1975,16 @@ class ManualMultinodeRunner:
             created_at=created_at,
             dry_run=self.dry_run,
             keep_going=self.keep_going,
+            historical_skip_ignore_bs=self.historical_skip_ignore_bs,
             rate_plan=rate_plan,
             cases=case_names,
         )
 
         results: list[CaseResult] = []
         exact_case_skips, historical_blocked_groups = build_historical_skip_state(
-            self.artifact_root, selected_cases)
+            self.artifact_root,
+            selected_cases,
+            ignore_bs=self.historical_skip_ignore_bs)
         runtime_blocked_groups: dict[str, tuple[float, str]] = {}
         aborted: dict[str, Any] | None = None
         self.install_signal_handlers()
@@ -1955,6 +2033,7 @@ class ManualMultinodeRunner:
                 created_at=created_at,
                 dry_run=self.dry_run,
                 keep_going=self.keep_going,
+                historical_skip_ignore_bs=self.historical_skip_ignore_bs,
                 rate_plan=rate_plan,
                 cases=case_names,
                 finished_at=current_iso_timestamp(),
@@ -2640,6 +2719,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Continue to later cases even if one case fails. "
               "Use --no-keep-going to stop after the first failed case."),
     )
+    parser.add_argument(
+        "--historical-skip-ignore-bs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=("When checking historical successful results for skip decisions, "
+              "treat cases that differ only in bs/max_num_seqs as matches. "
+              "Enabled by default; use --no-historical-skip-ignore-bs to "
+              "require exact bs matches."),
+    )
     return parser
 
 
@@ -2661,6 +2749,7 @@ def main(argv: list[str] | None = None) -> None:
         Path(args.artifact_root),
         dry_run=args.dry_run,
         keep_going=args.keep_going,
+        historical_skip_ignore_bs=args.historical_skip_ignore_bs,
     )
     results = runner.run(selected_cases, args.run_label, rate_plan=args.rate_plan)
 
