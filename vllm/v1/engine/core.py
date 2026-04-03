@@ -118,6 +118,7 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        self._shutdown_waiters: list[Future[None]] = []
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -696,6 +697,23 @@ class EngineCore:
         """
         if self.shutdown_state == EngineShutdownState.RUNNING:
             self.shutdown_state = EngineShutdownState.REQUESTED
+
+    def request_shutdown_and_wait(self) -> Future[None]:
+        """Request a graceful shutdown and resolve once teardown completes."""
+        future: Future[None] = Future()
+        self._shutdown_waiters.append(future)
+        self.request_shutdown()
+        return future
+
+    def finalize_shutdown_waiters(self, error: Exception | None = None) -> None:
+        for future in self._shutdown_waiters:
+            if future.done():
+                continue
+            if error is None:
+                future.set_result(None)
+            else:
+                future.set_exception(error)
+        self._shutdown_waiters.clear()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
@@ -1276,7 +1294,15 @@ class EngineCoreProc(EngineCore):
             if signal_callback is not None:
                 signal_callback.stop()
             if engine_core is not None:
-                engine_core.shutdown()
+                shutdown_error: Exception | None = None
+                try:
+                    engine_core.shutdown()
+                except Exception as exc:
+                    shutdown_error = exc
+                engine_core.finalize_shutdown_waiters(shutdown_error)
+                engine_core.wait_for_output_queue_idle(timeout=5.0)
+                if shutdown_error is not None:
+                    raise shutdown_error
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
@@ -1500,6 +1526,15 @@ class EngineCoreProc(EngineCore):
                 "to send. Please report this issue."
             )
 
+    def wait_for_output_queue_idle(self, timeout: float = 5.0) -> None:
+        if not time:
+            return
+        deadline = time.time() + timeout
+        while self.output_queue.unfinished_tasks and time.time() < deadline:
+            time.sleep(0.01)
+        if self.output_queue.unfinished_tasks:
+            logger.warning("Timed out waiting for output queue to drain on shutdown.")
+
     def process_input_sockets(
         self,
         input_addresses: list[str],
@@ -1637,36 +1672,39 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
-                if output == EngineCoreProc.ENGINE_CORE_DEAD:
-                    for socket in sockets:
-                        socket.send(output)
-                    break
-                assert not isinstance(output, bytes)
-                client_index, outputs = output
-                outputs.engine_index = engine_index
+                try:
+                    if output == EngineCoreProc.ENGINE_CORE_DEAD:
+                        for socket in sockets:
+                            socket.send(output)
+                        break
+                    assert not isinstance(output, bytes)
+                    client_index, outputs = output
+                    outputs.engine_index = engine_index
 
-                if client_index == -1:
-                    # Don't reuse buffer for coordinator message
-                    # which will be very small.
-                    assert coord_socket is not None
-                    coord_socket.send_multipart(encoder.encode(outputs))
-                    continue
+                    if client_index == -1:
+                        # Don't reuse buffer for coordinator message
+                        # which will be very small.
+                        assert coord_socket is not None
+                        coord_socket.send_multipart(encoder.encode(outputs))
+                        continue
 
-                # Reclaim buffers that zmq is finished with.
-                while pending and pending[-1][0].done:
-                    reuse_buffers.append(pending.pop()[2])
+                    # Reclaim buffers that zmq is finished with.
+                    while pending and pending[-1][0].done:
+                        reuse_buffers.append(pending.pop()[2])
 
-                buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
-                buffers = encoder.encode_into(outputs, buffer)
-                tracker = sockets[client_index].send_multipart(
-                    buffers, copy=False, track=True
-                )
-                if not tracker.done:
-                    ref = outputs if len(buffers) > 1 else None
-                    pending.appendleft((tracker, ref, buffer))
-                elif len(reuse_buffers) < max_reuse_bufs:
-                    # Limit the number of buffers to reuse.
-                    reuse_buffers.append(buffer)
+                    buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                    buffers = encoder.encode_into(outputs, buffer)
+                    tracker = sockets[client_index].send_multipart(
+                        buffers, copy=False, track=True
+                    )
+                    if not tracker.done:
+                        ref = outputs if len(buffers) > 1 else None
+                        pending.appendleft((tracker, ref, buffer))
+                    elif len(reuse_buffers) < max_reuse_bufs:
+                        # Limit the number of buffers to reuse.
+                        reuse_buffers.append(buffer)
+                finally:
+                    self.output_queue.task_done()
 
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised

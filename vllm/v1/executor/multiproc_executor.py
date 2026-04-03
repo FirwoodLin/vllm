@@ -431,6 +431,10 @@ class MultiprocExecutor(Executor):
             )
             for p in active_procs():
                 p.kill()
+            if not wait_for_termination(active_procs(), 4):
+                raise RuntimeError(
+                    "Worker Termination: worker processes survived SIGKILL"
+                )
 
     def shutdown(self):
         """Properly shut down the executor and its workers"""

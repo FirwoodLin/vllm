@@ -11,10 +11,13 @@ import multiprocessing
 import os
 import socket
 
+import pytest
+
 from tests.utils import multi_gpu_test
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.executor import multiproc_executor as multiproc_executor_mod
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
 MODEL = "facebook/opt-125m"
@@ -260,6 +263,36 @@ def test_multiproc_executor_shutdown_cleanup():
     # Multiple shutdowns should be safe (idempotent)
     executor.shutdown()
     executor.shutdown()
+
+
+def test_ensure_worker_termination_raises_if_worker_survives_sigkill(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeProc:
+        def __init__(self):
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def is_alive(self):
+            return True
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def kill(self):
+            self.kill_calls += 1
+
+    fake_proc = FakeProc()
+    time_values = iter([0.0, 5.0, 10.0, 15.0, 20.0, 25.0])
+    monkeypatch.setattr(multiproc_executor_mod.time, "time",
+                        lambda: next(time_values))
+    monkeypatch.setattr(multiproc_executor_mod.time, "sleep", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="survived SIGKILL"):
+        MultiprocExecutor._ensure_worker_termination([fake_proc])
+
+    assert fake_proc.terminate_calls == 1
+    assert fake_proc.kill_calls == 1
 
 
 @multi_gpu_test(num_gpus=4)

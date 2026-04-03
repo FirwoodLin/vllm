@@ -189,6 +189,7 @@ class AsyncLLM(EngineClient):
         self._client_count = client_count
 
         self.output_handler: asyncio.Task | None = None
+        self._shutting_down = False
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -277,19 +278,46 @@ class AsyncLLM(EngineClient):
     def __del__(self):
         self.shutdown()
 
+    def begin_shutdown(self) -> None:
+        self._shutting_down = True
+        if engine_core := getattr(self, "engine_core", None):
+            begin_shutdown = getattr(engine_core, "begin_shutdown", None)
+            if callable(begin_shutdown):
+                begin_shutdown()
+
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown, cleaning up the background proc and IPC."""
+        logger.info(
+            "AsyncLLM shutdown start timeout=%s has_renderer=%s "
+            "has_engine_core=%s has_output_handler=%s",
+            timeout,
+            getattr(self, "renderer", None) is not None,
+            getattr(self, "engine_core", None) is not None,
+            getattr(self, "output_handler", None) is not None,
+        )
+        self.begin_shutdown()
         shutdown_prometheus()
+        logger.info("AsyncLLM shutdown: Prometheus shutdown complete")
 
         if renderer := getattr(self, "renderer", None):
+            logger.info("AsyncLLM shutdown: renderer.shutdown start")
             renderer.shutdown()
+            logger.info("AsyncLLM shutdown: renderer.shutdown done")
 
         if engine_core := getattr(self, "engine_core", None):
+            logger.info(
+                "AsyncLLM shutdown: engine_core.shutdown start timeout=%s",
+                timeout,
+            )
             engine_core.shutdown(timeout=timeout)
+            logger.info("AsyncLLM shutdown: engine_core.shutdown done")
 
         handler = getattr(self, "output_handler", None)
         if handler is not None:
+            logger.info("AsyncLLM shutdown: output handler cancellation start")
             cancel_task_threadsafe(handler)
+            logger.info("AsyncLLM shutdown: output handler cancellation done")
+        logger.info("AsyncLLM shutdown done")
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
@@ -737,6 +765,13 @@ class AsyncLLM(EngineClient):
                             if async_llm := self_ref():
                                 async_llm.do_log_stats_with_interval()
             except Exception as e:
+                async_llm = self_ref()
+                if (
+                    async_llm is not None
+                    and async_llm.is_shutting_down
+                    and isinstance(e, EngineDeadError)
+                ):
+                    return
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
 
@@ -1064,6 +1099,10 @@ class AsyncLLM(EngineClient):
     @property
     def is_stopped(self) -> bool:
         return self.errored
+
+    @property
+    def is_shutting_down(self) -> bool:
+        return self._shutting_down
 
     @property
     def errored(self) -> bool:

@@ -384,10 +384,12 @@ class BackgroundResources:
     # Set if any of the engines are dead. Here so that the output
     # processing threads can access it without holding a ref to the client.
     engine_dead: bool = False
+    shutting_down: bool = False
 
     def __call__(self):
         """Clean up background resources."""
 
+        self.shutting_down = True
         self.engine_dead = True
         if self.engine_manager is not None:
             self.engine_manager.shutdown()
@@ -648,10 +650,28 @@ class MPClient(EngineCoreClient):
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine manager under timeout and clean up resources."""
-        if self._finalizer.detach() is not None:
-            if self.resources.engine_manager is not None:
-                self.resources.engine_manager.shutdown(timeout=timeout)
-            self.resources()
+        logger.info("EngineCore client shutdown start timeout=%s", timeout)
+        self.begin_shutdown()
+        finalizer = self._finalizer.detach()
+        if finalizer is None:
+            logger.info("EngineCore client shutdown skipped: finalizer already detached")
+            return
+
+        if self.resources.engine_manager is not None:
+            logger.info(
+                "EngineCore client shutdown: engine_manager.shutdown start "
+                "timeout=%s",
+                timeout,
+            )
+            self.resources.engine_manager.shutdown(timeout=timeout)
+            logger.info("EngineCore client shutdown: engine_manager.shutdown done")
+
+        logger.info("EngineCore client shutdown: releasing resources")
+        self.resources()
+        logger.info("EngineCore client shutdown done")
+
+    def begin_shutdown(self) -> None:
+        self.resources.shutting_down = True
 
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""
@@ -695,7 +715,12 @@ class MPClient(EngineCoreClient):
             sentinels = [proc.sentinel for proc in engine_processes]
             died = multiprocessing.connection.wait(sentinels)
             _self = self_ref()
-            if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
+            if (
+                not _self
+                or not _self._finalizer.alive
+                or _self.resources.engine_dead
+                or _self.resources.shutting_down
+            ):
                 return
             _self.resources.engine_dead = True
             proc_name = next(
