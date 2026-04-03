@@ -1304,6 +1304,11 @@ def local_ports_for_case(resolved: ResolvedCase) -> tuple[int, ...]:
 
 def can_bind_local_tcp_port(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        # Previous cases can leave sockets in TIME_WAIT after a clean
+        # shutdown. Treat the port as reusable if we can bind with
+        # SO_REUSEADDR, which matches the next listener startup path more
+        # closely than a bare bind probe.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("", port))
         except OSError:
