@@ -151,6 +151,26 @@ def test_build_parser_keeps_going_by_default() -> None:
 
 
 @pytest.mark.benchmark
+def test_build_experiment_matrix_filters_model_dataset_and_strategy() -> None:
+    runner = load_runner_module()
+
+    cases = runner.build_experiment_matrix(
+        "coarse10_then_mid5",
+        models=("deepseek_v3_1024k", ),
+        datasets=("issue05_random", ),
+        strategies=("dp32", ),
+    )
+
+    assert len(cases) == 17
+    assert {case.model for case in cases} == {"deepseek_v3_1024k"}
+    assert {case.dataset for case in cases} == {"issue05_random"}
+    assert {case.strategy for case in cases} == {"dp32"}
+    assert [case.request_rate for case in cases[:4]] == [10.0, 20.0, 30.0, 40.0]
+    assert [case.request_rate for case in cases[-4:]] == [55.0, 65.0, 75.0,
+                                                           85.0]
+
+
+@pytest.mark.benchmark
 def test_build_frontend_and_headless_argv_include_required_flags(
         tmp_path: Path) -> None:
     runner = load_runner_module()
@@ -1367,6 +1387,25 @@ def test_select_cases_rejects_case_csv_with_all(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit,
                        match="Use either --case-csv or --all/--case, not both."):
+        runner.select_cases(args, [])
+
+
+@pytest.mark.benchmark
+def test_select_cases_rejects_case_csv_with_filter_flags(tmp_path: Path) -> None:
+    runner = load_runner_module()
+    csv_path = tmp_path / "cases.csv"
+    csv_path.write_text(
+        "name,cluster,model,dataset,strategy,request_rate\n"
+        "case_a,cluster_a,model_a,dataset_a,strategy_a,10\n",
+        encoding="utf-8",
+    )
+    args = runner.build_parser().parse_args(
+        ["--case-csv", str(csv_path), "--model", "deepseek_v3_1024k"])
+
+    with pytest.raises(
+            SystemExit,
+            match=("Use either --case-csv or --model/--dataset/--strategy "
+                   "filters, not both.")):
         runner.select_cases(args, [])
 
 

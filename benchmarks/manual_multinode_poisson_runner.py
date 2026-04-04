@@ -304,9 +304,15 @@ CLUSTERS: dict[str, ClusterSpec] = {
         master_port=29579,
         remote_hosts=("h200-rjob1", ),
     ),
+    # "4node_h200":
+    # ClusterSpec(
+    #     master_addr="10.102.97.179",
+    #     master_port=29579,
+    #     remote_hosts=("h200-rjob1", "h200-rjob2", "h200-rjob3"),
+    # ),
     "4node_h200":
     ClusterSpec(
-        master_addr="10.102.97.179",
+        master_addr="10.102.97.33",
         master_port=29579,
         remote_hosts=("h200-rjob1", "h200-rjob2", "h200-rjob3"),
     ),
@@ -417,6 +423,10 @@ def unique_candidate_rates_for_rate_plan(rate_plan: str) -> tuple[float, ...]:
 
 def build_experiment_matrix(
     rate_plan: str = DEFAULT_RATE_PLAN,
+    *,
+    models: list[str] | tuple[str, ...] | None = None,
+    datasets: list[str] | tuple[str, ...] | None = None,
+    strategies: list[str] | tuple[str, ...] | None = None,
 ) -> list[ExperimentCase]:
     try:
         rate_plan_phases = RATE_PLAN_PHASES[rate_plan]
@@ -426,43 +436,46 @@ def build_experiment_matrix(
             f"Unknown rate plan '{rate_plan}'. Supported values: {supported}"
         ) from exc
 
+    selected_models = ordered_models(models)
+    selected_datasets = ordered_datasets(datasets)
+    selected_strategies = ordered_strategies(strategies)
+
     experiments: list[ExperimentCase] = []
-    dataset_tag = DATASET_SHORT_NAMES.get(SWEEP_DATASET, SWEEP_DATASET)
     for rate_phase, request_rates in rate_plan_phases:
-        for model_name in SWEEP_MODELS:
-            model_tag = MODEL_SHORT_NAMES.get(model_name, model_name)
-            for strategy_name in SWEEP_STRATEGIES:
-                max_num_seqs = STRATEGY_MAX_NUM_SEQS[strategy_name]
-                gpu_memory_utilization = STRATEGY_GPU_MEMORY_UTILIZATION[
-                    strategy_name]
-                for request_rate in request_rates:
-                    rate_tag = f"{request_rate:g}"
-                    max_requests = bench_duration_to_max_requests(
-                        request_rate,
-                        DEFAULT_SWEEP_BENCH_DURATION_SEC,
-                    )
-                    experiments.append(
-                        ExperimentCase(
-                            name=(f"{model_tag}__{dataset_tag}__{strategy_name}"
-                                  f"__rate{rate_tag}__bs{max_num_seqs}"),
-                            cluster=SWEEP_CLUSTER,
-                            strategy=strategy_name,
-                            dataset=SWEEP_DATASET,
-                            model=model_name,
-                            request_rate=request_rate,
-                            rate_phase=rate_phase,
-                            gpu_memory_utilization=gpu_memory_utilization,
-                            max_requests=max_requests,
-                            warmup_requests=32,
-                            max_num_seqs=max_num_seqs,
-                            max_model_len=1000000,
-                            data_parallel_rpc_port=29550,
-                        ))
+        for dataset_name in selected_datasets:
+            dataset_tag = DATASET_SHORT_NAMES.get(dataset_name, dataset_name)
+            for model_name in selected_models:
+                model_tag = MODEL_SHORT_NAMES.get(model_name, model_name)
+                for strategy_name in selected_strategies:
+                    max_num_seqs = STRATEGY_MAX_NUM_SEQS[strategy_name]
+                    gpu_memory_utilization = STRATEGY_GPU_MEMORY_UTILIZATION[
+                        strategy_name]
+                    for request_rate in request_rates:
+                        rate_tag = f"{request_rate:g}"
+                        max_requests = bench_duration_to_max_requests(
+                            request_rate,
+                            DEFAULT_SWEEP_BENCH_DURATION_SEC,
+                        )
+                        experiments.append(
+                            ExperimentCase(
+                                name=(f"{model_tag}__{dataset_tag}__"
+                                      f"{strategy_name}__rate{rate_tag}__"
+                                      f"bs{max_num_seqs}"),
+                                cluster=SWEEP_CLUSTER,
+                                strategy=strategy_name,
+                                dataset=dataset_name,
+                                model=model_name,
+                                request_rate=request_rate,
+                                rate_phase=rate_phase,
+                                gpu_memory_utilization=
+                                gpu_memory_utilization,
+                                max_requests=max_requests,
+                                warmup_requests=32,
+                                max_num_seqs=max_num_seqs,
+                                max_model_len=1000000,
+                                data_parallel_rpc_port=29550,
+                            ))
     return experiments
-
-
-EXPERIMENTS: list[ExperimentCase] = build_experiment_matrix()
-
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -523,6 +536,67 @@ def positive_float(value: str) -> float:
     if parsed <= 0.0:
         raise argparse.ArgumentTypeError("Expected a positive float.")
     return parsed
+
+
+def _ordered_selection(
+    values: list[str] | tuple[str, ...] | None,
+    *,
+    supported: Mapping[str, Any],
+    default: tuple[str, ...],
+    label: str,
+) -> tuple[str, ...]:
+    if not values:
+        return default
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        if value not in supported:
+            supported_values = ", ".join(sorted(supported))
+            raise ValueError(
+                f"Unknown {label} '{value}'. Supported values: {supported_values}"
+            )
+        deduped.append(value)
+        seen.add(value)
+    return tuple(deduped)
+
+
+def ordered_models(
+    values: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    return _ordered_selection(
+        values,
+        supported=MODELS,
+        default=SWEEP_MODELS,
+        label="model",
+    )
+
+
+def ordered_datasets(
+    values: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    return _ordered_selection(
+        values,
+        supported=DATASETS,
+        default=(SWEEP_DATASET, ),
+        label="dataset",
+    )
+
+
+def ordered_strategies(
+    values: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    return _ordered_selection(
+        values,
+        supported=STRATEGIES,
+        default=SWEEP_STRATEGIES,
+        label="strategy",
+    )
+
+
+EXPERIMENTS: list[ExperimentCase] = build_experiment_matrix()
 
 
 def model_short_name(model: str) -> str:
@@ -1139,6 +1213,10 @@ def select_cases(args: argparse.Namespace,
                  experiments: list[ExperimentCase]) -> list[ExperimentCase]:
     if args.case_csv and (args.all or args.case):
         raise SystemExit("Use either --case-csv or --all/--case, not both.")
+    if args.case_csv and (args.model or args.dataset or args.strategy):
+        raise SystemExit(
+            "Use either --case-csv or --model/--dataset/--strategy filters, "
+            "not both.")
     if args.case_csv:
         return load_cases_from_csv(Path(args.case_csv))
 
@@ -2888,6 +2966,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a specific case by name. May be repeated.",
     )
     parser.add_argument(
+        "--model",
+        action="append",
+        help=("Limit configured cases to the specified model. May be "
+              "repeated."),
+    )
+    parser.add_argument(
+        "--dataset",
+        action="append",
+        help=("Limit configured cases to the specified dataset. May be "
+              "repeated."),
+    )
+    parser.add_argument(
+        "--strategy",
+        action="append",
+        help=("Limit configured cases to the specified strategy. May be "
+              "repeated."),
+    )
+    parser.add_argument(
         "--case-csv",
         default=None,
         help=("Load cases from a CSV file. CSV row order is preserved and "
@@ -2951,7 +3047,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    experiments = ([] if args.case_csv else build_experiment_matrix(args.rate_plan))
+    try:
+        experiments = ([] if args.case_csv else build_experiment_matrix(
+            args.rate_plan,
+            models=args.model,
+            datasets=args.dataset,
+            strategies=args.strategy,
+        ))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     selected_cases = apply_bench_duration_override(
         select_cases(args, experiments),
         args.bench_duration_sec,

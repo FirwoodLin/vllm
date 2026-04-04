@@ -38,21 +38,10 @@ def threshold_tag() -> str:
 
 
 def ordered_strategies(values: list[str] | None) -> tuple[str, ...]:
-    if not values:
-        return tuple(runner.SWEEP_STRATEGIES)
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for strategy in values:
-        if strategy in seen:
-            continue
-        if strategy not in runner.STRATEGIES:
-            supported = ", ".join(sorted(runner.STRATEGIES))
-            raise SystemExit(
-                f"Unknown strategy '{strategy}'. Supported values: {supported}")
-        deduped.append(strategy)
-        seen.add(strategy)
-    return tuple(deduped)
+    try:
+        return runner.ordered_strategies(values)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def template_cases_for_plan(
@@ -63,12 +52,15 @@ def template_cases_for_plan(
     rate_plan: str,
     bench_duration_sec: float | None,
 ) -> list[runner.ExperimentCase]:
-    strategy_set = set(strategies)
-    cases = [
-        case for case in runner.build_experiment_matrix(rate_plan)
-        if case.model == model and case.dataset == dataset
-        and case.strategy in strategy_set
-    ]
+    try:
+        cases = runner.build_experiment_matrix(
+            rate_plan,
+            models=(model, ),
+            datasets=(dataset, ),
+            strategies=strategies,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if bench_duration_sec is not None:
         cases = runner.apply_bench_duration_override(cases, bench_duration_sec)
 
@@ -192,6 +184,27 @@ def planned_rows_for_group(
     ]
 
 
+def filter_planned_rows_by_historical_skip_state(
+    artifact_root: Path,
+    rows: list[PlannedCaseRow],
+    *,
+    ignore_bs: bool,
+) -> list[PlannedCaseRow]:
+    if not rows:
+        return rows
+
+    exact_case_skips, blocked_group_rates = runner.build_historical_skip_state(
+        artifact_root,
+        [row.case for row in rows],
+        ignore_bs=ignore_bs,
+    )
+    return [
+        row for row in rows
+        if runner.block_reason_for_rate(blocked_group_rates, row.case) is None
+        and exact_case_skips.get(row.case.name) is None
+    ]
+
+
 def build_plan_rows(
     *,
     artifact_root: Path,
@@ -221,7 +234,11 @@ def build_plan_rows(
                 grouped.get(strategy, []),
                 ignore_bs=ignore_bs,
             ))
-    return planned_rows
+    return filter_planned_rows_by_historical_skip_state(
+        artifact_root,
+        planned_rows,
+        ignore_bs=ignore_bs,
+    )
 
 
 def planned_case_to_csv_row(planned: PlannedCaseRow) -> dict[str, str]:

@@ -67,6 +67,24 @@ def write_history_case(case_dir: Path, *, status: str,
 
 
 @pytest.mark.benchmark
+def test_template_cases_for_plan_supports_non_default_dataset_and_model() -> None:
+    planner = load_planner_module()
+
+    cases = planner.template_cases_for_plan(
+        model="deepseek_v3_1024k",
+        dataset="issue05_random",
+        strategies=("dp32", ),
+        rate_plan="coarse10_then_mid5",
+        bench_duration_sec=None,
+    )
+
+    assert len(cases) == 17
+    assert {case.model for case in cases} == {"deepseek_v3_1024k"}
+    assert {case.dataset for case in cases} == {"issue05_random"}
+    assert {case.strategy for case in cases} == {"dp32"}
+
+
+@pytest.mark.benchmark
 def test_build_plan_rows_starts_below_first_tpot_threshold_hit(
         tmp_path: Path) -> None:
     runner = load_runner_module()
@@ -138,3 +156,67 @@ def test_build_plan_rows_falls_back_to_timeout_rate_when_no_threshold_hit(
                                                        15.0, 10.0]
     assert {row.reason for row in rows} == {"start_from_timeout_rate35"}
     assert {row.historical_reference for row in rows} == {str(history_dir)}
+
+
+@pytest.mark.benchmark
+def test_build_plan_rows_filters_exact_cases_runner_would_skip(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    planner = load_planner_module()
+    artifact_root = tmp_path / "artifacts"
+
+    case30 = find_case(runner, strategy="dp4dcp8", request_rate=30.0)
+    history_dir = (runner.case_artifact_group_dir(artifact_root, case30) /
+                   "20260404-140000")
+    write_history_case(
+        history_dir,
+        status="ok",
+        summary={
+            "tpot_by_e2e": {
+                "mean": 80.0,
+            },
+        },
+    )
+
+    rows = planner.build_plan_rows(
+        artifact_root=artifact_root,
+        model="kimi_k2_instruct_0905",
+        dataset="issue01_random",
+        strategies=("dp4dcp8", ),
+        rate_plan="coarse10_then_mid5",
+        ignore_bs=True,
+        bench_duration_sec=None,
+    )
+
+    assert 30.0 not in [row.case.request_rate for row in rows]
+    assert [row.case.request_rate for row in rows[:5]] == [90.0, 85.0, 80.0,
+                                                           75.0, 70.0]
+
+
+@pytest.mark.benchmark
+def test_build_plan_rows_filters_group_rates_runner_would_skip(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    planner = load_planner_module()
+    artifact_root = tmp_path / "artifacts"
+
+    case30 = find_case(runner, strategy="dp4dcp8", request_rate=30.0)
+    history_dir = (runner.case_artifact_group_dir(artifact_root, case30) /
+                   "20260404-150000")
+    write_history_case(
+        history_dir,
+        status="failed",
+        summary=None,
+    )
+
+    rows = planner.build_plan_rows(
+        artifact_root=artifact_root,
+        model="kimi_k2_instruct_0905",
+        dataset="issue01_random",
+        strategies=("dp4dcp8", ),
+        rate_plan="coarse10_then_mid5",
+        ignore_bs=True,
+        bench_duration_sec=None,
+    )
+
+    assert [row.case.request_rate for row in rows] == [25.0, 20.0, 15.0, 10.0]
