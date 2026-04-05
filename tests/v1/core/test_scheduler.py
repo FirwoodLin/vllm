@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -20,12 +21,13 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler, logger as scheduler_logger
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -38,6 +40,27 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _write_dummy_opt_config(model_dir):
+    config = {
+        "architectures": ["OPTForCausalLM"],
+        "model_type": "opt",
+        "hidden_size": 16,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "ffn_dim": 64,
+        "vocab_size": 100,
+        "max_position_embeddings": 128,
+        "bos_token_id": 0,
+        "eos_token_id": 2,
+        "word_embed_proj_dim": 16,
+        "do_layer_norm_before": True,
+        "dropout": 0.0,
+        "attention_dropout": 0.0,
+        "activation_function": "relu",
+    }
+    (model_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
 def test_add_requests():
@@ -740,6 +763,55 @@ def test_preempt_during_execution():
     # sampled token id.
     assert len(requests[1].output_token_ids) == 1
     assert requests[1].output_token_ids[0] == 42
+
+
+def test_preempt_logs_request_details(tmp_path, monkeypatch):
+    model_dir = tmp_path / "dummy_opt"
+    model_dir.mkdir()
+    _write_dummy_opt_config(model_dir)
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+
+    scheduler = create_scheduler(
+        model=str(model_dir),
+        max_num_batched_tokens=100,
+        block_size=16,
+        num_blocks=11,
+        enable_prefix_caching=False,
+        skip_tokenizer_init=True,
+    )
+    requests = create_requests(num_requests=2, num_tokens=80, block_size=16)
+
+    scheduler.add_request(requests[0])
+    scheduler_output0 = scheduler.schedule()
+    scheduler.add_request(requests[1])
+    _ = scheduler.schedule()
+
+    scheduler.update_from_output(
+        scheduler_output0,
+        ModelRunnerOutput(
+            req_ids=[requests[0].request_id],
+            req_id_to_index={requests[0].request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    log_info = Mock()
+    monkeypatch.setattr(scheduler_logger, "info", log_info)
+    _ = scheduler.schedule()
+
+    preempt_calls = [
+        call for call in log_info.call_args_list
+        if call.args and call.args[0].startswith("PREEMPT ")
+    ]
+    assert preempt_calls
+    log_call = preempt_calls[0]
+    assert log_call.args[1] == requests[1].request_id
+    assert log_call.args[2] == "kv_cache_pressure"
+    assert log_call.args[3] == "prefill"
+    assert log_call.args[4] == 1
 
 
 def test_preempted_request_late_output_updates_waiting_token_accounting():

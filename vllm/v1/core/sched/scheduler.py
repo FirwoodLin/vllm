@@ -495,7 +495,11 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
-                    self._preempt_request(preempted_req, scheduled_timestamp)
+                    self._preempt_request(
+                        preempted_req,
+                        scheduled_timestamp,
+                        reason="kv_cache_pressure",
+                    )
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -946,7 +950,13 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
+    def _preempt_request(
+        self,
+        request: Request,
+        timestamp: float,
+        *,
+        reason: str,
+    ) -> None:
         """Preempt a request and put it back to the waiting queue.
 
         NOTE: The request should be popped from the running queue outside of this
@@ -955,6 +965,10 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        stage = "decode" if request.num_output_tokens > 0 else "prefill"
+        num_computed_tokens = request.num_computed_tokens
+        num_output_tokens = request.num_output_tokens
+
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -967,6 +981,21 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self._enqueue_waiting_request(request, prepend=True)
+
+        if self.log_stats:
+            logger.info(
+                "PREEMPT request_id=%s reason=%s stage=%s "
+                "num_preemptions=%d num_output_tokens=%d "
+                "num_computed_tokens=%d running_reqs=%d waiting_reqs=%d",
+                request.request_id,
+                reason,
+                stage,
+                request.num_preemptions,
+                num_output_tokens,
+                num_computed_tokens,
+                len(self.running),
+                len(self.waiting),
+            )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1979,7 +2008,11 @@ class Scheduler(SchedulerInterface):
             # running queue in FIFO order.
             while self.running:
                 request = self.running.pop()
-                self._preempt_request(request, timestamp)
+                self._preempt_request(
+                    request,
+                    timestamp,
+                    reason="reset_prefix_cache",
+                )
                 # NOTE(zhuohan): For async scheduling, we need to discard the latest
                 # output token on the fly to avoid a redundant repetitive output token.
                 request.num_output_placeholders = 0
