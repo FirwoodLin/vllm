@@ -27,6 +27,23 @@ from pathlib import Path
 from typing import Any, Mapping, TextIO
 
 
+def build_rate_range(start: float, stop: float, step: float) -> tuple[float, ...]:
+    if step <= 0.0:
+        raise ValueError("step must be > 0")
+    if stop < start:
+        raise ValueError("stop must be >= start")
+
+    count = int(round((stop - start) / step))
+    rates = tuple(round(start + step * index, 10) for index in range(count + 1))
+    if not rates:
+        raise ValueError("rate range cannot be empty")
+    if not math.isclose(rates[-1], stop):
+        raise ValueError(
+            f"rate range {start:g}..{stop:g} step {step:g} is not evenly divisible"
+        )
+    return rates
+
+
 HARNESS_ENTRYPOINT = "/vllm/offline_poisson_harness.py"
 DEFAULT_WORKDIR = "/vllm"
 DEFAULT_ARTIFACT_ROOT = Path(
@@ -79,6 +96,7 @@ PRESTART_CLEANUP_POLL_INTERVAL_SEC = 1.0
 LOCAL_SHUTDOWN_POLL_INTERVAL_SEC = 1.0
 WAIT_STATUS_LOG_INTERVAL_SEC = 15.0
 TPOT_BY_E2E_EARLY_STOP_MS = 100.0
+GPU_KV_CACHE_CAPACITY_LOG_MARKER = "poisson_gpu_kv_cache_capacity "
 RATE_SWEEP_START = 10
 RATE_SWEEP_STOP = 90
 RATE_SWEEP_STEP = 10
@@ -90,12 +108,33 @@ MID_SWEEP_REQUEST_RATES: tuple[float, ...] = tuple(
     float(rate)
     for rate in range(RATE_SWEEP_START + MID_RATE_SWEEP_OFFSET,
                       RATE_SWEEP_STOP, RATE_SWEEP_STEP))
+ISSUE01_TARGET_REQUEST_RATES: tuple[float, ...] = (40.0, 45.0)
+FULL2P5_SWEEP_REQUEST_RATES: tuple[float, ...] = build_rate_range(
+    2.5, 90.0, 2.5)
+COARSE1_SWEEP_REQUEST_RATES: tuple[float, ...] = build_rate_range(
+    1.0, 90.0, 1.0)
+MID0P5_SWEEP_REQUEST_RATES: tuple[float, ...] = build_rate_range(
+    1.5, 89.5, 1.0)
+COARSE1_TO10_SWEEP_REQUEST_RATES: tuple[float, ...] = build_rate_range(
+    1.0, 10.0, 1.0)
+MID0P5_TO10_SWEEP_REQUEST_RATES: tuple[float, ...] = build_rate_range(
+    1.5, 9.5, 1.0)
 DEFAULT_RATE_PLAN = "coarse10"
 RATE_PLAN_PHASES: dict[str, tuple[tuple[str, tuple[float, ...]], ...]] = {
     "coarse10": (("coarse10", SWEEP_REQUEST_RATES), ),
     "coarse10_then_mid5": (
         ("coarse10", SWEEP_REQUEST_RATES),
         ("mid5", MID_SWEEP_REQUEST_RATES),
+    ),
+    "issue01_40_45": (("issue01_40_45", ISSUE01_TARGET_REQUEST_RATES), ),
+    "full2p5": (("full2p5", FULL2P5_SWEEP_REQUEST_RATES), ),
+    "coarse1_then_mid0p5": (
+        ("coarse1", COARSE1_SWEEP_REQUEST_RATES),
+        ("mid0p5", MID0P5_SWEEP_REQUEST_RATES),
+    ),
+    "coarse1_to10_then_mid0p5": (
+        ("coarse1", COARSE1_TO10_SWEEP_REQUEST_RATES),
+        ("mid0p5", MID0P5_TO10_SWEEP_REQUEST_RATES),
     ),
 }
 CASE_CSV_FIELDNAMES: tuple[str, ...] = (
@@ -122,6 +161,7 @@ MODEL_SHORT_NAMES: dict[str, str] = {
 }
 DATASET_SHORT_NAMES: dict[str, str] = {
     "issue01_random": "issue01_random",
+    "long_full": "long_full",
 }
 
 
@@ -274,6 +314,8 @@ MODELS: dict[str, str] = {
 DATASETS: dict[str, str] = {
     "1k1k":
     "/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset-0110/1024-1024.csv",
+    "long_full":
+    "/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/madha/Gemini_Issues_Stats_rename-shuffle.csv",
     # "issue01_halfhalf":
     # "/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/"
     # "sharegpt-4o-mixlong-0326/sharegpt4o-halfhalf_geminiissue_r0.01_n60000_60k.csv",
@@ -653,6 +695,41 @@ def tail_file(path: Path, lines: int = 40) -> str:
         return ""
     content = path.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(content[-lines:])
+
+
+def extract_gpu_kv_cache_capacity_fields(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    for line in reversed(
+            path.read_text(encoding="utf-8",
+                           errors="replace").splitlines()):
+        marker_index = line.find(GPU_KV_CACHE_CAPACITY_LOG_MARKER)
+        if marker_index >= 0:
+            return line[marker_index +
+                        len(GPU_KV_CACHE_CAPACITY_LOG_MARKER):].strip()
+    return None
+
+
+def format_gpu_kv_cache_capacity_message(fields_text: str) -> str:
+    parsed: dict[str, str] = {}
+    for field in fields_text.split():
+        if "=" not in field:
+            continue
+        key, value = field.split("=", 1)
+        parsed[key] = value
+
+    total_tokens = parsed.get("total_tokens")
+    managed_engines = parsed.get("managed_engines")
+    usable_gpu_blocks = parsed.get("usable_gpu_blocks")
+    block_size = parsed.get("block_size")
+    if (total_tokens is not None and managed_engines is not None
+            and usable_gpu_blocks is not None and block_size is not None):
+        return ("GPU KV cache total token capacity="
+                f"{total_tokens} "
+                f"(managed_engines={managed_engines}, "
+                f"usable_gpu_blocks={usable_gpu_blocks}, "
+                f"block_size={block_size})")
+    return f"GPU KV cache capacity: {fields_text}"
 
 
 def jsonify(value: Any) -> Any:
@@ -2673,6 +2750,7 @@ class ManualMultinodeRunner:
         pending_headless_nodes = list(runtime.headless_nodes)
         case_name = self.runtime_case_name(runtime)
         next_log_at = wait_started_at + WAIT_STATUS_LOG_INTERVAL_SEC
+        kv_cache_capacity_logged = False
         while True:
             now = time.monotonic()
             exit_code = runtime.frontend.process.poll()
@@ -2685,6 +2763,15 @@ class ManualMultinodeRunner:
                         f"frontend exited with code {exit_code}.\n{detail}")
                 self.log_case(case_name, "frontend process exited with code 0")
                 return exit_code
+
+            if not kv_cache_capacity_logged:
+                capacity_fields = extract_gpu_kv_cache_capacity_fields(
+                    runtime.frontend.runtime_log_path)
+                if capacity_fields is not None:
+                    self.log_case(
+                        case_name,
+                        format_gpu_kv_cache_capacity_message(capacity_fields))
+                    kv_cache_capacity_logged = True
 
             if deadline is not None and now >= deadline:
                 detail = tail_file(runtime.frontend.runtime_log_path) or tail_file(
@@ -2999,7 +3086,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Request-rate sweep plan to use for --list, --all, and --case "
             "name resolution. 'coarse10' runs only 10-point spacing; "
-            "'coarse10_then_mid5' appends 15/25/.../85 after the coarse pass."
+            "'coarse10_then_mid5' appends 15/25/.../85 after the coarse pass; "
+            "'issue01_40_45' targets rates 40 and 45; "
+            "'full2p5' uses 2.5-point spacing from 2.5 to 90; "
+            "'coarse1_then_mid0p5' combines 1-point coarse rates with 0.5-point "
+            "midpoints; "
+            "'coarse1_to10_then_mid0p5' limits that combination to rates <= 10."
         ),
     )
     parser.add_argument(

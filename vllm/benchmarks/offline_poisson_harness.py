@@ -69,6 +69,7 @@ TTFT_SEMANTICS_DECODE_BENCH_DUMMY_PREFILL = (
 )
 FRONTEND_TEARDOWN_HEARTBEAT_SEC = 15.0
 FRONTEND_TEARDOWN_TIMEOUT_SEC = 60.0
+GPU_KV_CACHE_CAPACITY_LOG_MARKER = "poisson_gpu_kv_cache_capacity"
 
 
 def _non_negative_int(value: str) -> int:
@@ -151,6 +152,58 @@ def _log_frontend_phase(
     if extra_fields:
         fields.update(extra_fields)
     logger.info("poisson_frontend %s", _format_frontend_log_fields(fields))
+
+
+def _log_gpu_kv_cache_capacity(
+    async_llm: Any,
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    frontend_started_at_s: float,
+) -> None:
+    cache_config = getattr(getattr(async_llm, "vllm_config", None),
+                           "cache_config", None)
+    if cache_config is None:
+        logger.warning("%s unavailable: missing cache_config",
+                       GPU_KV_CACHE_CAPACITY_LOG_MARKER)
+        return
+
+    num_gpu_blocks = getattr(cache_config, "num_gpu_blocks", None)
+    block_size = getattr(cache_config, "block_size", None)
+    if (not isinstance(num_gpu_blocks, int) or num_gpu_blocks <= 0
+            or not isinstance(block_size, int) or block_size <= 0):
+        logger.warning(
+            "%s unavailable: num_gpu_blocks=%s block_size=%s",
+            GPU_KV_CACHE_CAPACITY_LOG_MARKER,
+            num_gpu_blocks,
+            block_size,
+        )
+        return
+
+    engine_ranks_managed = getattr(async_llm.engine_core, "engine_ranks_managed",
+                                   ())
+    managed_engine_count = max(len(engine_ranks_managed), 1)
+    reserved_null_blocks = managed_engine_count
+    usable_gpu_blocks = max(num_gpu_blocks - reserved_null_blocks, 0)
+    total_tokens = usable_gpu_blocks * block_size
+
+    fields = {
+        "scope": "aggregate_managed_engines",
+        "pid": os.getpid(),
+        "output_dir": output_dir,
+        "request_rate": getattr(args, "request_rate", None),
+        "dp_size": getattr(args, "data_parallel_size", None),
+        "dp_size_local": getattr(args, "data_parallel_size_local", None),
+        "managed_engines": managed_engine_count,
+        "num_gpu_blocks": num_gpu_blocks,
+        "reserved_null_blocks": reserved_null_blocks,
+        "usable_gpu_blocks": usable_gpu_blocks,
+        "block_size": block_size,
+        "total_tokens": total_tokens,
+        "elapsed_s": time.monotonic() - frontend_started_at_s,
+    }
+    logger.info("%s %s", GPU_KV_CACHE_CAPACITY_LOG_MARKER,
+                _format_frontend_log_fields(fields))
 
 
 def _jsonify(value: Any) -> Any:
@@ -1075,6 +1128,12 @@ async def run_frontend(args: argparse.Namespace) -> None:
         )
         _log_frontend_phase(
             "async_llm_created",
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+        )
+        _log_gpu_kv_cache_capacity(
+            async_llm,
             args=args,
             output_dir=output_dir,
             frontend_started_at_s=frontend_started_at_s,
