@@ -137,6 +137,12 @@ RATE_PLAN_PHASES: dict[str, tuple[tuple[str, tuple[float, ...]], ...]] = {
         ("mid0p5", MID0P5_TO10_SWEEP_REQUEST_RATES),
     ),
 }
+DEFAULT_DISPATCH_POLICY = "waiting_x4_plus_running"
+DISPATCH_POLICY_CHOICES: tuple[str, ...] = (
+    DEFAULT_DISPATCH_POLICY,
+    "least_cache",
+    "least_batch",
+)
 CASE_CSV_FIELDNAMES: tuple[str, ...] = (
     "enabled",
     "name",
@@ -144,6 +150,7 @@ CASE_CSV_FIELDNAMES: tuple[str, ...] = (
     "model",
     "dataset",
     "strategy",
+    "dispatch_policy",
     "request_rate",
     "rate_phase",
     "max_num_seqs",
@@ -205,6 +212,7 @@ class ExperimentCase:
     strategy: str
     dataset: str
     model: str = "deepseek_v3_1024k"
+    dispatch_policy: str = DEFAULT_DISPATCH_POLICY
     request_rate: float = 100.0
     rate_phase: str = DEFAULT_RATE_PLAN
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
@@ -656,10 +664,37 @@ def stringify_gpu_memory_utilization(value: float) -> str:
     return f"mem{percentage:g}".replace(".", "_")
 
 
+def normalize_dispatch_policy(policy: str) -> str:
+    normalized = policy.strip()
+    if normalized not in DISPATCH_POLICY_CHOICES:
+        supported = ", ".join(DISPATCH_POLICY_CHOICES)
+        raise ValueError(
+            f"unknown dispatch_policy '{policy}'. Supported values: {supported}"
+        )
+    return normalized
+
+
+def _dispatch_policy_group_key_component(case: ExperimentCase) -> str | None:
+    dispatch_policy = normalize_dispatch_policy(case.dispatch_policy)
+    if dispatch_policy == DEFAULT_DISPATCH_POLICY:
+        return None
+    return f"dispatch_{sanitize_tag(dispatch_policy)}"
+
+
+def _dispatch_policy_artifact_suffix(case: ExperimentCase) -> str:
+    component = _dispatch_policy_group_key_component(case)
+    return f"-{component}" if component is not None else ""
+
+
 def case_group_key(case: ExperimentCase) -> str:
-    return "/".join(
-        (model_short_name(case.model), dataset_short_name(case.dataset),
-         sanitize_tag(case.strategy)))
+    parts = [
+        model_short_name(case.model),
+        dataset_short_name(case.dataset),
+        sanitize_tag(case.strategy),
+    ]
+    if (dispatch_component := _dispatch_policy_group_key_component(case)) is not None:
+        parts.append(dispatch_component)
+    return "/".join(parts)
 
 
 def case_artifact_dataset_dir(artifact_root: Path, case: ExperimentCase) -> Path:
@@ -673,8 +708,11 @@ def case_artifact_rate_duration_tag(case: ExperimentCase) -> str:
 
 
 def case_artifact_scenario_prefix(case: ExperimentCase) -> str:
-    return (f"{sanitize_tag(case.strategy)}-"
-            f"{stringify_gpu_memory_utilization(case.gpu_memory_utilization)}")
+    return (
+        f"{sanitize_tag(case.strategy)}"
+        f"{_dispatch_policy_artifact_suffix(case)}-"
+        f"{stringify_gpu_memory_utilization(case.gpu_memory_utilization)}"
+    )
 
 
 def case_artifact_group_dir(artifact_root: Path, case: ExperimentCase) -> Path:
@@ -950,6 +988,7 @@ def build_common_harness_argv(
     role: str,
     node_rank: int,
 ) -> list[str]:
+    dispatch_policy = normalize_dispatch_policy(resolved.case.dispatch_policy)
     argv = [
         "python3",
         HARNESS_ENTRYPOINT,
@@ -972,6 +1011,8 @@ def build_common_harness_argv(
         str(resolved.case.data_parallel_rpc_port),
         "--data-parallel-backend",
         resolved.strategy.data_parallel_backend,
+        "--data-parallel-dispatch-policy",
+        dispatch_policy,
         "--tensor-parallel-size",
         str(resolved.strategy.tensor_parallel_size),
         "--decode-context-parallel-size",
@@ -1348,6 +1389,7 @@ def describe_case(case: ExperimentCase) -> str:
     return (
         f"{case.name}: model={model_short_name(case.model)}, "
         f"cluster={case.cluster}, strategy={case.strategy}, "
+        f"dispatch={normalize_dispatch_policy(case.dispatch_policy)}, "
         f"dataset={case.dataset}, phase={case.rate_phase}, "
         f"rate={stringify_request_rate(case.request_rate)}, "
         f"mem={stringify_gpu_memory_utilization(case.gpu_memory_utilization)}, "
@@ -1429,6 +1471,10 @@ def load_cases_from_csv(path: Path) -> list[ExperimentCase]:
                     strategy=strategy,
                     dataset=dataset,
                     model=model,
+                    dispatch_policy=(
+                        _csv_cell(row, "dispatch_policy")
+                        or DEFAULT_DISPATCH_POLICY
+                    ),
                     request_rate=float(request_rate_raw),
                     rate_phase=_csv_cell(row, "rate_phase") or DEFAULT_RATE_PLAN,
                     gpu_memory_utilization=_csv_float(
@@ -1447,6 +1493,7 @@ def load_cases_from_csv(path: Path) -> list[ExperimentCase]:
                         default=29550,
                     ) or 29550,
                 ))
+            normalize_dispatch_policy(cases[-1].dispatch_policy)
         except Exception as exc:
             raise SystemExit(
                 f"Invalid case CSV row {row_index} in {path}: {exc}") from exc
