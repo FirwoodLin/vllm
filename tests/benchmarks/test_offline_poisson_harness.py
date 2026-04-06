@@ -360,6 +360,35 @@ def test_connector_mode_from_config() -> None:
 
 
 @pytest.mark.benchmark
+def test_log_frontend_phase_includes_dispatch_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages: list[str] = []
+    monkeypatch.setattr(
+        harness_mod.logger,
+        "info",
+        lambda message, *args, **_kwargs: messages.append(
+            message % args if args else message),
+    )
+
+    harness_mod._log_frontend_phase(
+        "frontend_start",
+        args=Namespace(
+            request_rate=12.5,
+            data_parallel_dispatch_policy="least_batch",
+            data_parallel_size=16,
+            data_parallel_size_local=8,
+            save_merged_parquet=False,
+        ),
+        output_dir=tmp_path,
+        frontend_started_at_s=0.0,
+    )
+
+    assert any("dispatch_policy=least_batch" in message for message in messages)
+
+
+@pytest.mark.benchmark
 def test_apply_benchmark_arg_defaults_normalizes_legacy_decode_bench_config() -> None:
     args = Namespace(
         kv_transfer_config={

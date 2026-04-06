@@ -56,6 +56,7 @@ class MetricStats:
     maxs: list[float]
     p25s: list[float]
     medians: list[float]
+    means: list[float]
     p75s: list[float]
     cvs: list[float]
 
@@ -139,6 +140,7 @@ def compute_metric_stats(values_by_step: list[list[float]]) -> MetricStats:
     maxs: list[float] = []
     p25s: list[float] = []
     medians: list[float] = []
+    means: list[float] = []
     p75s: list[float] = []
     cvs: list[float] = []
 
@@ -148,9 +150,9 @@ def compute_metric_stats(values_by_step: list[list[float]]) -> MetricStats:
         maxs.append(sorted_values[-1])
         p25s.append(percentile(sorted_values, 25.0))
         medians.append(percentile(sorted_values, 50.0))
-        p75s.append(percentile(sorted_values, 75.0))
-
         mean_value = fmean(sorted_values)
+        means.append(mean_value)
+        p75s.append(percentile(sorted_values, 75.0))
         std_value = pstdev(sorted_values)
         cvs.append(0.0 if mean_value <= 0 else (std_value / mean_value) * 100.0)
 
@@ -159,6 +161,7 @@ def compute_metric_stats(values_by_step: list[list[float]]) -> MetricStats:
         maxs=maxs,
         p25s=p25s,
         medians=medians,
+        means=means,
         p75s=p75s,
         cvs=cvs,
     )
@@ -407,6 +410,14 @@ def plot_metric(
         color=ribbon_color,
         linewidth=1.4,
         label="Median",
+    )
+    ax.plot(
+        steps,
+        stats.means,
+        color=ribbon_color,
+        linewidth=1.2,
+        linestyle=":",
+        label="Mean",
     )
 
     ax.set_title(title)

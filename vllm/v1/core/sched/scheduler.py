@@ -1856,6 +1856,9 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
+    def get_num_free_kv_blocks(self) -> int:
+        return self.kv_cache_manager.block_pool.get_num_free_blocks()
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -2094,6 +2097,7 @@ class Scheduler(SchedulerInterface):
                 if waiting_head is not None
                 else 0
             ),
+            free_kv_blocks=self.get_num_free_kv_blocks(),
             kv_cache_usage=self.kv_cache_manager.usage,
             encoder_cache_usage=self._get_encoder_cache_usage(),
             prefix_cache_stats=prefix_cache_stats,

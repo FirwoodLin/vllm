@@ -18,6 +18,10 @@ from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
 
 logger = init_logger(__name__)
 
+LB_STATS_WAITING_IDX = 0
+LB_STATS_RUNNING_IDX = 1
+LB_STATS_FREE_KV_BLOCKS_IDX = 2
+
 
 class DPCoordinator:
     """Coordinator process used for data-parallel deployments (DP>1).
@@ -25,9 +29,8 @@ class DPCoordinator:
     Intermediates between multiple DP engine rank processes and one or more
     front-end API server processes.
 
-    * Collects stats from each DP engine (currently just waiting and running
-      queue lengths), and publishes these to all front-ends for use in
-      load-balancing decisions.
+    * Collects load-balancing stats from each DP engine, and publishes these
+      to all front-ends for use in load-balancing decisions.
 
     * Keeps track of the current DP "request wave" number and running state
       of the engines. This is received from the DP rank 0 engine and published
@@ -112,7 +115,7 @@ class DPCoordinator:
 
 class EngineState:
     def __init__(self):
-        self.request_counts = [0, 0]  # [waiting, running]
+        self.lb_stats = [0, 0, 0]  # [waiting, running, free_kv_blocks]
 
 
 class DPCoordinatorProc:
@@ -165,11 +168,11 @@ class DPCoordinatorProc:
         current_wave = 0
         engines_running = False
 
-        # For tracking request counts for internal load-balancing.
+        # For tracking load-balancing stats for internal load-balancing.
         stats_changed = False
         last_stats_step = -1
         last_stats_wave = -1
-        last_step_counts: list[list[int]] | None = None
+        last_step_lb_stats: list[list[int]] | None = None
 
         with (
             make_zmq_socket(
@@ -217,19 +220,19 @@ class DPCoordinatorProc:
 
                 # Wait at least 50ms to ensure we've received all stats for
                 # the current step.
-                min_timeout = 50 if last_step_counts is None else 0
+                min_timeout = 50 if last_step_lb_stats is None else 0
 
                 events = poller.poll(timeout=max(min_timeout, wait_for - elapsed))
                 if not events:
                     # Poller timeout - publish current stats to front-ends.
-                    if last_step_counts is not None:
-                        engine_req_counts_list = last_step_counts
-                        last_step_counts = None
+                    if last_step_lb_stats is not None:
+                        engine_lb_stats = last_step_lb_stats
+                        last_step_lb_stats = None
                     else:
-                        engine_req_counts_list = self._get_engine_counts()
+                        engine_lb_stats = self._get_engine_lb_stats()
                         stats_changed = False
 
-                    to_publish = (engine_req_counts_list, current_wave, engines_running)
+                    to_publish = (engine_lb_stats, current_wave, engines_running)
                     publish_front.send(msgspec.msgpack.encode(to_publish))
                     last_publish_time = int(time.time() * 1000)
                     continue
@@ -329,7 +332,7 @@ class DPCoordinatorProc:
                     if scheduler_stats:
                         # 1. Updated request load stats - update our local
                         # state with these.
-                        stats = self.engines[eng_index].request_counts
+                        stats = self.engines[eng_index].lb_stats
                         stats_step = scheduler_stats.step_counter
                         stats_wave = scheduler_stats.current_wave
                         if (
@@ -338,7 +341,9 @@ class DPCoordinatorProc:
                             and stats_step > last_stats_step
                         ):
                             if stats_changed:
-                                last_step_counts = self._get_engine_counts(do_copy=True)
+                                last_step_lb_stats = self._get_engine_lb_stats(
+                                    do_copy=True
+                                )
                             last_stats_step = stats_step
                             last_stats_wave = stats_wave
                         elif stats_wave != last_stats_wave or (
@@ -354,8 +359,11 @@ class DPCoordinatorProc:
                                 last_stats_wave,
                                 last_stats_step,
                             )
-                        stats[0] = scheduler_stats.num_waiting_reqs
-                        stats[1] = scheduler_stats.num_running_reqs
+                        stats[LB_STATS_WAITING_IDX] = scheduler_stats.num_waiting_reqs
+                        stats[LB_STATS_RUNNING_IDX] = scheduler_stats.num_running_reqs
+                        stats[LB_STATS_FREE_KV_BLOCKS_IDX] = (
+                            scheduler_stats.free_kv_blocks
+                        )
                         stats_changed = True
 
                     # Wave coordination: handle wave completion and start notifications
@@ -408,8 +416,8 @@ class DPCoordinatorProc:
         wave_encoded = msgspec.msgpack.encode((wave, exclude_engine_index))
         socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
 
-    def _get_engine_counts(self, do_copy=False) -> list[list[int]]:
-        """Return list of [waiting, running] count lists for each engine."""
+    def _get_engine_lb_stats(self, do_copy=False) -> list[list[int]]:
+        """Return list of [waiting, running, free_kv_blocks] stats."""
         if do_copy:
-            return [copy.copy(e.request_counts) for e in self.engines]
-        return [e.request_counts for e in self.engines]
+            return [copy.copy(e.lb_stats) for e in self.engines]
+        return [e.lb_stats for e in self.engines]

@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import manual_multinode_poisson_runner as runner
@@ -51,6 +51,7 @@ def template_cases_for_plan(
     strategies: tuple[str, ...],
     rate_plan: str,
     bench_duration_sec: float | None,
+    dispatch_policy: str = runner.DEFAULT_DISPATCH_POLICY,
 ) -> list[runner.ExperimentCase]:
     try:
         cases = runner.build_experiment_matrix(
@@ -63,6 +64,10 @@ def template_cases_for_plan(
         raise SystemExit(str(exc)) from exc
     if bench_duration_sec is not None:
         cases = runner.apply_bench_duration_override(cases, bench_duration_sec)
+    normalized_dispatch_policy = runner.normalize_dispatch_policy(dispatch_policy)
+    cases = [
+        replace(case, dispatch_policy=normalized_dispatch_policy) for case in cases
+    ]
 
     if not cases:
         raise SystemExit(
@@ -214,6 +219,7 @@ def build_plan_rows(
     rate_plan: str,
     ignore_bs: bool,
     bench_duration_sec: float | None,
+    dispatch_policy: str = runner.DEFAULT_DISPATCH_POLICY,
 ) -> list[PlannedCaseRow]:
     template_cases = template_cases_for_plan(
         model=model,
@@ -221,6 +227,7 @@ def build_plan_rows(
         strategies=strategies,
         rate_plan=rate_plan,
         bench_duration_sec=bench_duration_sec,
+        dispatch_policy=dispatch_policy,
     )
     grouped: dict[str, list[runner.ExperimentCase]] = {key: [] for key in strategies}
     for case in template_cases:
@@ -250,6 +257,7 @@ def planned_case_to_csv_row(planned: PlannedCaseRow) -> dict[str, str]:
         "model": case.model,
         "dataset": case.dataset,
         "strategy": case.strategy,
+        "dispatch_policy": case.dispatch_policy,
         "request_rate": runner.stringify_request_rate(case.request_rate),
         "rate_phase": case.rate_phase,
         "max_num_seqs": "" if case.max_num_seqs is None else str(
@@ -317,6 +325,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Override benchmark duration when deriving max_requests for the "
               "generated CSV rows."),
     )
+    parser.add_argument(
+        "--dispatch-policy",
+        default=runner.DEFAULT_DISPATCH_POLICY,
+        choices=sorted(runner.DISPATCH_POLICY_CHOICES),
+        help=("Dispatch policy to stamp into generated rows. "
+              "Defaults to the runner's default policy."),
+    )
     return parser
 
 
@@ -332,6 +347,7 @@ def main(argv: list[str] | None = None) -> None:
         rate_plan=args.rate_plan,
         ignore_bs=args.historical_skip_ignore_bs,
         bench_duration_sec=args.bench_duration_sec,
+        dispatch_policy=args.dispatch_policy,
     )
     output_csv = Path(args.output_csv).expanduser().resolve()
     write_plan_csv(output_csv, rows)

@@ -33,6 +33,7 @@ SUBMETRICS = ("mean", "p50", "p99")
 CASE_NAME_PATTERN = re.compile(
     r"^(?P<prefix>.+)-rate(?P<rate>\d+(?:\.\d+)?)(?P<suffix>(?:-.+)*)$"
 )
+MEMORY_TAG_PATTERN = re.compile(r"-mem[^-]+")
 MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">")
 
 
@@ -147,7 +148,7 @@ def parse_case_name(case_name: str) -> tuple[str, str, float] | None:
     prefix = match.group("prefix")
     suffix = match.group("suffix")
     rate = float(match.group("rate"))
-    group_key = f"{prefix}{suffix}"
+    group_key = MEMORY_TAG_PATTERN.sub("", f"{prefix}{suffix}")
     strategy_name = prefix.split("-", 1)[0]
     return group_key, strategy_name, rate
 
@@ -232,14 +233,17 @@ def collect_plot_data(
     root: Path,
     selected_models: set[str] | None,
 ) -> dict[str, dict[str, dict[str, list[SeriesPoint]]]]:
-    candidates_by_case: dict[tuple[str, str, str], list[RunCandidate]] = defaultdict(list)
+    candidates_by_case: dict[
+        tuple[str, str, str, float], list[RunCandidate]
+    ] = defaultdict(list)
     for candidate in iter_run_candidates(root):
         if selected_models is not None and candidate.model not in selected_models:
             continue
         parsed = parse_case_name(candidate.case_name)
         if parsed is None:
             continue
-        candidate_key = (candidate.model, candidate.dataset, candidate.case_name)
+        group_key, _, rate = parsed
+        candidate_key = (candidate.model, candidate.dataset, group_key, rate)
         candidates_by_case[candidate_key].append(candidate)
 
     plot_data: dict[str, dict[str, dict[str, list[SeriesPoint]]]] = defaultdict(

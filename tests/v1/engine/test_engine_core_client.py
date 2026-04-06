@@ -197,13 +197,29 @@ def _make_pooling_request(
     )
 
 
-def test_dplb_late_interaction_sticky_routing():
+def _make_fake_dplb_client(
+    *,
+    policy: str = "waiting_x4_plus_running",
+    lb_engines: list[list[int]],
+    eng_start_index: int = 0,
+    client_count: int = 1,
+) -> DPLBAsyncMPClient:
     client = object.__new__(DPLBAsyncMPClient)
-    client.client_count = 1
+    client.client_count = client_count
     client.reqs_in_flight = {}
-    client.core_engines = [b"\x00\x00", b"\x01\x00", b"\x02\x00"]
-    client.lb_engines = [[0, 0], [0, 0], [0, 0]]
-    client.eng_start_index = 0
+    client.core_engines = [index.to_bytes(2, "little") for index in range(len(lb_engines))]
+    client.lb_engines = [stats.copy() for stats in lb_engines]
+    client.eng_start_index = eng_start_index
+    client.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_dispatch_policy=policy,
+        )
+    )
+    return client
+
+
+def test_dplb_late_interaction_sticky_routing():
+    client = _make_fake_dplb_client(lb_engines=[[0, 0, 0], [0, 0, 0], [0, 0, 0]])
 
     query_key = "rerank-abc-query-0"
     query_request = _make_pooling_request(
@@ -222,12 +238,7 @@ def test_dplb_late_interaction_sticky_routing():
 
 
 def test_dplb_non_late_interaction_still_uses_lb():
-    client = object.__new__(DPLBAsyncMPClient)
-    client.client_count = 1
-    client.reqs_in_flight = {}
-    client.core_engines = [b"\x00\x00", b"\x01\x00", b"\x02\x00"]
-    client.lb_engines = [[2, 1], [0, 0], [1, 0]]
-    client.eng_start_index = 0
+    client = _make_fake_dplb_client(lb_engines=[[2, 1, 100], [0, 0, 80], [1, 0, 90]])
 
     request = make_request(SamplingParams(max_tokens=1))
     chosen_engine = client.get_core_engine_for_request(request)

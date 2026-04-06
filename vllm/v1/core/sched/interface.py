@@ -227,6 +227,11 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_num_free_kv_blocks(self) -> int:
+        """Returns the current number of free KV cache blocks."""
+        raise NotImplementedError
+
+    @abstractmethod
     def make_stats(self) -> "SchedulerStats | None":
         """Make a SchedulerStats object for logging.
 

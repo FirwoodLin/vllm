@@ -165,6 +165,8 @@ def test_build_experiment_matrix_filters_model_dataset_and_strategy() -> None:
     assert {case.model for case in cases} == {"deepseek_v3_1024k"}
     assert {case.dataset for case in cases} == {"issue05_random"}
     assert {case.strategy for case in cases} == {"dp32"}
+    assert all(case.gpu_memory_utilization == pytest.approx(0.87)
+               for case in cases)
     assert [case.request_rate for case in cases[:4]] == [10.0, 20.0, 30.0, 40.0]
     assert [case.request_rate for case in cases[-4:]] == [55.0, 65.0, 75.0,
                                                            85.0]
@@ -187,6 +189,7 @@ def test_build_frontend_and_headless_argv_include_required_flags(
             strategy="strategy_a",
             dataset="dataset_alias",
             model="model_alias",
+            dispatch_policy="least_cache",
             request_rate=100.0,
             max_requests=9000,
             warmup_requests=32,
@@ -250,6 +253,8 @@ def test_build_frontend_and_headless_argv_include_required_flags(
     assert "--enable-expert-parallel" in frontend_argv
     assert "--attention-backend" in frontend_argv
     assert "--all2all-backend" in frontend_argv
+    assert "--data-parallel-dispatch-policy" in frontend_argv
+    assert "least_cache" in frontend_argv
     assert "--input-csv" not in headless_argv
     assert "--request-rate" not in headless_argv
 
@@ -351,6 +356,7 @@ def test_write_case_manifest_includes_commands_and_paths(tmp_path: Path) -> None
             strategy="strategy_a",
             dataset="dataset_alias",
             model="model_alias",
+            dispatch_policy="least_batch",
             request_rate=5.0,
         ),
         clusters={
@@ -396,9 +402,43 @@ def test_write_case_manifest_includes_commands_and_paths(tmp_path: Path) -> None
     assert payload["case_name"] == "case_manifest"
     assert payload["status"] == "prepared"
     assert payload["shared_artifact_mount"] is True
+    assert payload["case"]["dispatch_policy"] == "least_batch"
     assert payload["commands"]["frontend_launch_command"] == "frontend command"
     assert payload["commands"]["remote_launch_commands"]["1"] == "rank1 command"
     assert payload["paths"]["benchmark_dir"] == str(artifacts.benchmark_dir)
+
+
+@pytest.mark.benchmark
+def test_non_default_dispatch_policy_affects_case_grouping() -> None:
+    runner = load_runner_module()
+    default_case = runner.ExperimentCase(
+        name="default_policy",
+        cluster="cluster_a",
+        strategy="strategy_a",
+        dataset="dataset_a",
+        model="model_a",
+    )
+    least_cache_case = runner.ExperimentCase(
+        name="least_cache_policy",
+        cluster="cluster_a",
+        strategy="strategy_a",
+        dataset="dataset_a",
+        model="model_a",
+        dispatch_policy="least_cache",
+    )
+
+    assert runner.case_group_key(default_case) == "MODEL_A/dataset_a/strategy_a"
+    assert runner.case_group_key(least_cache_case) == (
+        "MODEL_A/dataset_a/strategy_a/dispatch_least_cache"
+    )
+    assert (
+        runner.case_artifact_scenario_prefix(default_case)
+        == "strategy_a-mem85"
+    )
+    assert (
+        runner.case_artifact_scenario_prefix(least_cache_case)
+        == "strategy_a-dispatch_least_cache-mem85"
+    )
 
 
 @pytest.mark.benchmark
@@ -700,6 +740,125 @@ def test_wait_for_frontend_allows_clean_headless_shutdown(
 
 
 @pytest.mark.benchmark
+def test_detect_group_trend_outlier_candidates_flags_local_spike(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+
+    cases = [
+        runner.ExperimentCase(
+            name="group_a_rate10",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=10.0,
+        ),
+        runner.ExperimentCase(
+            name="group_a_rate20",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=20.0,
+        ),
+        runner.ExperimentCase(
+            name="group_a_rate30",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=30.0,
+        ),
+    ]
+
+    latest_results_by_case_name = {}
+    for case, metric in zip(cases, (40.0, 90.0, 50.0), strict=True):
+        benchmark_dir = tmp_path / case.name / "benchmark"
+        benchmark_dir.mkdir(parents=True, exist_ok=True)
+        summary_json = benchmark_dir / "summary.json"
+        summary_json.write_text(
+            json.dumps({"tpot_by_e2e": {
+                "mean": metric,
+            }}) + "\n",
+            encoding="utf-8",
+        )
+        latest_results_by_case_name[case.name] = runner.CaseResult(
+            case_name=case.name,
+            status="ok",
+            exit_code=0,
+            started_at="2026-04-03T00:00:00+08:00",
+            finished_at="2026-04-03T00:10:00+08:00",
+            case_dir=benchmark_dir.parent,
+            benchmark_dir=benchmark_dir,
+            summary_json=summary_json,
+            detail="completed",
+        )
+
+    candidates = runner.detect_group_trend_outlier_candidates(
+        cases,
+        latest_results_by_case_name,
+        relative_threshold_pct=5.0,
+        absolute_threshold_ms=5.0,
+    )
+
+    assert [candidate.case.name for candidate in candidates] == ["group_a_rate20"]
+    assert candidates[0].expected_value == pytest.approx(45.0)
+    assert candidates[0].delta_ms == pytest.approx(45.0)
+
+
+@pytest.mark.benchmark
+def test_find_fatal_signal_in_log_detects_worker_exit_pair(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    log_path = tmp_path / "rank1.log"
+    log_path.write_text(
+        "\n".join([
+            "wrapper still running",
+            "Worker proc 1 died unexpectedly, shutting down executor.",
+            "tearing down",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    excerpt = runner.find_fatal_signal_in_log(
+        log_path, lines=runner.FATAL_LOG_SCAN_LINES)
+
+    assert excerpt is not None
+    assert "Worker proc 1 died unexpectedly, shutting down executor." in excerpt
+
+
+@pytest.mark.benchmark
+def test_wait_for_headless_startup_fails_on_fatal_rank_log(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=False)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+
+    headless = make_node_runtime(
+        runner,
+        tmp_path,
+        node_rank=1,
+        host="node-a",
+        poll_results=[None],
+        runtime_log="EngineCore encountered a fatal error.\n",
+    )
+    runtime = SimpleNamespace(
+        headless_nodes=[headless],
+        resolved=SimpleNamespace(
+            case=SimpleNamespace(start_grace_sec=60.0)),
+    )
+
+    with pytest.raises(RuntimeError,
+                       match="detected fatal engine failure") as exc_info:
+        launcher.wait_for_headless_startup(runtime)
+
+    assert str(headless.runtime_log_path) in str(exc_info.value)
+    assert "EngineCore encountered a fatal error." in str(exc_info.value)
+
+
+@pytest.mark.benchmark
 def test_wait_for_headless_shutdown_checks_remote_pidfiles(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runner = load_runner_module()
@@ -766,6 +925,38 @@ def test_wait_for_frontend_still_fails_for_nonzero_headless_exit(
 
     with pytest.raises(RuntimeError, match="rank 1 on node-a exited early"):
         launcher.wait_for_frontend(runtime)
+
+
+@pytest.mark.benchmark
+def test_wait_for_frontend_fails_on_fatal_frontend_log(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=False)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+
+    frontend = make_node_runtime(
+        runner,
+        tmp_path,
+        node_rank=0,
+        host="local",
+        poll_results=[None],
+        runtime_log="AsyncLLM output_handler failed.\n",
+    )
+    runtime = SimpleNamespace(
+        frontend=frontend,
+        headless_nodes=[],
+        resolved=SimpleNamespace(
+            case=SimpleNamespace(max_bench_duration_sec=60.0)),
+    )
+
+    with pytest.raises(RuntimeError,
+                       match="detected fatal engine failure") as exc_info:
+        launcher.wait_for_frontend(runtime)
+
+    assert str(frontend.runtime_log_path) in str(exc_info.value)
+    assert "AsyncLLM output_handler failed." in str(exc_info.value)
 
 
 @pytest.mark.benchmark
@@ -1043,7 +1234,15 @@ def test_run_case_fails_if_cleanup_verification_fails(
                         lambda *_args, **_kwargs: (_ for _ in ()).throw(
                             RuntimeError("cleanup dirty")))
     monkeypatch.setattr(runner, "augment_benchmark_outputs",
-                        lambda *_args, **_kwargs: None)
+                        lambda benchmark_dir: runner.write_json(
+                            benchmark_dir / "summary.json",
+                            {
+                                "total_requests": 1,
+                                "successful_requests": 1,
+                                "failed_requests": 0,
+                                "failure_ratio": 0.0,
+                            },
+                        ))
 
     result = launcher.run_case(
         runner.ExperimentCase(
@@ -1060,6 +1259,100 @@ def test_run_case_fails_if_cleanup_verification_fails(
     assert result.status == "failed"
     assert result.exit_code == 1
     assert result.detail == "cleanup dirty"
+
+
+@pytest.mark.benchmark
+def test_run_case_fails_when_summary_indicates_failed_requests(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(tmp_path,
+                                            dry_run=False,
+                                            keep_going=True)
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="case_a",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=10.0,
+        ),
+        clusters={
+            "cluster_a":
+            runner.ClusterSpec(
+                master_addr="10.0.0.1",
+                master_port=29579,
+                remote_hosts=(),
+            ),
+        },
+        strategies={
+            "strategy_a":
+            runner.StrategySpec(
+                data_parallel_size=1,
+                data_parallel_size_local=1,
+                tensor_parallel_size=1,
+            ),
+        },
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    monkeypatch.setattr(runner, "resolve_case", lambda _case: resolved)
+    monkeypatch.setattr(launcher, "run_preclean", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "launch_headless_nodes",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "wait_for_headless_startup",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "launch_frontend",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "wait_for_frontend",
+                        lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(launcher, "wait_for_headless_shutdown",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "wait_for_local_shutdown",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "cleanup_case_runtime",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "verify_case_cleanup",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "augment_benchmark_outputs",
+        lambda benchmark_dir: runner.write_json(
+            benchmark_dir / "summary.json",
+            {
+                "total_requests": 21000,
+                "successful_requests": 7492,
+                "failed_requests": 13508,
+                "failure_ratio": 0.643238,
+            },
+        ),
+    )
+
+    result = launcher.run_case(
+        runner.ExperimentCase(
+            name="case_a",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=10.0,
+        ),
+        tmp_path / "run",
+    )
+
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert "benchmark summary indicates failure" in result.detail
+    assert "total_requests=21000" in result.detail
+    assert "successful_requests=7492" in result.detail
+    assert "failed_requests=13508" in result.detail
+    assert "failure_ratio=0.643238" in result.detail
 
 
 @pytest.mark.benchmark
@@ -1155,6 +1448,111 @@ def test_run_continues_after_failed_case_when_keep_going_enabled(
     blocked = manifest["runtime_blocked_groups"]["MODEL_A/dataset_a/strategy_a"]
     assert blocked["blocked_from_rate"] == 10.0
     assert blocked["reason"] == "case status=failed"
+
+
+@pytest.mark.benchmark
+def test_run_auto_reruns_trend_outlier_case(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_runner_module()
+    launcher = runner.ManualMultinodeRunner(
+        tmp_path,
+        dry_run=False,
+        keep_going=True,
+        auto_rerun_trend_outliers=True,
+        trend_rerun_max_attempts=1,
+        trend_rerun_relative_threshold_pct=5.0,
+        trend_rerun_absolute_threshold_ms=5.0,
+    )
+    monkeypatch.setattr(runner, "build_historical_skip_state",
+                        lambda *_args, **_kwargs: ({}, {}))
+    monkeypatch.setattr(runner, "current_run_tag",
+                        lambda: "20260403-000000")
+    monkeypatch.setattr(runner, "current_iso_timestamp",
+                        lambda: "2026-04-03T00:00:00+08:00")
+    monkeypatch.setattr(launcher, "install_signal_handlers", lambda: None)
+    monkeypatch.setattr(launcher, "restore_signal_handlers", lambda: None)
+
+    executed_cases: list[tuple[str, int]] = []
+    attempts: dict[str, int] = {}
+    metric_by_attempt = {
+        ("group_a_rate10", 1): 40.0,
+        ("group_a_rate20", 1): 90.0,
+        ("group_a_rate20", 2): 45.0,
+        ("group_a_rate30", 1): 50.0,
+    }
+
+    def fake_run_case(case, _run_dir):
+        attempt = attempts.get(case.name, 0) + 1
+        attempts[case.name] = attempt
+        executed_cases.append((case.name, attempt))
+
+        benchmark_dir = tmp_path / f"{case.name}_attempt{attempt}" / "benchmark"
+        benchmark_dir.mkdir(parents=True, exist_ok=True)
+        summary_json = benchmark_dir / "summary.json"
+        summary_json.write_text(
+            json.dumps({"tpot_by_e2e": {
+                "mean": metric_by_attempt[(case.name, attempt)],
+            }}) + "\n",
+            encoding="utf-8",
+        )
+
+        return runner.CaseResult(
+            case_name=case.name,
+            status="ok",
+            exit_code=0,
+            started_at="2026-04-03T00:00:00+08:00",
+            finished_at="2026-04-03T00:10:00+08:00",
+            case_dir=benchmark_dir.parent,
+            benchmark_dir=benchmark_dir,
+            summary_json=summary_json,
+            detail="completed",
+        )
+
+    monkeypatch.setattr(launcher, "run_case", fake_run_case)
+
+    cases = [
+        runner.ExperimentCase(
+            name="group_a_rate10",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=10.0,
+        ),
+        runner.ExperimentCase(
+            name="group_a_rate20",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=20.0,
+        ),
+        runner.ExperimentCase(
+            name="group_a_rate30",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_a",
+            model="model_a",
+            request_rate=30.0,
+        ),
+    ]
+
+    results = launcher.run(cases, run_label="trend_rerun", rate_plan="coarse10")
+
+    assert executed_cases == [
+        ("group_a_rate10", 1),
+        ("group_a_rate20", 1),
+        ("group_a_rate30", 1),
+        ("group_a_rate20", 2),
+    ]
+    assert [result.case_name for result in results] == [
+        "group_a_rate10",
+        "group_a_rate20",
+        "group_a_rate30",
+        "group_a_rate20",
+    ]
+    rerun_metric = runner.load_case_result_summary_metric(results[-1])
+    assert rerun_metric == pytest.approx(45.0)
 
 
 @pytest.mark.benchmark
@@ -1347,11 +1745,11 @@ def test_load_cases_from_csv_skips_disabled_rows_and_preserves_order(
     csv_path.write_text(
         "\n".join([
             ",".join(runner.CASE_CSV_FIELDNAMES),
-            ("1,case_b,cluster_b,model_b,dataset_b,strategy_b,20,manual,"
-             "64,0.9,200,8,4096,29551,planned,ref_b"),
-            ("0,case_skip,cluster_b,model_b,dataset_b,strategy_b,25,manual,"
-             "64,0.9,250,8,4096,29551,planned,ref_skip"),
-            ("1,case_a,cluster_a,model_a,dataset_a,strategy_a,10,,32,0.85,"
+            ("1,case_b,cluster_b,model_b,dataset_b,strategy_b,least_batch,"
+             "20,manual,64,0.9,200,8,4096,29551,planned,ref_b"),
+            ("0,case_skip,cluster_b,model_b,dataset_b,strategy_b,least_cache,"
+             "25,manual,64,0.9,250,8,4096,29551,planned,ref_skip"),
+            ("1,case_a,cluster_a,model_a,dataset_a,strategy_a,,10,,32,0.85,"
              "100,0,,29550,planned,ref_a"),
         ]) + "\n",
         encoding="utf-8",
@@ -1360,6 +1758,7 @@ def test_load_cases_from_csv_skips_disabled_rows_and_preserves_order(
     cases = runner.load_cases_from_csv(csv_path)
 
     assert [case.name for case in cases] == ["case_b", "case_a"]
+    assert cases[0].dispatch_policy == "least_batch"
     assert cases[0].request_rate == pytest.approx(20.0)
     assert cases[0].rate_phase == "manual"
     assert cases[0].max_num_seqs == 64
@@ -1369,6 +1768,7 @@ def test_load_cases_from_csv_skips_disabled_rows_and_preserves_order(
     assert cases[0].max_model_len == 4096
     assert cases[0].data_parallel_rpc_port == 29551
     assert cases[1].rate_phase == runner.DEFAULT_RATE_PLAN
+    assert cases[1].dispatch_policy == runner.DEFAULT_DISPATCH_POLICY
     assert cases[1].warmup_requests == 0
     assert cases[1].max_model_len is None
 
@@ -1464,3 +1864,58 @@ def test_build_historical_skip_state_blocks_higher_rates_after_historical_timeou
     assert runner.block_reason_for_rate(blocked_group_rates, cases[2]) is not None
     assert runner.block_reason_for_rate(blocked_group_rates, cases[1]) is not None
     assert runner.block_reason_for_rate(blocked_group_rates, cases[0]) is None
+
+
+@pytest.mark.benchmark
+def test_build_historical_skip_state_matches_history_with_different_mem(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    artifact_root = tmp_path / "artifacts"
+    historical_case = runner.ExperimentCase(
+        name="group_rate40_old_mem",
+        cluster="cluster_a",
+        strategy="strategy_a",
+        dataset="dataset_a",
+        model="model_a",
+        request_rate=40.0,
+        max_requests=400,
+        max_num_seqs=64,
+        gpu_memory_utilization=0.9,
+        warmup_requests=0,
+    )
+    current_case = runner.ExperimentCase(
+        name="group_rate40_new_mem",
+        cluster="cluster_a",
+        strategy="strategy_a",
+        dataset="dataset_a",
+        model="model_a",
+        request_rate=40.0,
+        max_requests=400,
+        max_num_seqs=64,
+        gpu_memory_utilization=0.87,
+        warmup_requests=0,
+    )
+    history_dir = (runner.case_artifact_group_dir(artifact_root,
+                                                  historical_case) /
+                   "20260403-160000")
+    write_case_benchmark_artifacts(
+        history_dir,
+        manifest_status="ok",
+        summary={
+            "tpot_by_e2e": {
+                "mean": 10.0,
+            },
+        },
+        requests_present=False,
+    )
+
+    exact_case_skips, blocked_group_rates = runner.build_historical_skip_state(
+        artifact_root,
+        [current_case],
+        ignore_bs=False,
+    )
+
+    assert blocked_group_rates == {}
+    assert current_case.name in exact_case_skips
+    assert "matched with different mem" in exact_case_skips[current_case.name]
+    assert "mem90" in exact_case_skips[current_case.name]

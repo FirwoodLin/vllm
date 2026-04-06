@@ -1808,7 +1808,7 @@ class DPEngineCoreProc(EngineCoreProc):
         # finished with DP peers every N steps.
         self.step_counter = 0
         self.current_wave = 0
-        self.last_counts = (0, 0)
+        self.last_lb_snapshot = (0, 0, 0)
 
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
@@ -1885,16 +1885,20 @@ class DPEngineCoreProc(EngineCoreProc):
         else:
             super()._handle_client_request(request_type, request)
 
-    def _maybe_publish_request_counts(self):
+    def _maybe_publish_lb_stats(self):
         if not self.publish_dp_lb_stats:
             return
 
-        # Publish our request counts (if they've changed).
-        counts = self.scheduler.get_request_counts()
-        if counts != self.last_counts:
-            self.last_counts = counts
+        running, waiting = self.scheduler.get_request_counts()
+        lb_snapshot = (running, waiting, self.scheduler.get_num_free_kv_blocks())
+        if lb_snapshot != self.last_lb_snapshot:
+            self.last_lb_snapshot = lb_snapshot
             stats = SchedulerStats(
-                *counts, step_counter=self.step_counter, current_wave=self.current_wave
+                num_running_reqs=running,
+                num_waiting_reqs=waiting,
+                step_counter=self.step_counter,
+                current_wave=self.current_wave,
+                free_kv_blocks=lb_snapshot[2],
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
@@ -1913,7 +1917,7 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.eep_scaling_state = None
 
             executed = self._process_engine_step()
-            self._maybe_publish_request_counts()
+            self._maybe_publish_lb_stats()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
             if not executed:

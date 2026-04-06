@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import multiprocessing
 import queue
-import sys
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -12,6 +11,7 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
+from logging import DEBUG
 from threading import Thread
 from typing import Any, TypeAlias, TypeVar
 
@@ -20,6 +20,7 @@ import zmq
 import zmq.asyncio
 
 from vllm.config import VllmConfig
+from vllm.config.parallel import DataParallelDispatchPolicy
 from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -62,6 +63,10 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
+
+LB_STATS_WAITING_IDX = 0
+LB_STATS_RUNNING_IDX = 1
+LB_STATS_FREE_KV_BLOCKS_IDX = 2
 
 
 class EngineCoreClient(ABC):
@@ -1207,9 +1212,9 @@ class DPAsyncMPClient(AsyncMPClient):
             client_index,
         )
 
-        # List of [waiting, running] pair per engine.
+        # List of [waiting, running, free_kv_blocks] per engine.
         # Used only by DPLBAsyncMPClient subclass.
-        self.lb_engines: list[list[int]] = [[0, 0] for _ in self.core_engines]
+        self.lb_engines: list[list[int]] = [[0, 0, 0] for _ in self.core_engines]
 
         self.eep_scaling_cache: ElasticScalingCache | None = None
 
@@ -1287,7 +1292,7 @@ class DPAsyncMPClient(AsyncMPClient):
                             )
                             if len(self.lb_engines) < new_engine_count:
                                 self.lb_engines = self.lb_engines + [
-                                    [0, 0]
+                                    [0, 0, 0]
                                     for _ in range(
                                         new_engine_count - len(self.lb_engines)
                                     )
@@ -1323,19 +1328,21 @@ class DPAsyncMPClient(AsyncMPClient):
                         continue
 
                     # Update local load-balancing state.
-                    counts, wave, running = msgspec.msgpack.decode(buf)
+                    lb_stats, wave, running = msgspec.msgpack.decode(buf)
                     self.current_wave = wave
                     self.engines_running = running
-                    if counts is not None:
-                        # Running and waiting counts are global from the
+                    if lb_stats is not None:
+                        # Load-balancing stats are global from the
                         # Coordinator including all EngineCores. Slice to get
                         # just the cores managed by this client.
                         ranks = self.engine_ranks_managed
                         count_slice = slice(ranks[0], ranks[-1] + 1)
-                        sliced_counts = counts[count_slice]
-                        self.lb_engines = sliced_counts
+                        sliced_lb_stats = lb_stats[count_slice]
+                        self.lb_engines = sliced_lb_stats
                         logger.debug(
-                            "Received counts: %s (%s)", sliced_counts, count_slice
+                            "Received LB stats: %s (%s)",
+                            sliced_lb_stats,
+                            count_slice,
                         )
 
         resources.stats_update_task = asyncio.create_task(
@@ -1395,6 +1402,34 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
+        dispatch_policy = (
+            self.vllm_config.parallel_config.data_parallel_dispatch_policy
+        )
+        logger.info(
+            "Initialized internal DPLB dispatch_policy=%s client_index=%d "
+            "client_count=%d managed_engines=%d eng_start_index=%d",
+            dispatch_policy,
+            self.client_index,
+            self.client_count,
+            len(self.core_engines),
+            self.eng_start_index,
+        )
+
+    @staticmethod
+    def _lb_sort_key(
+        lb_stats: Sequence[int], policy: DataParallelDispatchPolicy
+    ) -> tuple[int, ...]:
+        waiting = lb_stats[LB_STATS_WAITING_IDX]
+        running = lb_stats[LB_STATS_RUNNING_IDX]
+        free_kv_blocks = lb_stats[LB_STATS_FREE_KV_BLOCKS_IDX]
+
+        if policy == "waiting_x4_plus_running":
+            return (waiting * 4 + running,)
+        if policy == "least_batch":
+            return (running, waiting)
+        if policy == "least_cache":
+            return (-free_kv_blocks, running, waiting)
+        raise ValueError(f"Unknown data parallel dispatch policy: {policy}")
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
@@ -1403,23 +1438,39 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 request.pooling_params, len(self.core_engines)
             )
         ) is None:
-            current_counts = self.lb_engines
+            current_lb_stats = self.lb_engines
+            dispatch_policy = (
+                self.vllm_config.parallel_config.data_parallel_dispatch_policy
+            )
             # TODO use P2C alg for larger DP sizes
-            num_engines = len(current_counts)
-            min_score = sys.maxsize
+            num_engines = len(current_lb_stats)
+            best_key: tuple[int, ...] | None = None
             eng_index = 0
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
-                waiting, running = current_counts[idx]
-                score = waiting * 4 + running
-                if score < min_score:
-                    min_score = score
+                score = self._lb_sort_key(current_lb_stats[idx], dispatch_policy)
+                if best_key is None or score < best_key:
+                    best_key = score
                     eng_index = idx
+            if logger.isEnabledFor(DEBUG):
+                lb_snapshot = [stats.copy() for stats in current_lb_stats]
+                logger.debug(
+                    "DPLB dispatch policy=%s request_id=%s eng_start_index=%d "
+                    "lb_stats=%s chosen_engine_index=%d chosen_stats=%s "
+                    "chosen_sort_key=%s",
+                    dispatch_policy,
+                    request.request_id,
+                    self.eng_start_index,
+                    lb_snapshot,
+                    eng_index,
+                    lb_snapshot[eng_index],
+                    best_key,
+                )
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
-            current_counts[eng_index][0] += self.client_count
+            current_lb_stats[eng_index][LB_STATS_WAITING_IDX] += self.client_count
 
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.

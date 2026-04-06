@@ -85,6 +85,23 @@ def test_template_cases_for_plan_supports_non_default_dataset_and_model() -> Non
 
 
 @pytest.mark.benchmark
+def test_template_cases_for_plan_can_override_dispatch_policy() -> None:
+    planner = load_planner_module()
+
+    cases = planner.template_cases_for_plan(
+        model="deepseek_v3_1024k",
+        dataset="issue05_random",
+        strategies=("dp32", ),
+        rate_plan="coarse10_then_mid5",
+        bench_duration_sec=None,
+        dispatch_policy="least_cache",
+    )
+
+    assert len(cases) == 17
+    assert {case.dispatch_policy for case in cases} == {"least_cache"}
+
+
+@pytest.mark.benchmark
 def test_build_plan_rows_starts_below_first_tpot_threshold_hit(
         tmp_path: Path) -> None:
     runner = load_runner_module()
@@ -124,6 +141,38 @@ def test_build_plan_rows_starts_below_first_tpot_threshold_hit(
     loaded_cases = runner.load_cases_from_csv(csv_path)
     assert [case.request_rate for case in loaded_cases] == [35.0, 30.0, 25.0,
                                                             20.0, 15.0, 10.0]
+    assert {case.dispatch_policy for case in loaded_cases} == {
+        runner.DEFAULT_DISPATCH_POLICY
+    }
+
+
+@pytest.mark.benchmark
+def test_write_plan_csv_preserves_requested_dispatch_policy(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    planner = load_planner_module()
+    artifact_root = tmp_path / "artifacts"
+
+    rows = planner.build_plan_rows(
+        artifact_root=artifact_root,
+        model="kimi_k2_instruct_0905",
+        dataset="issue01_random",
+        strategies=("dp4dcp8", ),
+        rate_plan="coarse10_then_mid5",
+        ignore_bs=True,
+        bench_duration_sec=None,
+        dispatch_policy="least_batch",
+    )
+
+    csv_path = tmp_path / "plan.csv"
+    planner.write_plan_csv(csv_path, rows)
+
+    header = csv_path.read_text(encoding="utf-8").splitlines()[0]
+    assert "dispatch_policy" in header.split(",")
+
+    loaded_cases = runner.load_cases_from_csv(csv_path)
+    assert loaded_cases
+    assert {case.dispatch_policy for case in loaded_cases} == {"least_batch"}
 
 
 @pytest.mark.benchmark

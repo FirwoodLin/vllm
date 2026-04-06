@@ -83,6 +83,7 @@ from vllm.config.multimodal import MMCacheType, MMEncoderTPMode
 from vllm.config.observability import DetailedTraceModules
 from vllm.config.parallel import (
     All2AllBackend,
+    DataParallelDispatchPolicy,
     DataParallelBackend,
     DCPCommBackend,
     DistributedExecutorBackend,
@@ -418,6 +419,9 @@ class EngineArgs:
     data_parallel_hybrid_lb: bool = False
     data_parallel_external_lb: bool = False
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
+    data_parallel_dispatch_policy: DataParallelDispatchPolicy = (
+        ParallelConfig.data_parallel_dispatch_policy
+    )
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     enable_ep_weight_filter: bool = ParallelConfig.enable_ep_weight_filter
     moe_backend: MoEBackend = KernelConfig.moe_backend
@@ -902,6 +906,10 @@ class EngineArgs:
             type=str,
             default="mp",
             help='Backend for data parallel, either "mp" or "ray".',
+        )
+        parallel_group.add_argument(
+            "--data-parallel-dispatch-policy",
+            **parallel_kwargs["data_parallel_dispatch_policy"],
         )
         parallel_group.add_argument(
             "--data-parallel-hybrid-lb",
@@ -1769,6 +1777,7 @@ class EngineArgs:
             data_parallel_master_ip=data_parallel_address,
             data_parallel_rpc_port=data_parallel_rpc_port,
             data_parallel_backend=self.data_parallel_backend,
+            data_parallel_dispatch_policy=self.data_parallel_dispatch_policy,
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
             is_moe_model=model_config.is_moe,
             enable_expert_parallel=self.enable_expert_parallel,

@@ -135,6 +135,7 @@ def _log_frontend_phase(
         "pid": os.getpid(),
         "output_dir": output_dir,
         "request_rate": getattr(args, "request_rate", None),
+        "dispatch_policy": getattr(args, "data_parallel_dispatch_policy", None),
         "measured_requests": (
             measured_requests if measured_requests is not None else "pending"
         ),
@@ -1190,7 +1191,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
                 "ep_enabled": bool(args.enable_expert_parallel),
             },
             "routing_mode": args.routing_mode,
-            "dispatch_policy": "waiting_x4_plus_running",
+            "dispatch_policy": args.data_parallel_dispatch_policy,
             "connector_mode": connector_mode,
             "csv_path": str(Path(args.input_csv).expanduser().resolve()),
             "csv_rows": total_rows,

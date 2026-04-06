@@ -35,6 +35,11 @@ logger = init_logger(__name__)
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
+DataParallelDispatchPolicy = Literal[
+    "waiting_x4_plus_running",
+    "least_cache",
+    "least_batch",
+]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 All2AllBackend = Literal[
@@ -122,6 +127,10 @@ class ParallelConfig:
     """Port of the data parallel master."""
     data_parallel_backend: DataParallelBackend = "mp"
     """Backend to use for data parallel, either "mp" or "ray"."""
+    data_parallel_dispatch_policy: DataParallelDispatchPolicy = (
+        "waiting_x4_plus_running"
+    )
+    """Policy used for internal data-parallel request dispatching."""
     data_parallel_external_lb: bool = False
     """Whether to use "external" DP LB mode. Applies only to online serving
     and when data_parallel_size > 0. This is useful for a "one-pod-per-rank"

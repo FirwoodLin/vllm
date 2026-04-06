@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from collections.abc import Sequence
@@ -14,12 +15,20 @@ from pathlib import Path
 
 
 DEFAULT_MODELS = ("DPSK", "KIMI")
+# Keep this list in sync with benchmarks/manual_multinode_poisson_runner.py.
+MONITORED_FATAL_LOG_PATTERNS: tuple[tuple[str, ...], ...] = (
+    ("AsyncLLM output_handler failed.", ),
+    ("EngineCore encountered a fatal error.", ),
+    ("Worker proc", "died unexpectedly, shutting down executor."),
+    ("EngineDeadError: EngineCore encountered an issue.", ),
+)
 
 
 @dataclass(frozen=True)
 class ArchiveCandidate:
     run_dir: Path
     relative_run_dir: Path
+    reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -34,7 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Move manual_multinode run directories whose benchmark/ folder is "
-            "empty into offline_bench/archive while preserving the relative "
+            "empty, or whose logs/manifest contain monitored fatal errors, "
+            "into offline_bench/archive while preserving the relative "
             "directory structure."
         )
     )
@@ -71,8 +81,56 @@ def is_empty_dir(path: Path) -> bool:
     return not any(path.iterdir())
 
 
+def text_matches_monitored_error(text: str) -> bool:
+    return any(
+        all(part in text for part in required_parts)
+        for required_parts in MONITORED_FATAL_LOG_PATTERNS
+    )
+
+
+def load_manifest_detail(case_dir: Path) -> str:
+    manifest_path = case_dir / "case_manifest.json"
+    if not manifest_path.is_file():
+        return ""
+
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+
+    detail = payload.get("detail")
+    return detail if isinstance(detail, str) else ""
+
+
+def iter_runtime_log_paths(case_dir: Path) -> list[Path]:
+    paths = [case_dir / "frontend.log"]
+    paths.extend(sorted(case_dir.glob("rank*.log")))
+    return [path for path in paths if path.is_file()]
+
+
+def monitored_error_reason(case_dir: Path) -> str | None:
+    detail = load_manifest_detail(case_dir)
+    if detail and text_matches_monitored_error(detail):
+        return "monitored fatal error in case_manifest.json"
+
+    for log_path in iter_runtime_log_paths(case_dir):
+        try:
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if text_matches_monitored_error(content):
+            return f"monitored fatal error in {log_path.name}"
+    return None
+
+
 def iter_candidates(root: Path, models: Sequence[str]) -> list[ArchiveCandidate]:
-    candidates: list[ArchiveCandidate] = []
+    candidate_reasons: dict[Path, list[str]] = {}
+
+    def add_candidate(run_dir: Path, reason: str) -> None:
+        reasons = candidate_reasons.setdefault(run_dir, [])
+        if reason not in reasons:
+            reasons.append(reason)
+
     for model in models:
         model_dir = root / model
         if not model_dir.is_dir():
@@ -83,13 +141,22 @@ def iter_candidates(root: Path, models: Sequence[str]) -> list[ArchiveCandidate]
             if not benchmark_dir.is_dir() or not is_empty_dir(benchmark_dir):
                 continue
             run_dir = benchmark_dir.parent
-            candidates.append(
-                ArchiveCandidate(
-                    run_dir=run_dir,
-                    relative_run_dir=run_dir.relative_to(root),
-                )
-            )
-    return candidates
+            add_candidate(run_dir, "empty benchmark/")
+
+        for manifest_path in sorted(model_dir.rglob("case_manifest.json")):
+            run_dir = manifest_path.parent
+            reason = monitored_error_reason(run_dir)
+            if reason is not None:
+                add_candidate(run_dir, reason)
+
+    return [
+        ArchiveCandidate(
+            run_dir=run_dir,
+            relative_run_dir=run_dir.relative_to(root),
+            reasons=tuple(reasons),
+        )
+        for run_dir, reasons in sorted(candidate_reasons.items())
+    ]
 
 
 def iter_empty_case_candidates(
@@ -133,7 +200,8 @@ def render_plan_line(root: Path, archive_root: Path, candidate: ArchiveCandidate
     ).relative_to(
         archive_root.parent
     )
-    return f"{source} -> {destination}"
+    reasons = ", ".join(candidate.reasons)
+    return f"{source} -> {destination} [{reasons}]"
 
 
 def render_empty_case_plan_line(root: Path, candidate: EmptyCaseCandidate) -> str:
@@ -187,8 +255,8 @@ def main() -> None:
     empty_case_candidates = iter_empty_case_candidates(root=root, models=args.models)
     if not candidates and not empty_case_candidates:
         print(
-            "No run directories found with an empty benchmark/ directory, "
-            "and no empty case directories found."
+            "No run directories found with an empty benchmark/ directory or "
+            "monitored fatal errors, and no empty case directories found."
         )
         return
 
