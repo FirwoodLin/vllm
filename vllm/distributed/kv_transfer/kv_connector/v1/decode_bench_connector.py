@@ -180,6 +180,10 @@ class DecodeBenchConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         self.connector_scheduler.prepare_request_for_external_kv(request)
 
+    def request_local_kv_invalidated(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.request_local_kv_invalidated(request)
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -275,6 +279,11 @@ class DecodeBenchConnectorScheduler:
         # Return False for synchronous operation - the fill is fast enough
         # that async overhead isn't worth it
         return num_tokens_to_fill, False
+
+    def request_local_kv_invalidated(self, request: "Request") -> None:
+        req_id = request.request_id
+        self._filled_requests.discard(req_id)
+        self._pending_fills.pop(req_id, None)
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

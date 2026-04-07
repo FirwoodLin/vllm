@@ -99,6 +99,7 @@ def create_vllm_config(
     hf_overrides: dict[str, Any] | None = None,
     attention_backend: str | None = None,
     kv_load_failure_policy: Literal["recompute", "fail"] = "fail",
+    skip_tokenizer_init: bool = False,
 ) -> VllmConfig:
     """Initialize VllmConfig For Testing."""
     model_config = ModelConfig(
@@ -106,6 +107,7 @@ def create_vllm_config(
         trust_remote_code=True,
         dtype=dtype,
         seed=42,
+        skip_tokenizer_init=skip_tokenizer_init,
         hf_overrides=hf_overrides or {},
     )
     scheduler_config = SchedulerConfig(

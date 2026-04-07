@@ -971,8 +971,11 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
+        if self.connector is not None:
+            self.connector.request_local_kv_invalidated(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.num_external_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1

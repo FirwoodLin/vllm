@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for DecodeBenchConnector."""
 
+import json
+import tempfile
+import time
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -30,6 +35,27 @@ from .utils import (
 pytestmark = pytest.mark.cpu_test
 
 
+def _write_dummy_opt_config(model_dir: Path) -> None:
+    config = {
+        "architectures": ["OPTForCausalLM"],
+        "model_type": "opt",
+        "hidden_size": 16,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "ffn_dim": 64,
+        "vocab_size": 100,
+        "max_position_embeddings": 128,
+        "bos_token_id": 0,
+        "eos_token_id": 2,
+        "word_embed_proj_dim": 16,
+        "do_layer_norm_before": True,
+        "dropout": 0.0,
+        "attention_dropout": 0.0,
+        "activation_function": "relu",
+    }
+    (model_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
 class DecodeBenchTestRunner:
     """Test harness for scheduler/worker DecodeBenchConnector interactions."""
 
@@ -42,10 +68,15 @@ class DecodeBenchTestRunner:
         dummy_output_token_id: int = 0,
     ):
         self.req_id = -1
+        self._model_dir = tempfile.TemporaryDirectory()
+        model_dir = Path(self._model_dir.name)
+        _write_dummy_opt_config(model_dir)
 
         vllm_config = create_vllm_config(
+            model=str(model_dir),
             block_size=block_size,
             max_num_batched_tokens=1000,
+            skip_tokenizer_init=True,
             kv_connector_extra_config={
                 "dummy_prefill": dummy_prefill,
                 "dummy_output_token_id": dummy_output_token_id,
@@ -155,7 +186,7 @@ def test_decode_bench_connector_default_mode_remains_sync():
 
     assert req.status == RequestStatus.RUNNING
     assert req.num_output_tokens == 0
-    assert req.num_computed_tokens == prompt_len - 1
+    assert req.num_computed_tokens == prompt_len
     assert scheduler_output.num_scheduled_tokens[req.request_id] == 1
     assert req.request_id in metadata.reqs_to_fill
     assert metadata.reqs_to_fill[req.request_id][1] == prompt_len - 1
@@ -202,10 +233,76 @@ def test_decode_bench_connector_dummy_prefill_uses_async_full_hit():
     scheduled_req = second_output.scheduled_new_reqs[0]
 
     assert req.status == RequestStatus.RUNNING
-    assert req.num_computed_tokens == prompt_len
+    assert req.num_computed_tokens == prompt_len + 1
     assert req.num_cached_tokens == prompt_len
     assert second_output.num_scheduled_tokens[req.request_id] == 1
     assert scheduled_req.req_id == req.request_id
     assert scheduled_req.num_computed_tokens == prompt_len
     assert scheduled_req.prompt_token_ids == [1] * prompt_len
     assert scheduled_req.output_token_ids == [synthetic_token_id]
+
+
+def test_decode_bench_connector_dummy_prefill_reloads_after_preempt():
+    block_size = 16
+    synthetic_token_id = 7
+    decode_token_id = 11
+    runner = DecodeBenchTestRunner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        dummy_prefill=True,
+        dummy_output_token_id=synthetic_token_id,
+    )
+    prompt_len = block_size * 2
+    req = runner.new_request([1] * prompt_len)
+
+    first_output = runner.scheduler.schedule()
+    _, kv_output = runner.run_connector(first_output)
+    assert kv_output is not None
+
+    model_runner_output = create_model_runner_output(reqs=[])
+    model_runner_output.kv_connector_output = kv_output
+    runner.scheduler.update_from_output(first_output, model_runner_output)
+
+    second_output = runner.scheduler.schedule()
+    runner.scheduler.update_from_output(
+        second_output,
+        create_model_runner_output([req], token_id=decode_token_id),
+    )
+
+    assert req.status == RequestStatus.RUNNING
+    assert req.num_tokens == prompt_len + 2
+    assert req.num_output_tokens == 2
+    assert list(req.output_token_ids) == [synthetic_token_id, decode_token_id]
+
+    runner.scheduler.running.remove(req)
+    runner.scheduler._preempt_request(req, time.time(), reason="unit_test")
+
+    assert req.status == RequestStatus.PREEMPTED
+    assert req.num_computed_tokens == 0
+    assert req.num_external_computed_tokens == 0
+
+    resumed_output = runner.scheduler.schedule()
+    resumed_metadata, resumed_kv_output = runner.run_connector(resumed_output)
+
+    assert resumed_output.total_num_scheduled_tokens == 0
+    assert req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert req.num_tokens == prompt_len + 2
+    assert req.num_output_tokens == 2
+    assert list(req.output_token_ids) == [synthetic_token_id, decode_token_id]
+    assert req.request_id in resumed_metadata.reqs_to_fill
+    assert resumed_metadata.reqs_to_fill[req.request_id][1] == 2
+
+    assert resumed_kv_output is not None
+    assert resumed_kv_output.finished_recving == {req.request_id}
+
+    model_runner_output = create_model_runner_output(reqs=[])
+    model_runner_output.kv_connector_output = resumed_kv_output
+    runner.scheduler.update_from_output(resumed_output, model_runner_output)
+
+    promoted_output = runner.scheduler.schedule()
+
+    assert req.status == RequestStatus.RUNNING
+    assert req.num_computed_tokens == req.num_tokens
+    assert promoted_output.num_scheduled_tokens[req.request_id] == 1
+    assert promoted_output.scheduled_cached_reqs.num_reqs == 1
+    assert promoted_output.scheduled_cached_reqs.req_ids == [req.request_id]

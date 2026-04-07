@@ -456,6 +456,15 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def request_local_kv_invalidated(self, request: "Request") -> None:
+        """
+        Notify the connector that scheduler-side local KV for a live request
+        has been invalidated and may need to be re-declared later.
+
+        The default implementation is a no-op.
+        """
+        return
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,
