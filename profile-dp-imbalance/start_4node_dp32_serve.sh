@@ -62,8 +62,10 @@ OUTPUT_LEN="${OUTPUT_LEN:-64}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.87}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-FLASHMLA}"
+DP_DISPATCH_POLICY="${DP_DISPATCH_POLICY:-waiting_x4_plus_running}"
+# DP_DISPATCH_POLICY="${DP_DISPATCH_POLICY:-least_cache}"
 
 PROFILE_ROOT="${PROFILE_ROOT:-/tmp/profile-dp-imbalance}"
 PROFILE_WINDOW_ITERATIONS="${PROFILE_WINDOW_ITERATIONS:-32}"
@@ -109,6 +111,14 @@ if [[ "${TP_SIZE}" != "1" ]]; then
   exit 2
 fi
 
+if [[ "${DP_DISPATCH_POLICY}" != "waiting_x4_plus_running" && \
+      "${DP_DISPATCH_POLICY}" != "least_cache" && \
+      "${DP_DISPATCH_POLICY}" != "least_batch" ]]; then
+  echo "DP_DISPATCH_POLICY must be one of: waiting_x4_plus_running, least_cache, least_batch." >&2
+  echo "Got DP_DISPATCH_POLICY=${DP_DISPATCH_POLICY}." >&2
+  exit 2
+fi
+
 if [[ -n "${DP_MASTER_PORT}" && "${DP_MASTER_PORT}" != <-> ]]; then
   echo "DP_MASTER_PORT must be an integer, got ${DP_MASTER_PORT}." >&2
   exit 2
@@ -136,6 +146,9 @@ mkdir -p "${PROFILE_DIR}"
 export VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-1}"
 export VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-1800000}"
 export VLLM_MOE_ROUTING_SIMULATION_STRATEGY="${VLLM_MOE_ROUTING_SIMULATION_STRATEGY:-uniform_random}"
+export VLLM_RANDOMIZE_DP_DUMMY_INPUTS="${VLLM_RANDOMIZE_DP_DUMMY_INPUTS:-1}"
+export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+
 
 if [[ -n "${DP_MASTER_PORT}" ]]; then
   export VLLM_DP_MASTER_PORT="${DP_MASTER_PORT}"
@@ -194,6 +207,7 @@ cmd=(
   --no-async-scheduling
   --data-parallel-size "${DP_SIZE}"
   --data-parallel-backend mp
+  --data-parallel-dispatch-policy "${DP_DISPATCH_POLICY}"
   --data-parallel-size-local "${DP_LOCAL_SIZE}"
   --data-parallel-address "${MASTER_ADDR}"
   --data-parallel-rpc-port "${RPC_PORT}"
@@ -245,6 +259,7 @@ echo "  serve_host_resolved: ${serve_host_resolved}"
 echo "  serve_bind: ${serve_bind_hint}"
 echo "  port: ${PORT}"
 echo "  topology: dp=${DP_SIZE} tp=${TP_SIZE} local_dp=${DP_LOCAL_SIZE}"
+echo "  dp_dispatch_policy: ${DP_DISPATCH_POLICY}"
 echo "  attention_backend: ${ATTENTION_BACKEND}"
 echo "  request shape per DP: 63x${SHORT_INPUT_LEN} + 1x${LONG_INPUT_LEN}, output=${OUTPUT_LEN}"
 echo "  profiler_dir: ${PROFILE_DIR}"
