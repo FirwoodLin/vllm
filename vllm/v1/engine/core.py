@@ -1808,7 +1808,7 @@ class DPEngineCoreProc(EngineCoreProc):
         # finished with DP peers every N steps.
         self.step_counter = 0
         self.current_wave = 0
-        self.last_lb_snapshot = (0, 0, 0)
+        self.last_lb_snapshot = (0, 0, 0, 0)
 
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
@@ -1890,15 +1890,18 @@ class DPEngineCoreProc(EngineCoreProc):
             return
 
         running, waiting = self.scheduler.get_request_counts()
-        lb_snapshot = (running, waiting, self.scheduler.get_num_free_kv_blocks())
+        waiting_total_tokens = self.scheduler.waiting_total_tokens
+        free_kv_blocks = self.scheduler.get_num_free_kv_blocks()
+        lb_snapshot = (running, waiting, waiting_total_tokens, free_kv_blocks)
         if lb_snapshot != self.last_lb_snapshot:
             self.last_lb_snapshot = lb_snapshot
             stats = SchedulerStats(
                 num_running_reqs=running,
                 num_waiting_reqs=waiting,
+                waiting_total_tokens=waiting_total_tokens,
                 step_counter=self.step_counter,
                 current_wave=self.current_wave,
-                free_kv_blocks=lb_snapshot[2],
+                free_kv_blocks=free_kv_blocks,
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 

@@ -26,6 +26,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.async_utils import in_loop
 from vllm.utils.network_utils import (
     close_sockets,
@@ -66,7 +67,8 @@ EngineIdentity = bytes
 
 LB_STATS_WAITING_IDX = 0
 LB_STATS_RUNNING_IDX = 1
-LB_STATS_FREE_KV_BLOCKS_IDX = 2
+LB_STATS_WAITING_TOTAL_TOKENS_IDX = 2
+LB_STATS_FREE_KV_BLOCKS_IDX = 3
 
 
 class EngineCoreClient(ABC):
@@ -1212,9 +1214,10 @@ class DPAsyncMPClient(AsyncMPClient):
             client_index,
         )
 
-        # List of [waiting, running, free_kv_blocks] per engine.
+        # List of [waiting, running, waiting_total_tokens, free_kv_blocks]
+        # per engine.
         # Used only by DPLBAsyncMPClient subclass.
-        self.lb_engines: list[list[int]] = [[0, 0, 0] for _ in self.core_engines]
+        self.lb_engines: list[list[int]] = [[0, 0, 0, 0] for _ in self.core_engines]
 
         self.eep_scaling_cache: ElasticScalingCache | None = None
 
@@ -1292,7 +1295,7 @@ class DPAsyncMPClient(AsyncMPClient):
                             )
                             if len(self.lb_engines) < new_engine_count:
                                 self.lb_engines = self.lb_engines + [
-                                    [0, 0, 0]
+                                    [0, 0, 0, 0]
                                     for _ in range(
                                         new_engine_count - len(self.lb_engines)
                                     )
@@ -1417,19 +1420,40 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     @staticmethod
     def _lb_sort_key(
-        lb_stats: Sequence[int], policy: DataParallelDispatchPolicy
+        lb_stats: Sequence[int],
+        policy: DataParallelDispatchPolicy,
+        block_size_tokens: int,
     ) -> tuple[int, ...]:
         waiting = lb_stats[LB_STATS_WAITING_IDX]
         running = lb_stats[LB_STATS_RUNNING_IDX]
+        waiting_total_tokens = lb_stats[LB_STATS_WAITING_TOTAL_TOKENS_IDX]
         free_kv_blocks = lb_stats[LB_STATS_FREE_KV_BLOCKS_IDX]
 
         if policy == "waiting_x4_plus_running":
             return (waiting * 4 + running,)
         if policy == "least_batch":
-            return (running, waiting)
+            return (waiting + running,)
         if policy == "least_cache":
-            return (-free_kv_blocks, running, waiting)
+            free_kv_tokens = free_kv_blocks * block_size_tokens
+            return (waiting_total_tokens - free_kv_tokens,)
         raise ValueError(f"Unknown data parallel dispatch policy: {policy}")
+
+    def _lb_block_size_tokens(self) -> int:
+        block_size = self.vllm_config.cache_config.block_size
+        assert block_size is not None
+        parallel_config = self.vllm_config.parallel_config
+        return (
+            block_size
+            * parallel_config.decode_context_parallel_size
+            * parallel_config.prefill_context_parallel_size
+        )
+
+    @staticmethod
+    def _request_waiting_tokens(request: EngineCoreRequest) -> int:
+        return length_from_prompt_token_ids_or_embeds(
+            request.prompt_token_ids,
+            request.prompt_embeds,
+        )
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
@@ -1442,6 +1466,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             dispatch_policy = (
                 self.vllm_config.parallel_config.data_parallel_dispatch_policy
             )
+            lb_block_size_tokens = self._lb_block_size_tokens()
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_lb_stats)
             best_key: tuple[int, ...] | None = None
@@ -1450,7 +1475,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 # Start from client_index to help with balancing when engines
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
-                score = self._lb_sort_key(current_lb_stats[idx], dispatch_policy)
+                score = self._lb_sort_key(
+                    current_lb_stats[idx],
+                    dispatch_policy,
+                    lb_block_size_tokens,
+                )
                 if best_key is None or score < best_key:
                     best_key = score
                     eng_index = idx
@@ -1471,6 +1500,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_lb_stats[eng_index][LB_STATS_WAITING_IDX] += self.client_count
+            current_lb_stats[eng_index][LB_STATS_WAITING_TOTAL_TOKENS_IDX] += (
+                self._request_waiting_tokens(request) * self.client_count
+            )
 
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.

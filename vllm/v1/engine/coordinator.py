@@ -20,7 +20,8 @@ logger = init_logger(__name__)
 
 LB_STATS_WAITING_IDX = 0
 LB_STATS_RUNNING_IDX = 1
-LB_STATS_FREE_KV_BLOCKS_IDX = 2
+LB_STATS_WAITING_TOTAL_TOKENS_IDX = 2
+LB_STATS_FREE_KV_BLOCKS_IDX = 3
 
 
 class DPCoordinator:
@@ -115,7 +116,8 @@ class DPCoordinator:
 
 class EngineState:
     def __init__(self):
-        self.lb_stats = [0, 0, 0]  # [waiting, running, free_kv_blocks]
+        self.lb_stats = [0, 0, 0, 0]
+        # [waiting, running, waiting_total_tokens, free_kv_blocks]
 
 
 class DPCoordinatorProc:
@@ -361,6 +363,9 @@ class DPCoordinatorProc:
                             )
                         stats[LB_STATS_WAITING_IDX] = scheduler_stats.num_waiting_reqs
                         stats[LB_STATS_RUNNING_IDX] = scheduler_stats.num_running_reqs
+                        stats[LB_STATS_WAITING_TOTAL_TOKENS_IDX] = (
+                            scheduler_stats.waiting_total_tokens
+                        )
                         stats[LB_STATS_FREE_KV_BLOCKS_IDX] = (
                             scheduler_stats.free_kv_blocks
                         )
@@ -417,7 +422,9 @@ class DPCoordinatorProc:
         socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
 
     def _get_engine_lb_stats(self, do_copy=False) -> list[list[int]]:
-        """Return list of [waiting, running, free_kv_blocks] stats."""
+        """Return list of [waiting, running, waiting_total_tokens,
+        free_kv_blocks] stats.
+        """
         if do_copy:
             return [copy.copy(e.lb_stats) for e in self.engines]
         return [e.lb_stats for e in self.engines]
