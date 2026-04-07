@@ -88,7 +88,7 @@ DEFAULT_SHARED_CLI_ARGS = (
     "--trust-remote-code",
 )
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
-DEFAULT_BENCH_TIMEOUT_SEC = 60 * 60
+DEFAULT_BENCH_TIMEOUT_SEC = 45 * 60
 DEFAULT_SWEEP_BENCH_DURATION_SEC = 600.0
 PRESTART_CLEANUP_MAX_ATTEMPTS = 3
 PRESTART_CLEANUP_WAIT_SEC = 10.0
@@ -103,11 +103,6 @@ FATAL_LOG_PATTERNS: tuple[tuple[str, ...], ...] = (
     ("EngineDeadError: EngineCore encountered an issue.", ),
 )
 TPOT_BY_E2E_EARLY_STOP_MS = 100.0
-TREND_RERUN_METRIC_KEY = "tpot_by_e2e"
-TREND_RERUN_SUBMETRIC = "mean"
-DEFAULT_TREND_RERUN_MAX_ATTEMPTS = 1
-DEFAULT_TREND_RERUN_RELATIVE_THRESHOLD_PCT = 12.0
-DEFAULT_TREND_RERUN_ABSOLUTE_THRESHOLD_MS = 8.0
 GPU_KV_CACHE_CAPACITY_LOG_MARKER = "poisson_gpu_kv_cache_capacity "
 RATE_SWEEP_START = 10
 RATE_SWEEP_STOP = 90
@@ -313,20 +308,6 @@ class CaseResult:
     benchmark_dir: Path
     summary_json: Path
     detail: str
-
-
-@dataclass(frozen=True)
-class TrendOutlierCandidate:
-    case: ExperimentCase
-    result: CaseResult
-    lower_case: ExperimentCase
-    lower_result: CaseResult
-    upper_case: ExperimentCase
-    upper_result: CaseResult
-    actual_value: float
-    expected_value: float
-    allowed_delta_ms: float
-    delta_ms: float
 
 
 class BenchTimeoutError(TimeoutError):
@@ -611,13 +592,6 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0.0:
         raise argparse.ArgumentTypeError("Expected a positive float.")
-    return parsed
-
-
-def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("Expected a positive integer.")
     return parsed
 
 
@@ -1658,125 +1632,22 @@ def augment_benchmark_outputs(benchmark_dir: Path) -> None:
 
 
 def extract_summary_tpot_by_e2e_mean(summary: Mapping[str, Any]) -> float | None:
-    return extract_summary_metric_value(summary,
-                                        metric_key=TREND_RERUN_METRIC_KEY,
-                                        submetric=TREND_RERUN_SUBMETRIC)
-
-
-def extract_summary_metric_value(summary: Mapping[str, Any], *,
-                                 metric_key: str,
-                                 submetric: str) -> float | None:
-    metric = summary.get(metric_key)
+    metric = summary.get("tpot_by_e2e")
     if not isinstance(metric, Mapping):
         return None
 
-    raw_value = metric.get(submetric)
-    if raw_value is None:
+    mean_value = metric.get("mean")
+    if mean_value is None:
         return None
 
     try:
-        parsed = float(raw_value)
+        parsed = float(mean_value)
     except (TypeError, ValueError):
         return None
 
     if not math.isfinite(parsed):
         return None
     return parsed
-
-
-def load_case_result_summary_metric(
-    result: CaseResult,
-    *,
-    metric_key: str = TREND_RERUN_METRIC_KEY,
-    submetric: str = TREND_RERUN_SUBMETRIC,
-) -> float | None:
-    try:
-        summary = load_json(result.summary_json)
-    except Exception:
-        return None
-    return extract_summary_metric_value(summary,
-                                        metric_key=metric_key,
-                                        submetric=submetric)
-
-
-def interpolate_case_metric(lower_case: ExperimentCase,
-                            lower_value: float,
-                            upper_case: ExperimentCase,
-                            upper_value: float,
-                            current_case: ExperimentCase) -> float | None:
-    span = upper_case.request_rate - lower_case.request_rate
-    if math.isclose(span, 0.0):
-        return None
-    weight = ((current_case.request_rate - lower_case.request_rate) / span)
-    return lower_value + (upper_value - lower_value) * weight
-
-
-def detect_group_trend_outlier_candidates(
-    group_cases: list[ExperimentCase],
-    latest_results_by_case_name: Mapping[str, CaseResult],
-    *,
-    metric_key: str = TREND_RERUN_METRIC_KEY,
-    submetric: str = TREND_RERUN_SUBMETRIC,
-    relative_threshold_pct: float = DEFAULT_TREND_RERUN_RELATIVE_THRESHOLD_PCT,
-    absolute_threshold_ms: float = DEFAULT_TREND_RERUN_ABSOLUTE_THRESHOLD_MS,
-) -> list[TrendOutlierCandidate]:
-    if len(group_cases) < 3:
-        return []
-
-    ordered_cases = sorted(group_cases, key=lambda case: case.request_rate)
-    successful_points: list[tuple[ExperimentCase, CaseResult, float]] = []
-    for case in ordered_cases:
-        result = latest_results_by_case_name.get(case.name)
-        if result is None or result.status != "ok":
-            continue
-        metric_value = load_case_result_summary_metric(
-            result,
-            metric_key=metric_key,
-            submetric=submetric,
-        )
-        if metric_value is None:
-            continue
-        successful_points.append((case, result, metric_value))
-
-    if len(successful_points) < 3:
-        return []
-
-    candidates: list[TrendOutlierCandidate] = []
-    for index in range(1, len(successful_points) - 1):
-        lower_case, lower_result, lower_value = successful_points[index - 1]
-        current_case, current_result, current_value = successful_points[index]
-        upper_case, upper_result, upper_value = successful_points[index + 1]
-
-        expected_value = interpolate_case_metric(lower_case, lower_value,
-                                                 upper_case, upper_value,
-                                                 current_case)
-        if expected_value is None:
-            continue
-
-        delta_ms = abs(current_value - expected_value)
-        allowed_delta_ms = max(
-            absolute_threshold_ms,
-            abs(expected_value) * (relative_threshold_pct / 100.0),
-        )
-        lower_bound = min(lower_value, upper_value) - allowed_delta_ms
-        upper_bound = max(lower_value, upper_value) + allowed_delta_ms
-        if lower_bound <= current_value <= upper_bound:
-            continue
-
-        candidates.append(
-            TrendOutlierCandidate(
-                case=current_case,
-                result=current_result,
-                lower_case=lower_case,
-                lower_result=lower_result,
-                upper_case=upper_case,
-                upper_result=upper_result,
-                actual_value=current_value,
-                expected_value=expected_value,
-                allowed_delta_ms=allowed_delta_ms,
-                delta_ms=delta_ms,
-            ))
-    return sorted(candidates, key=lambda item: item.delta_ms, reverse=True)
 
 
 def should_stop_followup_rates(result: CaseResult) -> tuple[bool, str | None]:
@@ -2250,7 +2121,6 @@ def write_run_manifest(
     created_at: str,
     dry_run: bool,
     keep_going: bool,
-    ignore_historical_skips: bool,
     historical_skip_ignore_bs: bool,
     rate_plan: str,
     cases: list[str],
@@ -2266,7 +2136,6 @@ def write_run_manifest(
         "created_at": created_at,
         "dry_run": dry_run,
         "keep_going": keep_going,
-        "ignore_historical_skips": ignore_historical_skips,
         "historical_skip_ignore_bs": historical_skip_ignore_bs,
         "rate_plan": rate_plan,
         "cases": cases,
@@ -2514,23 +2383,11 @@ class ManualMultinodeRunner:
 
     def __init__(self, artifact_root: Path, *, dry_run: bool,
                  keep_going: bool = True,
-                 ignore_historical_skips: bool = False,
-                 historical_skip_ignore_bs: bool = True,
-                 auto_rerun_trend_outliers: bool = False,
-                 trend_rerun_max_attempts: int = DEFAULT_TREND_RERUN_MAX_ATTEMPTS,
-                 trend_rerun_relative_threshold_pct: float = DEFAULT_TREND_RERUN_RELATIVE_THRESHOLD_PCT,
-                 trend_rerun_absolute_threshold_ms: float = DEFAULT_TREND_RERUN_ABSOLUTE_THRESHOLD_MS) -> None:
+                 historical_skip_ignore_bs: bool = True) -> None:
         self.artifact_root = artifact_root.expanduser().resolve()
         self.dry_run = dry_run
         self.keep_going = keep_going
-        self.ignore_historical_skips = ignore_historical_skips
         self.historical_skip_ignore_bs = historical_skip_ignore_bs
-        self.auto_rerun_trend_outliers = auto_rerun_trend_outliers
-        self.trend_rerun_max_attempts = trend_rerun_max_attempts
-        self.trend_rerun_relative_threshold_pct = (
-            trend_rerun_relative_threshold_pct)
-        self.trend_rerun_absolute_threshold_ms = (
-            trend_rerun_absolute_threshold_ms)
         self._active_runtime: ActiveCaseRuntime | None = None
         self._previous_handlers: dict[int, Any] = {}
         self._handling_signal = False
@@ -2641,24 +2498,16 @@ class ManualMultinodeRunner:
             created_at=created_at,
             dry_run=self.dry_run,
             keep_going=self.keep_going,
-            ignore_historical_skips=self.ignore_historical_skips,
             historical_skip_ignore_bs=self.historical_skip_ignore_bs,
             rate_plan=rate_plan,
             cases=case_names,
         )
 
         results: list[CaseResult] = []
-        latest_results_by_case_name: dict[str, CaseResult] = {}
-        selected_cases_by_group: dict[str, list[ExperimentCase]] = {}
-        for case in selected_cases:
-            selected_cases_by_group.setdefault(case_group_key(case), []).append(case)
-        exact_case_skips: dict[str, str] = {}
-        historical_blocked_groups: dict[str, tuple[float, str]] = {}
-        if not self.ignore_historical_skips:
-            exact_case_skips, historical_blocked_groups = build_historical_skip_state(
-                self.artifact_root,
-                selected_cases,
-                ignore_bs=self.historical_skip_ignore_bs)
+        exact_case_skips, historical_blocked_groups = build_historical_skip_state(
+            self.artifact_root,
+            selected_cases,
+            ignore_bs=self.historical_skip_ignore_bs)
         runtime_blocked_groups: dict[str, tuple[float, str]] = {}
         aborted: dict[str, Any] | None = None
         self.install_signal_handlers()
@@ -2685,7 +2534,6 @@ class ManualMultinodeRunner:
 
                 result = self.run_case(case, run_dir)
                 results.append(result)
-                latest_results_by_case_name[case.name] = result
                 should_stop, stop_reason = should_stop_followup_rates(result)
                 if should_stop:
                     reason = stop_reason or "blocked by previous case result"
@@ -2697,14 +2545,6 @@ class ManualMultinodeRunner:
                 if (result.status not in {"ok", "dry_run", "timed_out"}
                         and not self.keep_going):
                     break
-
-            if self.auto_rerun_trend_outliers:
-                self.run_trend_outlier_reruns(
-                    selected_cases_by_group,
-                    latest_results_by_case_name,
-                    results,
-                    run_dir,
-                )
         except BaseException as exc:
             aborted = describe_abort(exc)
             raise
@@ -2716,7 +2556,6 @@ class ManualMultinodeRunner:
                 created_at=created_at,
                 dry_run=self.dry_run,
                 keep_going=self.keep_going,
-                ignore_historical_skips=self.ignore_historical_skips,
                 historical_skip_ignore_bs=self.historical_skip_ignore_bs,
                 rate_plan=rate_plan,
                 cases=case_names,
@@ -2942,54 +2781,6 @@ class ManualMultinodeRunner:
             summary_json=artifacts.benchmark_dir / "summary.json",
             detail=detail,
         )
-
-    def run_trend_outlier_reruns(
-        self,
-        selected_cases_by_group: Mapping[str, list[ExperimentCase]],
-        latest_results_by_case_name: dict[str, CaseResult],
-        results: list[CaseResult],
-        run_dir: Path,
-    ) -> None:
-        attempts_by_case_name: dict[str, int] = {}
-
-        while True:
-            pending_candidates: list[TrendOutlierCandidate] = []
-            for group_cases in selected_cases_by_group.values():
-                for candidate in detect_group_trend_outlier_candidates(
-                        group_cases,
-                        latest_results_by_case_name,
-                        relative_threshold_pct=self.
-                        trend_rerun_relative_threshold_pct,
-                        absolute_threshold_ms=self.
-                        trend_rerun_absolute_threshold_ms):
-                    attempts = attempts_by_case_name.get(candidate.case.name, 0)
-                    if attempts >= self.trend_rerun_max_attempts:
-                        continue
-                    pending_candidates.append(candidate)
-
-            if not pending_candidates:
-                return
-
-            candidate = pending_candidates[0]
-            attempts = attempts_by_case_name.get(candidate.case.name, 0) + 1
-            attempts_by_case_name[candidate.case.name] = attempts
-            self.log_case(
-                candidate.case.name,
-                ("trend-outlier rerun "
-                 f"{attempts}/{self.trend_rerun_max_attempts}: "
-                 f"{TREND_RERUN_METRIC_KEY}.{TREND_RERUN_SUBMETRIC}="
-                 f"{candidate.actual_value:.3f}ms, "
-                 f"expected≈{candidate.expected_value:.3f}ms, "
-                 f"allowed_delta={candidate.allowed_delta_ms:.3f}ms, "
-                 f"neighbors=({candidate.lower_case.request_rate:g}, "
-                 f"{candidate.upper_case.request_rate:g})"),
-            )
-            rerun_result = self.run_case(candidate.case, run_dir)
-            results.append(rerun_result)
-            latest_results_by_case_name[candidate.case.name] = rerun_result
-            if rerun_result.status not in {"ok", "dry_run", "timed_out"
-                                           } and not self.keep_going:
-                return
 
     def run_preclean(self, resolved: ResolvedCase,
                      artifacts: ArtifactPaths) -> None:
@@ -3510,41 +3301,6 @@ def build_parser() -> argparse.ArgumentParser:
               "Enabled by default; use --no-historical-skip-ignore-bs to "
               "require exact bs matches."),
     )
-    parser.add_argument(
-        "--ignore-historical-skips",
-        action="store_true",
-        default=False,
-        help=("Ignore all historical skip logic for this run and execute cases "
-              "even when prior failures or successful exact matches exist."),
-    )
-    parser.add_argument(
-        "--auto-rerun-trend-outliers",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=("After the main sweep finishes, detect obvious local trend "
-              "outliers in tpot_by_e2e.mean and rerun those rates."),
-    )
-    parser.add_argument(
-        "--trend-rerun-max-attempts",
-        type=positive_int,
-        default=DEFAULT_TREND_RERUN_MAX_ATTEMPTS,
-        help=("Maximum rerun attempts per suspicious rate when "
-              "--auto-rerun-trend-outliers is enabled."),
-    )
-    parser.add_argument(
-        "--trend-rerun-relative-threshold-pct",
-        type=positive_float,
-        default=DEFAULT_TREND_RERUN_RELATIVE_THRESHOLD_PCT,
-        help=("Relative tolerance around the interpolated local trend used "
-              "to flag rerun candidates."),
-    )
-    parser.add_argument(
-        "--trend-rerun-absolute-threshold-ms",
-        type=positive_float,
-        default=DEFAULT_TREND_RERUN_ABSOLUTE_THRESHOLD_MS,
-        help=("Minimum absolute deviation in milliseconds required to flag "
-              "a local trend outlier."),
-    )
     return parser
 
 
@@ -3576,14 +3332,7 @@ def main(argv: list[str] | None = None) -> None:
         Path(args.artifact_root),
         dry_run=args.dry_run,
         keep_going=args.keep_going,
-        ignore_historical_skips=args.ignore_historical_skips,
         historical_skip_ignore_bs=args.historical_skip_ignore_bs,
-        auto_rerun_trend_outliers=args.auto_rerun_trend_outliers,
-        trend_rerun_max_attempts=args.trend_rerun_max_attempts,
-        trend_rerun_relative_threshold_pct=args.
-        trend_rerun_relative_threshold_pct,
-        trend_rerun_absolute_threshold_ms=args.
-        trend_rerun_absolute_threshold_ms,
     )
     results = runner.run(selected_cases,
                          args.run_label,

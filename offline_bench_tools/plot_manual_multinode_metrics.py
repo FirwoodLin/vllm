@@ -30,10 +30,16 @@ METRIC_SPECS = (
     ("ttft_ms", "ttft_ms", 1000.0),
 )
 SUBMETRICS = ("mean", "p50", "p99")
+DEFAULT_DISPATCH_POLICIES = (
+    "waiting_x4_plus_running",
+    "least_cache",
+)
 CASE_NAME_PATTERN = re.compile(
     r"^(?P<prefix>.+)-rate(?P<rate>\d+(?:\.\d+)?)(?P<suffix>(?:-.+)*)$"
 )
 MEMORY_TAG_PATTERN = re.compile(r"-mem[^-]+")
+BATCH_SIZE_TAG_PATTERN = re.compile(r"-bs[^-]+")
+DISPATCH_TAG_PATTERN = re.compile(r"(?:^|-)dispatch_(?P<policy>[^-]+)")
 MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">")
 
 
@@ -44,6 +50,9 @@ class RunCandidate:
     case_name: str
     timestamp: str
     benchmark_dir: Path
+    group_key: str
+    rate: float
+    dispatch_policy: str
 
 
 @dataclass(frozen=True)
@@ -85,6 +94,24 @@ def parse_args() -> argparse.Namespace:
         default="png",
         help="Output figure format.",
     )
+    parser.add_argument(
+        "--dispatch-policy-filter",
+        nargs="+",
+        default=list(DEFAULT_DISPATCH_POLICIES),
+        help=(
+            "Only plot the specified dispatch policies. "
+            f"Default: {', '.join(DEFAULT_DISPATCH_POLICIES)}. "
+            "Use --dispatch-policy-filter all to disable filtering."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-bs",
+        action="store_true",
+        help=(
+            "Ignore '-bs*' in case names when grouping lines. "
+            "Runs with different bs values will be merged into one series."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -118,7 +145,25 @@ def summarize(values: list[float]) -> dict[str, float]:
     }
 
 
-def iter_run_candidates(root: Path) -> list[RunCandidate]:
+def load_dispatch_policy(
+    benchmark_dir: Path,
+    case_dispatch_policy: str | None,
+) -> str:
+    if case_dispatch_policy:
+        return case_dispatch_policy
+
+    run_meta_path = benchmark_dir / "run_meta.json"
+    if run_meta_path.exists():
+        with run_meta_path.open() as f:
+            payload = json.load(f)
+        dispatch_policy = payload.get("dispatch_policy")
+        if isinstance(dispatch_policy, str) and dispatch_policy:
+            return dispatch_policy
+
+    return DEFAULT_DISPATCH_POLICIES[0]
+
+
+def iter_run_candidates(root: Path, ignore_bs_in_group: bool) -> list[RunCandidate]:
     candidates: list[RunCandidate] = []
     for benchmark_dir in root.glob("*/*/*/*/benchmark"):
         if not benchmark_dir.is_dir():
@@ -129,6 +174,13 @@ def iter_run_candidates(root: Path) -> list[RunCandidate]:
         model, dataset, case_name, timestamp, _ = rel_parts
         if model.startswith("_"):
             continue
+        parsed = parse_case_name(
+            case_name,
+            ignore_bs_in_group=ignore_bs_in_group,
+        )
+        if parsed is None:
+            continue
+        group_key, _, rate, case_dispatch_policy = parsed
         candidates.append(
             RunCandidate(
                 model=model,
@@ -136,21 +188,38 @@ def iter_run_candidates(root: Path) -> list[RunCandidate]:
                 case_name=case_name,
                 timestamp=timestamp,
                 benchmark_dir=benchmark_dir,
+                group_key=group_key,
+                rate=rate,
+                dispatch_policy=load_dispatch_policy(
+                    benchmark_dir,
+                    case_dispatch_policy,
+                ),
             )
         )
     return candidates
 
 
-def parse_case_name(case_name: str) -> tuple[str, str, float] | None:
+def parse_case_name(
+    case_name: str,
+    *,
+    ignore_bs_in_group: bool = False,
+) -> tuple[str, str, float, str | None] | None:
     match = CASE_NAME_PATTERN.match(case_name)
     if match is None:
         return None
     prefix = match.group("prefix")
     suffix = match.group("suffix")
     rate = float(match.group("rate"))
-    group_key = MEMORY_TAG_PATTERN.sub("", f"{prefix}{suffix}")
+    raw_group_key = MEMORY_TAG_PATTERN.sub("", f"{prefix}{suffix}")
+    if ignore_bs_in_group:
+        raw_group_key = BATCH_SIZE_TAG_PATTERN.sub("", raw_group_key)
+    dispatch_match = DISPATCH_TAG_PATTERN.search(raw_group_key)
+    dispatch_policy = (
+        dispatch_match.group("policy") if dispatch_match is not None else None
+    )
+    group_key = DISPATCH_TAG_PATTERN.sub("", raw_group_key).strip("-")
     strategy_name = prefix.split("-", 1)[0]
-    return group_key, strategy_name, rate
+    return group_key, strategy_name, rate, dispatch_policy
 
 
 def load_summary_json(path: Path) -> dict[str, dict[str, float]] | None:
@@ -232,18 +301,27 @@ def load_point_stats(benchmark_dir: Path) -> dict[str, dict[str, float]] | None:
 def collect_plot_data(
     root: Path,
     selected_models: set[str] | None,
+    dispatch_policy_filter: set[str] | None,
+    ignore_bs_in_group: bool,
 ) -> dict[str, dict[str, dict[str, list[SeriesPoint]]]]:
     candidates_by_case: dict[
-        tuple[str, str, str, float], list[RunCandidate]
+        tuple[str, str, str, str, float], list[RunCandidate]
     ] = defaultdict(list)
-    for candidate in iter_run_candidates(root):
+    for candidate in iter_run_candidates(root, ignore_bs_in_group):
         if selected_models is not None and candidate.model not in selected_models:
             continue
-        parsed = parse_case_name(candidate.case_name)
-        if parsed is None:
+        if (
+            dispatch_policy_filter is not None
+            and candidate.dispatch_policy not in dispatch_policy_filter
+        ):
             continue
-        group_key, _, rate = parsed
-        candidate_key = (candidate.model, candidate.dataset, group_key, rate)
+        candidate_key = (
+            candidate.model,
+            candidate.dataset,
+            candidate.group_key,
+            candidate.dispatch_policy,
+            candidate.rate,
+        )
         candidates_by_case[candidate_key].append(candidate)
 
     plot_data: dict[str, dict[str, dict[str, list[SeriesPoint]]]] = defaultdict(
@@ -272,12 +350,13 @@ def collect_plot_data(
         key=lambda item: (item[0].model, item[0].dataset, item[0].case_name,
                           item[0].timestamp),
     ):
-        parsed = parse_case_name(candidate.case_name)
-        if parsed is None:
-            continue
-        group_key, _, rate = parsed
-        plot_data[candidate.model][candidate.dataset][group_key].append(
-            SeriesPoint(rate=rate, stats=stats, source_dir=candidate.benchmark_dir)
+        series_key = make_series_key(candidate.group_key, candidate.dispatch_policy)
+        plot_data[candidate.model][candidate.dataset][series_key].append(
+            SeriesPoint(
+                rate=candidate.rate,
+                stats=stats,
+                source_dir=candidate.benchmark_dir,
+            )
         )
 
     for model_datasets in plot_data.values():
@@ -292,21 +371,39 @@ def strategy_name_from_group_key(group_key: str) -> str:
     return group_key.split("-", 1)[0]
 
 
+def make_series_key(group_key: str, dispatch_policy: str) -> str:
+    return f"{group_key}@@dispatch={dispatch_policy}"
+
+
+def split_series_key(series_key: str) -> tuple[str, str]:
+    group_key, dispatch_policy = series_key.rsplit("@@dispatch=", 1)
+    return group_key, dispatch_policy
+
+
 def build_display_names(
     model_series: dict[str, list[SeriesPoint]],
 ) -> dict[str, str]:
     strategy_to_groups: dict[str, list[str]] = defaultdict(list)
-    for group_key in model_series:
+    strategy_to_policies: dict[str, set[str]] = defaultdict(set)
+    for series_key in model_series:
+        group_key, dispatch_policy = split_series_key(series_key)
         strategy_name = strategy_name_from_group_key(group_key)
-        strategy_to_groups[strategy_name].append(group_key)
+        strategy_to_groups[strategy_name].append(series_key)
+        strategy_to_policies[strategy_name].add(dispatch_policy)
 
     display_names: dict[str, str] = {}
-    for strategy_name, group_keys in strategy_to_groups.items():
-        if len(group_keys) == 1:
-            display_names[group_keys[0]] = strategy_name
-            continue
-        for group_key in group_keys:
-            display_names[group_key] = group_key
+    for strategy_name, series_keys in strategy_to_groups.items():
+        include_dispatch_policy = len(strategy_to_policies[strategy_name]) > 1
+        for series_key in series_keys:
+            group_key, dispatch_policy = split_series_key(series_key)
+            if len(series_keys) == 1:
+                label = strategy_name
+            else:
+                label = group_key
+            if (include_dispatch_policy
+                    or dispatch_policy != DEFAULT_DISPATCH_POLICIES[0]):
+                label = f"{label} [{dispatch_policy}]"
+            display_names[series_key] = label
     return display_names
 
 
@@ -346,10 +443,12 @@ def render_dataset_figure(
         y=0.98,
     )
 
-    for strategy_index, group_key in enumerate(sorted(dataset_series)):
-        points = dataset_series[group_key]
+    for strategy_index, series_key in enumerate(
+        sorted(dataset_series, key=split_series_key)
+    ):
+        points = dataset_series[series_key]
         marker = MARKERS[strategy_index % len(MARKERS)]
-        label = display_names[group_key]
+        label = display_names[series_key]
 
         for row_index, (metric_key, metric_title, y_max) in enumerate(METRIC_SPECS):
             for col_index, submetric in enumerate(SUBMETRICS):
@@ -402,11 +501,21 @@ def main() -> None:
     root = args.root.resolve()
     output_dir = args.output_dir.resolve()
     selected_models = set(args.models) if args.models else None
+    dispatch_policy_filter = (
+        None
+        if "all" in args.dispatch_policy_filter
+        else set(args.dispatch_policy_filter)
+    )
 
     if not root.exists():
         raise FileNotFoundError(f"root directory does not exist: {root}")
 
-    plot_data = collect_plot_data(root, selected_models)
+    plot_data = collect_plot_data(
+        root,
+        selected_models,
+        dispatch_policy_filter,
+        ignore_bs_in_group=args.ignore_bs,
+    )
     if not plot_data:
         raise RuntimeError(f"no usable benchmark data found under: {root}")
 
