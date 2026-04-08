@@ -128,10 +128,26 @@ cd "${REPO_ROOT}"
 #   --artifact-root "${ARTIFACT_ROOT}" \
 #   --case-csv benchmarks/plans-unfinished/0408/dpsk_issue05random_dp32_dp16cp2_rate20_22p5.csv
 
-python3 benchmarks/manual_multinode_poisson_runner.py \
-  --artifact-root "${ARTIFACT_ROOT}" \
-  --case-csv benchmarks/plans-unfinished/0408/dpsk_issue03random_dp32_dp16cp2_rate17p5_20_22p5_25_27p5.csv
+# python3 benchmarks/manual_multinode_poisson_runner.py \
+#   --artifact-root "${ARTIFACT_ROOT}" \
+#   --case-csv benchmarks/plans-unfinished/0408/dpsk_issue03random_dp32_dp16cp2_rate17p5_20_22p5_25_27p5.csv
+
+# python3 benchmarks/manual_multinode_poisson_runner.py \
+#   --artifact-root "${ARTIFACT_ROOT}" \
+#   --case-csv benchmarks/plans-unfinished/0408/dpsk_short_random_dp8dcp4_dp16cp2_dp32_custom_bs_rate80_100_120_160_180.csv
 
 python3 benchmarks/manual_multinode_poisson_runner.py \
   --artifact-root "${ARTIFACT_ROOT}" \
-  --case-csv benchmarks/plans-unfinished/0408/dpsk_short_random_dp8dcp4_dp16cp2_dp32_custom_bs_rate80_100_120_160_180.csv
+  --case-csv benchmarks/plans-unfinished/0408/kimi_issue03random_dp32_waiting_x4_plus_running_step5_5_to30.csv
+
+python3 benchmarks/manual_multinode_poisson_runner.py \
+  --artifact-root "${ARTIFACT_ROOT}" \
+  --case-csv benchmarks/plans-unfinished/0408/kimi_issue03random_dp32_waiting_x4_plus_running_step2p5_2p5_to30.csv
+
+python3 benchmarks/manual_multinode_poisson_runner.py \
+  --artifact-root "${ARTIFACT_ROOT}" \
+  --case-csv benchmarks/plans-unfinished/0408/kimi_issue03random_dp16cp2_dp8dcp4_dp4dcp8_waiting_x4_plus_running_step5_5_to30.csv
+
+python3 benchmarks/manual_multinode_poisson_runner.py \
+  --artifact-root "${ARTIFACT_ROOT}" \
+  --case-csv benchmarks/plans-unfinished/0408/kimi_issue03random_dp16cp2_dp4dcp8_dp8dcp4_waiting_x4_plus_running_step2p5_2p5_to30.csv
