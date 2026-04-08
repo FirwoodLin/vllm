@@ -148,6 +148,13 @@ def test_build_parser_keeps_going_by_default() -> None:
 
     assert parser.parse_args(["--list"]).keep_going is True
     assert parser.parse_args(["--list", "--no-keep-going"]).keep_going is False
+    parsed = parser.parse_args([
+        "--list",
+        "--frontend-extra-arg=--profile-after-warmup",
+        "--headless-extra-arg=--profiler-config.profiler",
+    ])
+    assert parsed.frontend_extra_arg == ["--profile-after-warmup"]
+    assert parsed.headless_extra_arg == ["--profiler-config.profiler"]
 
 
 @pytest.mark.benchmark
@@ -257,6 +264,96 @@ def test_build_frontend_and_headless_argv_include_required_flags(
     assert "least_cache" in frontend_argv
     assert "--input-csv" not in headless_argv
     assert "--request-rate" not in headless_argv
+
+
+@pytest.mark.benchmark
+def test_apply_extra_argv_overrides_appends_runner_cli_overrides() -> None:
+    runner = load_runner_module()
+    cases = [
+        runner.ExperimentCase(
+            name="case_a",
+            cluster="4node_h200",
+            strategy="dp32",
+            dataset="issue01_random",
+            model="deepseek_v3_1024k",
+            frontend_extra_args=("--existing-frontend", ),
+            headless_extra_args=("--existing-headless", ),
+        )
+    ]
+
+    updated = runner.apply_extra_argv_overrides(
+        cases,
+        frontend_extra_args=("--profile-after-warmup", ),
+        headless_extra_args=("--profiler-config.profiler", "torch"),
+    )
+
+    assert updated[0].frontend_extra_args == (
+        "--existing-frontend",
+        "--profile-after-warmup",
+    )
+    assert updated[0].headless_extra_args == (
+        "--existing-headless",
+        "--profiler-config.profiler",
+        "torch",
+    )
+
+
+@pytest.mark.benchmark
+def test_build_argv_expands_benchmark_dir_placeholder(tmp_path: Path) -> None:
+    runner = load_runner_module()
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="case_a",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=100.0,
+            frontend_extra_args=(
+                "--profiler-config.torch_profiler_dir",
+                "{benchmark_dir}/torch_profiler",
+            ),
+            headless_extra_args=(
+                "--profiler-config.torch_profiler_dir",
+                "{benchmark_dir}/torch_profiler",
+            ),
+        ),
+        clusters={
+            "cluster_a":
+            runner.ClusterSpec(
+                master_addr="10.0.0.1",
+                master_port=29579,
+                remote_hosts=("node-a", ),
+            ),
+        },
+        strategies={
+            "strategy_a":
+            runner.StrategySpec(
+                data_parallel_size=16,
+                data_parallel_size_local=8,
+                tensor_parallel_size=1,
+            ),
+        },
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    frontend_argv = runner.build_frontend_argv(resolved, output_dir)
+    headless_argv = runner.build_headless_argv(
+        resolved,
+        node_rank=1,
+        benchmark_dir=output_dir,
+    )
+
+    profiler_dir = f"{output_dir}/torch_profiler"
+    assert profiler_dir in frontend_argv
+    assert profiler_dir in headless_argv
 
 
 @pytest.mark.benchmark

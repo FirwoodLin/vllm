@@ -14,6 +14,9 @@ from vllm.benchmarks.offline_poisson_harness import (
     _compute_pre_forward_ttft_ms,
     _enforce_harness_observability,
     _request_clean_cluster_shutdown,
+    _resolve_profile_prefix,
+    _start_frontend_profile_if_requested,
+    _stop_frontend_profile,
     _shutdown_frontend_async_llm,
     _submit_one_request,
     build_success_record,
@@ -742,3 +745,103 @@ def test_shutdown_frontend_async_llm_uses_forced_cleanup_after_timeout(
     assert "phase=clean_cluster_shutdown_fallback" in joined
     assert "phase=async_llm_shutdown_start" in joined
     assert "timeout_s=0.000" in joined
+
+
+@pytest.mark.benchmark
+def test_resolve_profile_prefix_defaults_to_output_dir_name(tmp_path: Path) -> None:
+    args = Namespace(profile_prefix=None)
+    output_dir = tmp_path / "case_a"
+
+    assert _resolve_profile_prefix(args, output_dir) == "case_a"
+
+
+@pytest.mark.benchmark
+def test_start_frontend_profile_if_requested_uses_default_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _AsyncLLM:
+        def __init__(self) -> None:
+            self.prefixes: list[str | None] = []
+
+        async def start_profile(self, profile_prefix: str | None = None) -> None:
+            self.prefixes.append(profile_prefix)
+
+    args = Namespace(
+        profile_after_warmup=True,
+        profile_prefix=None,
+        request_rate=40.0,
+        data_parallel_dispatch_policy="waiting_x4_plus_running",
+        data_parallel_size=32,
+        data_parallel_size_local=8,
+        save_merged_parquet=False,
+    )
+    async_llm = _AsyncLLM()
+    messages: list[str] = []
+    monkeypatch.setattr(
+        harness_mod.logger,
+        "info",
+        lambda message, *args, **_kwargs: messages.append(
+            message % args if args else message),
+    )
+
+    profile_prefix = asyncio.run(
+        _start_frontend_profile_if_requested(
+            async_llm,
+            args=args,
+            output_dir=tmp_path / "case_a",
+            frontend_started_at_s=0.0,
+            measured_requests=256,
+        ))
+
+    joined = "\n".join(messages)
+    assert profile_prefix == "case_a"
+    assert async_llm.prefixes == ["case_a"]
+    assert "phase=profile_start_start" in joined
+    assert "phase=profile_start_done" in joined
+    assert "profile_prefix=case_a" in joined
+
+
+@pytest.mark.benchmark
+def test_stop_frontend_profile_logs_stop_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _AsyncLLM:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        async def stop_profile(self) -> None:
+            self.stop_calls += 1
+
+    args = Namespace(
+        request_rate=40.0,
+        data_parallel_dispatch_policy="waiting_x4_plus_running",
+        data_parallel_size=32,
+        data_parallel_size_local=8,
+        save_merged_parquet=False,
+    )
+    async_llm = _AsyncLLM()
+    messages: list[str] = []
+    monkeypatch.setattr(
+        harness_mod.logger,
+        "info",
+        lambda message, *args, **_kwargs: messages.append(
+            message % args if args else message),
+    )
+
+    asyncio.run(
+        _stop_frontend_profile(
+            async_llm,
+            args=args,
+            output_dir=tmp_path / "case_a",
+            frontend_started_at_s=0.0,
+            measured_requests=256,
+            profile_prefix="case_a",
+        ))
+
+    joined = "\n".join(messages)
+    assert async_llm.stop_calls == 1
+    assert "phase=profile_stop_start" in joined
+    assert "phase=profile_stop_done" in joined
+    assert "profile_prefix=case_a" in joined

@@ -88,7 +88,7 @@ DEFAULT_SHARED_CLI_ARGS = (
     "--trust-remote-code",
 )
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
-DEFAULT_BENCH_TIMEOUT_SEC = 60 * 60
+DEFAULT_BENCH_TIMEOUT_SEC = 45 * 60
 DEFAULT_SWEEP_BENCH_DURATION_SEC = 600.0
 PRESTART_CLEANUP_MAX_ATTEMPTS = 3
 PRESTART_CLEANUP_WAIT_SEC = 10.0
@@ -1068,6 +1068,41 @@ def effective_max_num_batched_tokens(resolved: ResolvedCase) -> int | None:
     return resolved.strategy.max_num_batched_tokens
 
 
+def expand_command_arg_templates(
+    extra_args: tuple[str, ...],
+    *,
+    benchmark_dir: Path | None = None,
+) -> tuple[str, ...]:
+    if benchmark_dir is None:
+        return extra_args
+
+    benchmark_dir_text = str(benchmark_dir)
+    return tuple(
+        arg.replace("{benchmark_dir}", benchmark_dir_text)
+        for arg in extra_args
+    )
+
+
+def apply_extra_argv_overrides(
+    cases: list[ExperimentCase],
+    *,
+    frontend_extra_args: tuple[str, ...] = (),
+    headless_extra_args: tuple[str, ...] = (),
+) -> list[ExperimentCase]:
+    if not frontend_extra_args and not headless_extra_args:
+        return cases
+
+    return [
+        replace(
+            case,
+            frontend_extra_args=case.frontend_extra_args +
+            frontend_extra_args,
+            headless_extra_args=case.headless_extra_args +
+            headless_extra_args,
+        ) for case in cases
+    ]
+
+
 def build_common_harness_argv(
     resolved: ResolvedCase,
     *,
@@ -1156,17 +1191,29 @@ def build_frontend_argv(resolved: ResolvedCase, output_dir: Path) -> list[str]:
     if resolved.case.save_merged_parquet:
         argv.append("--save-merged-parquet")
 
-    argv.extend(resolved.case.frontend_extra_args)
+    argv.extend(
+        expand_command_arg_templates(
+            resolved.case.frontend_extra_args,
+            benchmark_dir=output_dir,
+        ))
     return argv
 
 
-def build_headless_argv(resolved: ResolvedCase, node_rank: int) -> list[str]:
+def build_headless_argv(
+    resolved: ResolvedCase,
+    node_rank: int,
+    benchmark_dir: Path | None = None,
+) -> list[str]:
     argv = build_common_harness_argv(
         resolved,
         role="headless-engine",
         node_rank=node_rank,
     )
-    argv.extend(resolved.case.headless_extra_args)
+    argv.extend(
+        expand_command_arg_templates(
+            resolved.case.headless_extra_args,
+            benchmark_dir=benchmark_dir,
+        ))
     return argv
 
 
@@ -1331,7 +1378,11 @@ def build_remote_launch_command(
 ) -> str:
     return build_runtime_shell_command(
         cwd=resolved.cluster.workdir,
-        argv=build_headless_argv(resolved, node_rank),
+        argv=build_headless_argv(
+            resolved,
+            node_rank,
+            benchmark_dir=artifacts.benchmark_dir,
+        ),
         env=collect_role_env(resolved, role="headless-engine"),
         env_script=resolved.cluster.remote_env_script,
         log_path=artifacts.rank_log_paths[node_rank],
@@ -3495,6 +3546,28 @@ def build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         help="Write commands and manifests without execution.")
     parser.add_argument(
+        "--frontend-extra-arg",
+        action="append",
+        default=[],
+        metavar="TOKEN",
+        help=(
+            "Append one extra argv token to every frontend harness command. "
+            "Repeat as --frontend-extra-arg=TOKEN for flags and their values "
+            "separately. Supports the {benchmark_dir} placeholder."
+        ),
+    )
+    parser.add_argument(
+        "--headless-extra-arg",
+        action="append",
+        default=[],
+        metavar="TOKEN",
+        help=(
+            "Append one extra argv token to every headless-engine harness "
+            "command. Repeat as --headless-extra-arg=TOKEN for flags and "
+            "their values separately. Supports the {benchmark_dir} placeholder."
+        ),
+    )
+    parser.add_argument(
         "--keep-going",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3563,6 +3636,11 @@ def main(argv: list[str] | None = None) -> None:
     selected_cases = apply_bench_duration_override(
         select_cases(args, experiments),
         args.bench_duration_sec,
+    )
+    selected_cases = apply_extra_argv_overrides(
+        selected_cases,
+        frontend_extra_args=tuple(args.frontend_extra_arg),
+        headless_extra_args=tuple(args.headless_extra_arg),
     )
 
     if args.list:

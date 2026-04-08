@@ -207,6 +207,76 @@ def _log_gpu_kv_cache_capacity(
                 _format_frontend_log_fields(fields))
 
 
+def _resolve_profile_prefix(
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> str:
+    explicit_prefix = getattr(args, "profile_prefix", None)
+    if explicit_prefix:
+        return explicit_prefix
+    return output_dir.name
+
+
+async def _start_frontend_profile_if_requested(
+    async_llm: Any,
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    frontend_started_at_s: float,
+    measured_requests: int | None,
+) -> str | None:
+    if not getattr(args, "profile_after_warmup", False):
+        return None
+
+    profile_prefix = _resolve_profile_prefix(args, output_dir)
+    _log_frontend_phase(
+        "profile_start_start",
+        args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
+        measured_requests=measured_requests,
+        extra_fields={"profile_prefix": profile_prefix},
+    )
+    await async_llm.start_profile(profile_prefix=profile_prefix)
+    _log_frontend_phase(
+        "profile_start_done",
+        args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
+        measured_requests=measured_requests,
+        extra_fields={"profile_prefix": profile_prefix},
+    )
+    return profile_prefix
+
+
+async def _stop_frontend_profile(
+    async_llm: Any,
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    frontend_started_at_s: float,
+    measured_requests: int | None,
+    profile_prefix: str,
+) -> None:
+    _log_frontend_phase(
+        "profile_stop_start",
+        args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
+        measured_requests=measured_requests,
+        extra_fields={"profile_prefix": profile_prefix},
+    )
+    await async_llm.stop_profile()
+    _log_frontend_phase(
+        "profile_stop_done",
+        args=args,
+        output_dir=output_dir,
+        frontend_started_at_s=frontend_started_at_s,
+        measured_requests=measured_requests,
+        extra_fields={"profile_prefix": profile_prefix},
+    )
+
+
 def _jsonify(value: Any) -> Any:
     if is_dataclass(value):
         return _jsonify(asdict(value))
@@ -1108,6 +1178,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
 
     async_llm: Any | None = None
     measured_requests_count: int | None = None
+    active_profile_prefix: str | None = None
     summary_written = False
     parquet_written = False
     recorder = RunRecorder(
@@ -1223,6 +1294,13 @@ async def run_frontend(args: argparse.Namespace) -> None:
             measured_requests=measured_requests_count,
             extra_fields={"warmup_requests": len(warmup_requests)},
         )
+        active_profile_prefix = await _start_frontend_profile_if_requested(
+            async_llm,
+            args=args,
+            output_dir=output_dir,
+            frontend_started_at_s=frontend_started_at_s,
+            measured_requests=measured_requests_count,
+        )
 
         arrival_deadlines_ns = build_poisson_arrival_deadlines_ns(
             num_requests=len(measured_requests),
@@ -1314,6 +1392,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
             )
     finally:
         active_exception = sys.exc_info()[1]
+        profile_stop_exception: BaseException | None = None
         _log_frontend_phase(
             "teardown_enter",
             args=args,
@@ -1324,6 +1403,36 @@ async def run_frontend(args: argparse.Namespace) -> None:
             parquet_written=parquet_written,
             exception=active_exception,
         )
+        if async_llm is not None and active_profile_prefix is not None:
+            try:
+                await _stop_frontend_profile(
+                    async_llm,
+                    args=args,
+                    output_dir=output_dir,
+                    frontend_started_at_s=frontend_started_at_s,
+                    measured_requests=measured_requests_count,
+                    profile_prefix=active_profile_prefix,
+                )
+            except Exception as exc:
+                profile_stop_exception = exc
+                _log_frontend_phase(
+                    "profile_stop_failed",
+                    args=args,
+                    output_dir=output_dir,
+                    frontend_started_at_s=frontend_started_at_s,
+                    measured_requests=measured_requests_count,
+                    summary_written=summary_written,
+                    parquet_written=parquet_written,
+                    exception=exc,
+                    extra_fields={"profile_prefix": active_profile_prefix},
+                )
+                if active_exception is not None:
+                    logger.warning(
+                        "Failed to stop the measured-phase profiler during "
+                        "frontend teardown.",
+                        exc_info=True,
+                    )
+        effective_exception = active_exception or profile_stop_exception
         _log_frontend_phase(
             "recorder_close_start",
             args=args,
@@ -1361,8 +1470,10 @@ async def run_frontend(args: argparse.Namespace) -> None:
             measured_requests=measured_requests_count,
             summary_written=summary_written,
             parquet_written=parquet_written,
-            exception=active_exception,
+            exception=effective_exception,
         )
+        if active_exception is None and profile_stop_exception is not None:
+            raise profile_stop_exception
 
 
 def run_headless_engine(args: argparse.Namespace) -> None:
@@ -1505,6 +1616,23 @@ def build_parser() -> FlexibleArgumentParser:
         "--request-id-prefix",
         default=None,
         help="Request id prefix. Default: r<seed>-",
+    )
+    frontend.add_argument(
+        "--profile-after-warmup",
+        action="store_true",
+        help=(
+            "Call AsyncLLM.start_profile() after warmup completes and stop the "
+            "profiler during frontend teardown. Requires profiler-config "
+            "flags to be set."
+        ),
+    )
+    frontend.add_argument(
+        "--profile-prefix",
+        default=None,
+        help=(
+            "Optional prefix passed to AsyncLLM.start_profile(). Defaults to "
+            "the output directory name."
+        ),
     )
     frontend.add_argument(
         "--routing-mode",
