@@ -28,6 +28,7 @@ ENGINE_STATS_RE = re.compile(
     r"Engine\s+(\d+):.*?Running:\s+(\d+)\s+reqs.*?"
     r"(?:GPU KV cache usage:\s+([0-9.]+)%|Free KV blocks:\s+(\d+))"
 )
+TIME_POSITION_PCTS = (25, 50, 60, 66, 75)
 
 
 @dataclass(frozen=True)
@@ -46,7 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Parse frontend.log and plot per-engine rank bar charts at "
-            "25% / 50% / 75% time positions for Running and GPU KV usage."
+            "25% / 50% / 60% / 66% / 75% time positions for Running and "
+            "GPU KV usage."
         )
     )
     parser.add_argument(
@@ -176,10 +178,9 @@ def parse_frontend_snapshots(
 def quartile_step_indices(num_steps: int) -> list[tuple[int, int]]:
     if num_steps <= 0:
         raise ValueError("num_steps must be > 0")
-    percentiles = (25, 50, 75)
     return [
         (pct, int(round((num_steps - 1) * (pct / 100.0))))
-        for pct in percentiles
+        for pct in TIME_POSITION_PCTS
     ]
 
 
@@ -200,8 +201,17 @@ def plot_metric_quartiles(
     rank_ids = np.arange(num_ranks)
     target_steps = quartile_step_indices(num_steps)
 
-    fig, axes = plt.subplots(1, 3, figsize=(21, 5.5), sharey=True, constrained_layout=True)
-    fig.suptitle(f"{metric_name} @ 25% / 50% / 75% Time Position", fontsize=14)
+    fig, axes = plt.subplots(
+        1,
+        len(target_steps),
+        figsize=(7 * len(target_steps), 5.5),
+        sharey=True,
+        constrained_layout=True,
+    )
+    fig.suptitle(
+        f"{metric_name} @ {' / '.join(f'{pct}%' for pct in TIME_POSITION_PCTS)} Time Position",
+        fontsize=14,
+    )
 
     bar_color = "#4C78A8"
     mean_color = "#E45756"
