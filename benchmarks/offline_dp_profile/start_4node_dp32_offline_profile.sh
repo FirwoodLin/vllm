@@ -14,6 +14,7 @@ REQUEST_RATE=""
 DISPATCH_POLICY=""
 CASE_NAME=""
 PROFILE_DELAY_ITERATIONS=33
+PAUSE_BEFORE_PROFILE=0
 
 function usage() {
   cat <<'EOF'
@@ -26,11 +27,12 @@ Options:
   --lens-json PATH
   --output-len N
   --warmup-requests N
-  --max-requests N
+  --max-requests N|csv_rows
   --request-rate FLOAT
   --dispatch-policy waiting_x4_plus_running|least_cache|least_batch
   --case-name NAME
   --profile-delay-iterations N   # default: 33
+  --pause-before-profile
   -h, --help
 
 When --lens-json is set, the script first converts the nested JSON input lengths
@@ -81,6 +83,10 @@ while (( $# > 0 )); do
       PROFILE_DELAY_ITERATIONS="$2"
       shift 2
       ;;
+    --pause-before-profile)
+      PAUSE_BEFORE_PROFILE=1
+      shift 1
+      ;;
     -h|--help)
       usage
       exit 0
@@ -127,24 +133,34 @@ if [[ -n "${LENS_JSON}" ]]; then
   RUN_CASE_CSV="${PREPARED_DIR}/custom_lens.casecsv"
 fi
 
+FRONTEND_EXTRA_ARGS=(
+  --frontend-extra-arg=--profile-after-warmup
+  --frontend-extra-arg=--no-async-scheduling
+  --frontend-extra-arg=--profiler-config.profiler
+  --frontend-extra-arg=torch
+  --frontend-extra-arg=--profiler-config.torch_profiler_dir
+  --frontend-extra-arg='{benchmark_dir}/torch_profiler'
+  --frontend-extra-arg=--profiler-config.ignore_frontend
+  --frontend-extra-arg=true
+  --frontend-extra-arg=--profiler-config.delay_iterations
+  --frontend-extra-arg="${PROFILE_DELAY_ITERATIONS}"
+  --frontend-extra-arg=--profiler-config.max_iterations
+  --frontend-extra-arg=31
+  --frontend-extra-arg=--profiler-config.wait_iterations
+  --frontend-extra-arg=0
+  --frontend-extra-arg=--profiler-config.warmup_iterations
+  --frontend-extra-arg=0
+)
+
+if [[ "${PAUSE_BEFORE_PROFILE}" == "1" ]]; then
+  FRONTEND_EXTRA_ARGS+=(--frontend-extra-arg=--pause-before-profile)
+fi
+
 python3 benchmarks/manual_multinode_poisson_runner.py \
   --artifact-root "${ARTIFACT_ROOT}" \
   --case-csv "${RUN_CASE_CSV}" \
-  --frontend-extra-arg=--profile-after-warmup \
-  --frontend-extra-arg=--profiler-config.profiler \
-  --frontend-extra-arg=torch \
-  --frontend-extra-arg=--profiler-config.torch_profiler_dir \
-  --frontend-extra-arg='{benchmark_dir}/torch_profiler' \
-  --frontend-extra-arg=--profiler-config.ignore_frontend \
-  --frontend-extra-arg=true \
-  --frontend-extra-arg=--profiler-config.delay_iterations \
-  --frontend-extra-arg="${PROFILE_DELAY_ITERATIONS}" \
-  --frontend-extra-arg=--profiler-config.max_iterations \
-  --frontend-extra-arg=31 \
-  --frontend-extra-arg=--profiler-config.wait_iterations \
-  --frontend-extra-arg=0 \
-  --frontend-extra-arg=--profiler-config.warmup_iterations \
-  --frontend-extra-arg=0 \
+  "${FRONTEND_EXTRA_ARGS[@]}" \
+  --headless-extra-arg=--no-async-scheduling \
   --headless-extra-arg=--profiler-config.profiler \
   --headless-extra-arg=torch \
   --headless-extra-arg=--profiler-config.torch_profiler_dir \

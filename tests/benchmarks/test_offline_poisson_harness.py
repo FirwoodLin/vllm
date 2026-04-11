@@ -10,6 +10,7 @@ import pytest
 import vllm.benchmarks.offline_poisson_harness as harness_mod
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.benchmarks.offline_poisson_harness import (
+    MAX_REQUESTS_CSV_ROWS,
     _apply_benchmark_arg_defaults,
     _compute_pre_forward_ttft_ms,
     _enforce_harness_observability,
@@ -26,6 +27,7 @@ from vllm.benchmarks.offline_poisson_harness import (
     default_cudagraph_capture_sizes,
     load_length_requests,
     resolve_csv_repeat,
+    resolve_max_requests_against_csv,
     split_warmup_and_measured_requests,
 )
 from vllm.benchmarks.datasets import SampleRequest
@@ -126,6 +128,14 @@ def test_resolve_csv_repeat_prefers_explicit_override() -> None:
         max_requests=9000,
         csv_repeat=400,
     ) == 400
+
+
+@pytest.mark.benchmark
+def test_resolve_max_requests_against_csv_rows() -> None:
+    assert resolve_max_requests_against_csv(
+        total_rows=2353,
+        max_requests=MAX_REQUESTS_CSV_ROWS,
+    ) == 2353
 
 
 @pytest.mark.benchmark

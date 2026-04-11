@@ -3,15 +3,28 @@
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
+from typing import Literal
+
+BENCHMARKS_DIR = Path(__file__).resolve().parents[1]
+if str(BENCHMARKS_DIR) not in sys.path:
+    sys.path.insert(0, str(BENCHMARKS_DIR))
+
+from offline_profile_strategy_defaults import (  # noqa: E402
+    get_strategy_profile_defaults,
+)
 
 DISPATCH_POLICIES = (
     "waiting_x4_plus_running",
     "least_cache",
     "least_batch",
 )
+DEFAULT_DISPATCH_POLICY = "waiting_x4_plus_running"
 DEFAULT_LENGTH_CSV_STEM = "custom_lens"
 DEFAULT_CASE_CSV_NAME = "custom_lens.casecsv"
+MAX_REQUESTS_CSV_ROWS = "csv_rows"
+MaxRequestsValue = int | Literal["csv_rows"]
 
 
 def positive_int(value: str) -> int:
@@ -26,6 +39,13 @@ def non_negative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("Expected a non-negative integer.")
     return parsed
+
+
+def max_requests_value(value: str) -> MaxRequestsValue:
+    lowered = value.strip().lower()
+    if lowered in {"csv", "csv_rows", "all_csv_rows"}:
+        return MAX_REQUESTS_CSV_ROWS
+    return non_negative_int(value)
 
 
 def positive_float(value: str) -> float:
@@ -63,6 +83,21 @@ def parse_args() -> argparse.Namespace:
         help="output_len written to every generated CSV row.",
     )
     parser.add_argument(
+        "--cluster",
+        default=None,
+        help="Override cluster in the derived casecsv.",
+    )
+    parser.add_argument(
+        "--strategy",
+        default=None,
+        help="Override strategy in the derived casecsv.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Override model in the derived casecsv.",
+    )
+    parser.add_argument(
         "--warmup-requests",
         type=non_negative_int,
         default=None,
@@ -70,15 +105,37 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-requests",
-        type=non_negative_int,
+        type=max_requests_value,
         default=None,
-        help="Override max_requests in the derived casecsv.",
+        help=(
+            "Override max_requests in the derived casecsv. Use "
+            f"'{MAX_REQUESTS_CSV_ROWS}' to make measured requests follow the "
+            "CSV row count."
+        ),
     )
     parser.add_argument(
         "--request-rate",
         type=positive_float,
         default=None,
         help="Override request_rate in the derived casecsv.",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=positive_int,
+        default=None,
+        help="Override max_num_seqs in the derived casecsv.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=positive_float,
+        default=None,
+        help="Override gpu_memory_utilization in the derived casecsv.",
+    )
+    parser.add_argument(
+        "--data-parallel-rpc-port",
+        type=positive_int,
+        default=None,
+        help="Override data_parallel_rpc_port in the derived casecsv.",
     )
     parser.add_argument(
         "--dispatch-policy",
@@ -89,7 +146,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--case-name",
         default=None,
-        help="Optional derived case name. Defaults to <base_name>__<lens_stem>.",
+        help=(
+            "Optional derived case name. Defaults to "
+            "<base_name>__<strategy>__<lens_stem>[__dispatch_<policy>]."
+        ),
     )
     return parser.parse_args()
 
@@ -185,6 +245,10 @@ def main() -> None:
     input_lengths = load_input_lengths(lens_json)
 
     derived_row = dict(base_row)
+    effective_strategy = (
+        args.strategy
+        or (derived_row.get("strategy") or "").strip()
+    )
     effective_dispatch_policy = (
         args.dispatch_policy
         or (derived_row.get("dispatch_policy") or "").strip()
@@ -196,17 +260,43 @@ def main() -> None:
     case_csv_path = output_dir / DEFAULT_CASE_CSV_NAME
 
     base_case_name = (derived_row.get("name") or "offline_profile_case").strip()
-    derived_case_name = args.case_name or (
-        f"{base_case_name}__{lens_json.stem}__{dispatch_tag}"
-    )
+    derived_case_name_parts = [base_case_name]
+    if effective_strategy:
+        derived_case_name_parts.append(effective_strategy)
+    derived_case_name_parts.append(lens_json.stem)
+    if effective_dispatch_policy != DEFAULT_DISPATCH_POLICY:
+        derived_case_name_parts.append(dispatch_tag)
+    derived_case_name = args.case_name or "__".join(derived_case_name_parts)
+
     derived_row["name"] = derived_case_name
     derived_row["dataset"] = str(length_csv_path)
+    if args.cluster is not None:
+        derived_row["cluster"] = args.cluster
+    if args.strategy is not None:
+        derived_row["strategy"] = args.strategy
+    if args.model is not None:
+        derived_row["model"] = args.model
     if args.warmup_requests is not None:
         derived_row["warmup_requests"] = str(args.warmup_requests)
     if args.max_requests is not None:
         derived_row["max_requests"] = str(args.max_requests)
     if args.request_rate is not None:
         derived_row["request_rate"] = f"{args.request_rate:g}"
+    if args.max_num_seqs is not None:
+        derived_row["max_num_seqs"] = str(args.max_num_seqs)
+    elif args.strategy is not None:
+        derived_row["max_num_seqs"] = str(
+            get_strategy_profile_defaults(effective_strategy).max_num_seqs)
+    if args.gpu_memory_utilization is not None:
+        derived_row["gpu_memory_utilization"] = (
+            f"{args.gpu_memory_utilization:g}"
+        )
+    elif args.strategy is not None:
+        derived_row["gpu_memory_utilization"] = (
+            f"{get_strategy_profile_defaults(effective_strategy).gpu_memory_utilization:g}"
+        )
+    if args.data_parallel_rpc_port is not None:
+        derived_row["data_parallel_rpc_port"] = str(args.data_parallel_rpc_port)
     if args.dispatch_policy is not None:
         derived_row["dispatch_policy"] = args.dispatch_policy
 
@@ -221,10 +311,22 @@ def main() -> None:
     print(f"  length_csv: {length_csv_path}")
     print(f"  case_csv: {case_csv_path}")
     print(f"  case_name: {derived_row['name']}")
+    print(f"  cluster: {derived_row.get('cluster', '')}")
+    print(f"  strategy: {derived_row.get('strategy', '')}")
+    print(f"  model: {derived_row.get('model', '')}")
     print(f"  dispatch_policy: {derived_row.get('dispatch_policy', '')}")
     print(f"  request_rate: {derived_row.get('request_rate', '')}")
     print(f"  warmup_requests: {derived_row.get('warmup_requests', '')}")
     print(f"  max_requests: {derived_row.get('max_requests', '')}")
+    print(f"  max_num_seqs: {derived_row.get('max_num_seqs', '')}")
+    print(
+        "  gpu_memory_utilization: "
+        f"{derived_row.get('gpu_memory_utilization', '')}"
+    )
+    print(
+        "  data_parallel_rpc_port: "
+        f"{derived_row.get('data_parallel_rpc_port', '')}"
+    )
 
 
 if __name__ == "__main__":

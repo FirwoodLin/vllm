@@ -24,7 +24,16 @@ import time
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, TextIO
+from typing import Any, Literal, Mapping, TextIO
+
+BENCHMARKS_DIR = Path(__file__).resolve().parent
+if str(BENCHMARKS_DIR) not in sys.path:
+    sys.path.insert(0, str(BENCHMARKS_DIR))
+
+from offline_profile_strategy_defaults import (  # noqa: E402
+    STRATEGY_PROFILE_DEFAULTS,
+    SUPPORTED_PROFILE_STRATEGIES,
+)
 
 
 def build_rate_range(start: float, stop: float, step: float) -> tuple[float, ...]:
@@ -182,6 +191,8 @@ DATASET_SHORT_NAMES: dict[str, str] = {
     "issue01_random": "issue01_random",
     "long_full": "long_full",
 }
+MAX_REQUESTS_CSV_ROWS = "csv_rows"
+MaxRequestsValue = int | Literal["csv_rows"] | None
 
 
 @dataclass(frozen=True)
@@ -228,7 +239,7 @@ class ExperimentCase:
     request_rate: float = 100.0
     rate_phase: str = DEFAULT_RATE_PLAN
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
-    max_requests: int | None = None
+    max_requests: MaxRequestsValue = None
     warmup_requests: int = 0
     max_num_seqs: int | None = None
     max_model_len: int | None = None
@@ -388,7 +399,7 @@ CLUSTERS: dict[str, ClusterSpec] = {
     # ),
     "4node_h200":
     ClusterSpec(
-        master_addr="10.102.97.33",
+        master_addr="10.102.97.179",
         master_port=29579,
         remote_hosts=("h200-rjob1", "h200-rjob2", "h200-rjob3"),
     ),
@@ -450,23 +461,15 @@ SWEEP_MODELS: tuple[str, ...] = (
     "kimi_k2_instruct_0905",
     "deepseek_v3_1024k",
 )
-SWEEP_STRATEGIES: tuple[str, ...] = (
-    "dp4dcp8",
-    "dp8dcp4",
-    "dp16cp2",
-    "dp32",
-)
+SWEEP_STRATEGIES: tuple[str, ...] = SUPPORTED_PROFILE_STRATEGIES
 STRATEGY_MAX_NUM_SEQS: dict[str, int] = {
-    "dp4dcp8": 1024,
-    "dp8dcp4": 768,
-    "dp16cp2": 384,
-    "dp32": 256,
+    strategy_name: defaults.max_num_seqs
+    for strategy_name, defaults in STRATEGY_PROFILE_DEFAULTS.items()
 }
 STRATEGY_GPU_MEMORY_UTILIZATION: dict[str, float] = {
-    strategy_name: DEFAULT_GPU_MEMORY_UTILIZATION
-    for strategy_name in SWEEP_STRATEGIES
+    strategy_name: defaults.gpu_memory_utilization
+    for strategy_name, defaults in STRATEGY_PROFILE_DEFAULTS.items()
 }
-STRATEGY_GPU_MEMORY_UTILIZATION["dp32"] = 0.87
 
 
 def bench_duration_to_max_requests(request_rate: float,
@@ -596,7 +599,7 @@ def stringify_request_rate(value: float) -> str:
 
 
 def infer_bench_duration_sec(case: ExperimentCase) -> float:
-    if case.max_requests is not None and not math.isinf(case.request_rate):
+    if isinstance(case.max_requests, int) and not math.isinf(case.request_rate):
         return case.max_requests / case.request_rate
     return DEFAULT_SWEEP_BENCH_DURATION_SEC
 
@@ -1559,6 +1562,21 @@ def _csv_int(row: Mapping[str, str], key: str, *,
     return int(raw)
 
 
+def _csv_max_requests(
+    row: Mapping[str, str],
+    key: str,
+    *,
+    default: MaxRequestsValue = None,
+) -> MaxRequestsValue:
+    raw = _csv_cell(row, key)
+    if not raw:
+        return default
+    lowered = raw.lower()
+    if lowered in {"csv", "csv_rows", "all_csv_rows"}:
+        return MAX_REQUESTS_CSV_ROWS
+    return int(raw)
+
+
 def _csv_float(row: Mapping[str, str], key: str, *,
                default: float | None = None) -> float | None:
     raw = _csv_cell(row, key)
@@ -1619,7 +1637,7 @@ def load_cases_from_csv(path: Path) -> list[ExperimentCase]:
                         "gpu_memory_utilization",
                         default=DEFAULT_GPU_MEMORY_UTILIZATION,
                     ) or DEFAULT_GPU_MEMORY_UTILIZATION,
-                    max_requests=_csv_int(row, "max_requests"),
+                    max_requests=_csv_max_requests(row, "max_requests"),
                     warmup_requests=_csv_int(row, "warmup_requests",
                                              default=0) or 0,
                     max_num_seqs=_csv_int(row, "max_num_seqs"),

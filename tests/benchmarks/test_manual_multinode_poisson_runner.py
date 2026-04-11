@@ -220,13 +220,14 @@ def test_build_frontend_and_headless_argv_include_required_flags(
         strategies={
             "strategy_a":
             runner.StrategySpec(
-                data_parallel_size=16,
-                data_parallel_size_local=8,
-                tensor_parallel_size=1,
-                decode_context_parallel_size=1,
+                data_parallel_size=8,
+                data_parallel_size_local=4,
+                tensor_parallel_size=8,
+                decode_context_parallel_size=8,
                 enable_expert_parallel=True,
                 attention_backend="FLASHMLA",
                 all2all_backend="deepep_low_latency",
+                dcp_comm_backend="a2a",
             ),
         },
         datasets={"dataset_alias": str(dataset_path)},
@@ -258,12 +259,18 @@ def test_build_frontend_and_headless_argv_include_required_flags(
     assert "--max-model-len" in frontend_argv
     assert "--max-num-batched-tokens" in frontend_argv
     assert "--enable-expert-parallel" in frontend_argv
+    assert "--decode-context-parallel-size" in frontend_argv
+    assert "8" in frontend_argv
     assert "--attention-backend" in frontend_argv
     assert "--all2all-backend" in frontend_argv
+    assert "--dcp-comm-backend" in frontend_argv
+    assert "a2a" in frontend_argv
     assert "--data-parallel-dispatch-policy" in frontend_argv
     assert "least_cache" in frontend_argv
     assert "--input-csv" not in headless_argv
     assert "--request-rate" not in headless_argv
+    assert "--dcp-comm-backend" in headless_argv
+    assert "a2a" in headless_argv
 
 
 @pytest.mark.benchmark
@@ -1868,6 +1875,26 @@ def test_load_cases_from_csv_skips_disabled_rows_and_preserves_order(
     assert cases[1].dispatch_policy == runner.DEFAULT_DISPATCH_POLICY
     assert cases[1].warmup_requests == 0
     assert cases[1].max_model_len is None
+
+
+@pytest.mark.benchmark
+def test_load_cases_from_csv_supports_csv_rows_max_requests(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    csv_path = tmp_path / "cases.csv"
+    csv_path.write_text(
+        "\n".join([
+            ",".join(runner.CASE_CSV_FIELDNAMES),
+            ("1,case_csv_rows,cluster_a,model_a,dataset_a,strategy_a,,10,,32,"
+             "0.85,csv_rows,4,,29550,planned,ref_a"),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    cases = runner.load_cases_from_csv(csv_path)
+
+    assert len(cases) == 1
+    assert cases[0].max_requests == runner.MAX_REQUESTS_CSV_ROWS
 
 
 @pytest.mark.benchmark

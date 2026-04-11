@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Literal, Mapping, cast
 
 import numpy as np
 import uvloop
@@ -70,6 +70,8 @@ TTFT_SEMANTICS_DECODE_BENCH_DUMMY_PREFILL = (
 FRONTEND_TEARDOWN_HEARTBEAT_SEC = 15.0
 FRONTEND_TEARDOWN_TIMEOUT_SEC = 60.0
 GPU_KV_CACHE_CAPACITY_LOG_MARKER = "poisson_gpu_kv_cache_capacity"
+MAX_REQUESTS_CSV_ROWS = "csv_rows"
+MaxRequestsArg = int | Literal["csv_rows"] | None
 
 
 def _non_negative_int(value: str) -> int:
@@ -77,6 +79,13 @@ def _non_negative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("Expected a non-negative integer.")
     return parsed
+
+
+def _max_requests_arg(value: str) -> int | Literal["csv_rows"]:
+    lowered = value.strip().lower()
+    if lowered in {"csv", "csv_rows", "all_csv_rows"}:
+        return MAX_REQUESTS_CSV_ROWS
+    return _non_negative_int(value)
 
 
 def _positive_int(value: str) -> int:
@@ -539,6 +548,17 @@ def split_warmup_and_measured_requests(
     return warmup, measured
 
 
+def resolve_max_requests_against_csv(
+    total_rows: int,
+    max_requests: MaxRequestsArg,
+) -> int | None:
+    if max_requests is None:
+        return None
+    if max_requests == MAX_REQUESTS_CSV_ROWS:
+        return total_rows
+    return max_requests
+
+
 def validate_request_lengths(
     requests: list[SampleRequest],
     max_model_len: int,
@@ -804,6 +824,11 @@ def _validate_frontend_args(args: argparse.Namespace) -> None:
     if args.routing_mode != "internal_dplb":
         raise NotImplementedError(
             "Only --routing-mode=internal_dplb is implemented."
+        )
+    if args.pause_before_profile and not args.profile_after_warmup:
+        raise ValueError(
+            "--pause-before-profile requires --profile-after-warmup so the "
+            "frontend can resume generation immediately after profiling starts."
         )
 
 
@@ -1179,6 +1204,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
     async_llm: Any | None = None
     measured_requests_count: int | None = None
     active_profile_prefix: str | None = None
+    generation_paused_for_profile = False
     summary_written = False
     parquet_written = False
     recorder = RunRecorder(
@@ -1221,10 +1247,14 @@ async def run_frontend(args: argparse.Namespace) -> None:
             disable_shuffle=True,
         )
         total_rows = len(dataset.csv_lengths or [])
+        effective_max_requests = resolve_max_requests_against_csv(
+            total_rows=total_rows,
+            max_requests=args.max_requests,
+        )
         csv_repeat = resolve_csv_repeat(
             total_rows=total_rows,
             warmup_requests=args.warmup_requests,
-            max_requests=args.max_requests,
+            max_requests=effective_max_requests,
             csv_repeat=args.csv_repeat,
         )
         all_requests = load_length_requests(
@@ -1237,7 +1267,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
         warmup_requests, measured_requests = split_warmup_and_measured_requests(
             all_requests,
             warmup_requests=args.warmup_requests,
-            max_requests=args.max_requests,
+            max_requests=effective_max_requests,
         )
         if not measured_requests:
             raise ValueError(
@@ -1270,12 +1300,14 @@ async def run_frontend(args: argparse.Namespace) -> None:
             "loaded_requests": len(all_requests),
             "request_rate": args.request_rate,
             "arrival_process": args.arrival_process,
+            "pause_before_profile": bool(args.pause_before_profile),
             "seed": args.seed,
             "ttft_definition": _ttft_definition_from_config(
                 args.kv_transfer_config
             ),
             "warmup_requests": len(warmup_requests),
             "measured_requests": len(measured_requests),
+            "effective_max_requests": effective_max_requests,
             "benchmark_start_time": datetime.now().astimezone().isoformat(),
             "engine_args": {
                 key: value
@@ -1294,42 +1326,101 @@ async def run_frontend(args: argparse.Namespace) -> None:
             measured_requests=measured_requests_count,
             extra_fields={"warmup_requests": len(warmup_requests)},
         )
-        active_profile_prefix = await _start_frontend_profile_if_requested(
-            async_llm,
-            args=args,
-            output_dir=output_dir,
-            frontend_started_at_s=frontend_started_at_s,
-            measured_requests=measured_requests_count,
-        )
-
-        arrival_deadlines_ns = build_poisson_arrival_deadlines_ns(
-            num_requests=len(measured_requests),
-            request_rate=args.request_rate,
-            seed=args.seed,
-        )
-
-        logger.info("Submitting %d measured request(s).", len(measured_requests))
         inflight: set[asyncio.Task[None]] = set()
-        scheduling_start_ns = time.perf_counter_ns()
-        for index, request in enumerate(measured_requests):
-            deadline_ns = scheduling_start_ns + arrival_deadlines_ns[index]
-            sleep_ns = deadline_ns - time.perf_counter_ns()
-            if sleep_ns > 0:
-                await asyncio.sleep(sleep_ns / 1e9)
-            await _submit_one_request(
-                engine=async_llm,
-                request=request,
-                recorder=recorder,
-                inflight=inflight,
-                kv_transfer_config=args.kv_transfer_config,
+        if args.pause_before_profile:
+            _log_frontend_phase(
+                "pause_before_profile_start",
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
             )
-        _log_frontend_phase(
-            "submission_done",
-            args=args,
-            output_dir=output_dir,
-            frontend_started_at_s=frontend_started_at_s,
-            measured_requests=measured_requests_count,
-        )
+            logger.info(
+                "Pausing generation with mode=keep before measured submission."
+            )
+            await async_llm.pause_generation(mode="keep", clear_cache=False)
+            generation_paused_for_profile = True
+            _log_frontend_phase(
+                "pause_before_profile_done",
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
+                extra_fields={"submission_mode": "paused_burst"},
+            )
+            logger.info(
+                "Submitting %d measured request(s) while generation is paused.",
+                len(measured_requests),
+            )
+            for request in measured_requests:
+                await _submit_one_request(
+                    engine=async_llm,
+                    request=request,
+                    recorder=recorder,
+                    inflight=inflight,
+                    kv_transfer_config=args.kv_transfer_config,
+                )
+            _log_frontend_phase(
+                "submission_done",
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
+                extra_fields={"submission_mode": "paused_burst"},
+            )
+            active_profile_prefix = await _start_frontend_profile_if_requested(
+                async_llm,
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
+            )
+            _log_frontend_phase(
+                "resume_after_profile_start",
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
+            )
+            logger.info("Resuming generation after profiler start.")
+            await async_llm.resume_generation()
+            generation_paused_for_profile = False
+        else:
+            active_profile_prefix = await _start_frontend_profile_if_requested(
+                async_llm,
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
+            )
+
+            arrival_deadlines_ns = build_poisson_arrival_deadlines_ns(
+                num_requests=len(measured_requests),
+                request_rate=args.request_rate,
+                seed=args.seed,
+            )
+
+            logger.info("Submitting %d measured request(s).", len(measured_requests))
+            scheduling_start_ns = time.perf_counter_ns()
+            for index, request in enumerate(measured_requests):
+                deadline_ns = scheduling_start_ns + arrival_deadlines_ns[index]
+                sleep_ns = deadline_ns - time.perf_counter_ns()
+                if sleep_ns > 0:
+                    await asyncio.sleep(sleep_ns / 1e9)
+                await _submit_one_request(
+                    engine=async_llm,
+                    request=request,
+                    recorder=recorder,
+                    inflight=inflight,
+                    kv_transfer_config=args.kv_transfer_config,
+                )
+            _log_frontend_phase(
+                "submission_done",
+                args=args,
+                output_dir=output_dir,
+                frontend_started_at_s=frontend_started_at_s,
+                measured_requests=measured_requests_count,
+            )
 
         while inflight:
             await asyncio.gather(*tuple(inflight))
@@ -1403,6 +1494,15 @@ async def run_frontend(args: argparse.Namespace) -> None:
             parquet_written=parquet_written,
             exception=active_exception,
         )
+        if async_llm is not None and generation_paused_for_profile:
+            try:
+                logger.info("Resuming generation during teardown cleanup.")
+                await async_llm.resume_generation()
+            except Exception:
+                logger.warning(
+                    "Failed to resume generation during frontend teardown cleanup.",
+                    exc_info=True,
+                )
         if async_llm is not None and active_profile_prefix is not None:
             try:
                 await _stop_frontend_profile(
@@ -1592,9 +1692,13 @@ def build_parser() -> FlexibleArgumentParser:
     )
     frontend.add_argument(
         "--max-requests",
-        type=_non_negative_int,
+        type=_max_requests_arg,
         default=None,
-        help="Cap the number of measured requests.",
+        help=(
+            "Cap the number of measured requests. Use "
+            f"'{MAX_REQUESTS_CSV_ROWS}' to run as many measured requests as "
+            "there are original CSV rows."
+        ),
     )
     frontend.add_argument(
         "--warmup-requests",
@@ -1632,6 +1736,16 @@ def build_parser() -> FlexibleArgumentParser:
         help=(
             "Optional prefix passed to AsyncLLM.start_profile(). Defaults to "
             "the output directory name."
+        ),
+    )
+    frontend.add_argument(
+        "--pause-before-profile",
+        action="store_true",
+        help=(
+            "After warmup, pause generation with mode=keep, submit all measured "
+            "requests into the engine queue, start profiling, then resume "
+            "generation. This changes request latency/queue-time statistics and "
+            "is intended for trace capture rather than throughput comparison."
         ),
     )
     frontend.add_argument(

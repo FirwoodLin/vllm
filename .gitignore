@@ -254,3 +254,7 @@ profile-dp-imbalance/
 benchmarks/plans-finishied/
 benchmarks/plans-unfinished/
 benchmarks/plans-unfinishied/
+benchmarks/offline_dp_profile/generated_inputs/
+benchmarks/offline_dp_profile/profile_cases/*
+!benchmarks/offline_dp_profile/profile_cases/deepseek_issue01_dp32_profile.casecsv
+!benchmarks/offline_dp_profile/profile_cases/offline_profile_template.casecsv
