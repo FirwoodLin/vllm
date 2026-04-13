@@ -12,6 +12,8 @@ import pytest
 
 MODULE_PATH = (Path(__file__).resolve().parents[2] / "benchmarks" /
                "manual_multinode_poisson_runner.py")
+PLAN_0412_DIR = (Path(__file__).resolve().parents[2] / "benchmarks" /
+                 "plans-unfinished" / "0412")
 
 
 def load_runner_module():
@@ -177,6 +179,248 @@ def test_build_experiment_matrix_filters_model_dataset_and_strategy() -> None:
     assert [case.request_rate for case in cases[:4]] == [10.0, 20.0, 30.0, 40.0]
     assert [case.request_rate for case in cases[-4:]] == [55.0, 65.0, 75.0,
                                                            85.0]
+
+
+@pytest.mark.benchmark
+def test_build_experiment_matrix_uses_qwen_strategies_by_default() -> None:
+    runner = load_runner_module()
+
+    cases = runner.build_experiment_matrix(
+        models=("qwen3_235b_fp8_1024k", ),
+        datasets=("issue01_random", ),
+    )
+
+    assert len(cases) == 36
+    assert {case.model for case in cases} == {"qwen3_235b_fp8_1024k"}
+    assert {case.strategy for case in cases} == {
+        "dp4tp8dcp2",
+        "dp8tp4",
+        "dp4tp8",
+        "dp16tp2",
+    }
+    assert all(case.strategy != "dp1tp8dcp2" for case in cases)
+    assert all(case.max_model_len == 1000000 for case in cases)
+
+
+@pytest.mark.benchmark
+def test_qwen_strategy_builds_flash_attn_argv(tmp_path: Path) -> None:
+    runner = load_runner_module()
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "qwen3-235B-fp8-1024k"
+    model_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="qwen_case",
+            cluster="cluster_a",
+            strategy="dp4tp8dcp2",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=100.0,
+            max_num_seqs=1024,
+            max_model_len=1000000,
+        ),
+        clusters={
+            "cluster_a":
+            runner.ClusterSpec(
+                master_addr="10.0.0.1",
+                master_port=29579,
+                remote_hosts=("node-a", "node-b", "node-c"),
+            ),
+        },
+        strategies=runner.STRATEGIES,
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    frontend_argv = runner.build_frontend_argv(resolved, output_dir)
+
+    assert frontend_argv[
+        frontend_argv.index("--attention-backend") + 1] == "FLASH_ATTN"
+    assert frontend_argv[
+        frontend_argv.index("--decode-context-parallel-size") + 1] == "2"
+    assert "--enable-expert-parallel" in frontend_argv
+    assert "--dcp-comm-backend" in frontend_argv
+    assert "a2a" in frontend_argv
+
+
+@pytest.mark.benchmark
+def test_qwen_single_node_strategy_is_case_only_but_allowed(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "qwen3-235B-fp8-1024k"
+    model_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+
+    assert "dp1tp8dcp2" not in runner.supported_strategies_for_model(
+        "qwen3_235b_fp8_1024k")
+
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="qwen_single_node_case",
+            cluster="cluster_a",
+            strategy="dp1tp8dcp2",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=100.0,
+            max_num_seqs=768,
+            max_model_len=1000000,
+        ),
+        clusters={
+            "cluster_a":
+            runner.ClusterSpec(
+                master_addr="127.0.0.1",
+                master_port=29579,
+                remote_hosts=(),
+            ),
+        },
+        strategies=runner.STRATEGIES,
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    frontend_argv = runner.build_frontend_argv(resolved, output_dir)
+
+    assert resolved.cluster.nnodes == 1
+    assert frontend_argv[frontend_argv.index("--nnodes") + 1] == "1"
+    assert frontend_argv[
+        frontend_argv.index("--tensor-parallel-size") + 1] == "8"
+    assert frontend_argv[
+        frontend_argv.index("--decode-context-parallel-size") + 1] == "2"
+    assert frontend_argv[
+        frontend_argv.index("--attention-backend") + 1] == "FLASH_ATTN"
+    assert "--enable-expert-parallel" in frontend_argv
+    assert frontend_argv[frontend_argv.index("--dcp-comm-backend") + 1] == "a2a"
+
+
+@pytest.mark.benchmark
+def test_load_single_node_qwen_case_csv() -> None:
+    runner = load_runner_module()
+    case_csv = (PLAN_0412_DIR /
+                "qwen3_235b_issue05random_dp1tp8dcp2_waiting_x4_plus_running_"
+                "step5_5_to100_1node.csv")
+
+    cases = runner.load_cases_from_csv(case_csv)
+
+    assert len(cases) == 20
+    assert {case.cluster for case in cases} == {"1node_h200"}
+    assert {case.strategy for case in cases} == {"dp1tp8dcp2"}
+    assert cases[0].request_rate == pytest.approx(5.0)
+    assert cases[-1].request_rate == pytest.approx(100.0)
+
+
+@pytest.mark.benchmark
+def test_qwen_dp4tp8_strategy_builds_ep_argv_without_dcp(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "qwen3-235B-fp8-1024k"
+    model_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="qwen_dp4tp8_case",
+            cluster="cluster_a",
+            strategy="dp4tp8",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=100.0,
+            max_num_seqs=1024,
+            max_model_len=1000000,
+        ),
+        clusters={
+            "cluster_a":
+            runner.ClusterSpec(
+                master_addr="10.0.0.1",
+                master_port=29579,
+                remote_hosts=("node-a", "node-b", "node-c"),
+            ),
+        },
+        strategies=runner.STRATEGIES,
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    frontend_argv = runner.build_frontend_argv(resolved, output_dir)
+
+    assert frontend_argv[
+        frontend_argv.index("--attention-backend") + 1] == "FLASH_ATTN"
+    assert frontend_argv[
+        frontend_argv.index("--decode-context-parallel-size") + 1] == "1"
+    assert frontend_argv[
+        frontend_argv.index("--tensor-parallel-size") + 1] == "8"
+    assert "--enable-expert-parallel" in frontend_argv
+    assert frontend_argv[
+        frontend_argv.index("--all2all-backend") + 1] == "deepep_low_latency"
+    assert "--dcp-comm-backend" not in frontend_argv
+
+
+@pytest.mark.benchmark
+def test_qwen_model_rejects_non_qwen_strategy(tmp_path: Path) -> None:
+    runner = load_runner_module()
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "qwen3-235B-fp8-1024k"
+    model_dir.mkdir()
+
+    with pytest.raises(SystemExit, match="Qwen models only support strategies"):
+        runner.resolve_case(
+            runner.ExperimentCase(
+                name="qwen_bad_strategy",
+                cluster="cluster_a",
+                strategy="dp32",
+                dataset="dataset_alias",
+                model="model_alias",
+            ),
+            clusters={
+                "cluster_a":
+                runner.ClusterSpec(
+                    master_addr="10.0.0.1",
+                    master_port=29579,
+                    remote_hosts=("node-a", "node-b", "node-c"),
+                ),
+            },
+            strategies=runner.STRATEGIES,
+            datasets={"dataset_alias": str(dataset_path)},
+            models={"model_alias": str(model_dir)},
+        )
+
+
+@pytest.mark.benchmark
+def test_non_qwen_model_rejects_qwen_strategy(tmp_path: Path) -> None:
+    runner = load_runner_module()
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    with pytest.raises(SystemExit, match="only supported for Qwen models"):
+        runner.resolve_case(
+            runner.ExperimentCase(
+                name="non_qwen_bad_strategy",
+                cluster="cluster_a",
+                strategy="dp8tp4",
+                dataset="dataset_alias",
+                model="model_alias",
+            ),
+            clusters={
+                "cluster_a":
+                runner.ClusterSpec(
+                    master_addr="10.0.0.1",
+                    master_port=29579,
+                    remote_hosts=("node-a", "node-b", "node-c"),
+                ),
+            },
+            strategies=runner.STRATEGIES,
+            datasets={"dataset_alias": str(dataset_path)},
+            models={"model_alias": str(model_dir)},
+        )
 
 
 @pytest.mark.benchmark
@@ -1895,6 +2139,27 @@ def test_load_cases_from_csv_supports_csv_rows_max_requests(
 
     assert len(cases) == 1
     assert cases[0].max_requests == runner.MAX_REQUESTS_CSV_ROWS
+
+
+@pytest.mark.benchmark
+def test_load_cases_from_csv_generates_missing_case_names(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    csv_path = tmp_path / "cases.csv"
+    csv_path.write_text(
+        "\n".join([
+            ",".join(runner.CASE_CSV_FIELDNAMES),
+            ("1,,cluster_a,qwen3_235b_fp8_1024k,issue01_random,dp4tp8,,"
+             "10,manual,512,0.85,6000,32,1000000,29550,planned,ref_a"),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    cases = runner.load_cases_from_csv(csv_path)
+
+    assert len(cases) == 1
+    assert cases[0].name == (
+        "QWEN3_235B__issue01_random__dp4tp8__rate10__bs512")
 
 
 @pytest.mark.benchmark

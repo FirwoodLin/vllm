@@ -85,8 +85,10 @@ FORWARDED_ENV_KEYS = (
     "VLLM_DEEP_GEMM_WARMUP",
     "VLLM_MOE_ROUTING_SIMULATION_STRATEGY",
     "VLLM_RANDOMIZE_DP_DUMMY_INPUTS",
+    "CUDA_LAUNCH_BLOCKING",
 )
 DEFAULT_ENV_OVERRIDES = {
+    "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
     "VLLM_DEEP_GEMM_WARMUP": "skip",
     "VLLM_LOG_STATS_INTERVAL": "1",
     "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": "uniform_random",
@@ -186,6 +188,8 @@ CASE_CSV_FIELDNAMES: tuple[str, ...] = (
 MODEL_SHORT_NAMES: dict[str, str] = {
     "deepseek_v3_1024k": "DPSK",
     "kimi_k2_instruct_0905": "KIMI",
+    "qwen3_235b_fp8_1024k": "QWEN3_235B",
+    "qwen3_235b_fp8": "QWEN3_235B",
 }
 DATASET_SHORT_NAMES: dict[str, str] = {
     "issue01_random": "issue01_random",
@@ -354,6 +358,10 @@ MODELS: dict[str, str] = {
     "kimi_k2_instruct_0905":
     "/mnt/nvme1n1/ml_research/models/models--moonshotai--Kimi-K2-Instruct-0905/"
     "snapshots/7152993552508c9f22042b3bb93b5e6acd06ce73",
+    "qwen3_235b_fp8_1024k":
+    "/mnt/nvme1n1/ml_research/models/qwen3-235B-fp8-1024k",
+    "qwen3_235b_fp8":
+    "/mnt/nvme1n1/ml_research/models/qwen3-235B-fp8",
 }
 
 DATASETS: dict[str, str] = {
@@ -385,6 +393,12 @@ DATASETS: dict[str, str] = {
 }
 
 CLUSTERS: dict[str, ClusterSpec] = {
+    "1node_h200":
+    ClusterSpec(
+        master_addr="127.0.0.1",
+        master_port=29579,
+        remote_hosts=(),
+    ),
     "2node_h200":
     ClusterSpec(
         master_addr="10.102.98.166",
@@ -399,7 +413,7 @@ CLUSTERS: dict[str, ClusterSpec] = {
     # ),
     "4node_h200":
     ClusterSpec(
-        master_addr="10.102.97.179",
+        master_addr="10.102.215.76",
         master_port=29579,
         remote_hosts=("h200-rjob1", "h200-rjob2", "h200-rjob3"),
     ),
@@ -453,6 +467,92 @@ STRATEGIES: dict[str, StrategySpec] = {
         attention_backend="FLASHMLA",
         all2all_backend="deepep_low_latency",
     ),
+    "dp4tp8dcp2":
+    StrategySpec(
+        data_parallel_size=4,
+        data_parallel_size_local=1,
+        tensor_parallel_size=8,
+        decode_context_parallel_size=2,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASH_ATTN",
+        all2all_backend="deepep_low_latency",
+        dcp_comm_backend="a2a",
+    ),
+    "dp1tp8dcp2":
+    StrategySpec(
+        data_parallel_size=1,
+        data_parallel_size_local=1,
+        tensor_parallel_size=8,
+        decode_context_parallel_size=2,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASH_ATTN",
+        all2all_backend="deepep_low_latency",
+        dcp_comm_backend="a2a",
+    ),
+    "dp4tp8dcp2_ar":
+    StrategySpec(
+        data_parallel_size=4,
+        data_parallel_size_local=1,
+        tensor_parallel_size=8,
+        decode_context_parallel_size=2,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASH_ATTN",
+        all2all_backend="deepep_low_latency",
+        dcp_comm_backend="ag_rs",
+    ),
+    "dp4tp8":
+    StrategySpec(
+        data_parallel_size=4,
+        data_parallel_size_local=1,
+        tensor_parallel_size=8,
+        decode_context_parallel_size=1,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASH_ATTN",
+        all2all_backend="deepep_low_latency",
+    ),
+    "dp8tp4":
+    StrategySpec(
+        data_parallel_size=8,
+        data_parallel_size_local=2,
+        tensor_parallel_size=4,
+        decode_context_parallel_size=1,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASH_ATTN",
+        all2all_backend="deepep_low_latency",
+    ),
+    "dp16tp2":
+    StrategySpec(
+        data_parallel_size=16,
+        data_parallel_size_local=4,
+        tensor_parallel_size=2,
+        decode_context_parallel_size=1,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASH_ATTN",
+        all2all_backend="deepep_low_latency",
+    ),
+}
+
+QWEN_SUPPORTED_STRATEGIES: tuple[str, ...] = (
+    "dp4tp8dcp2",
+    "dp8tp4",
+    "dp4tp8",
+    "dp16tp2",
+)
+QWEN_CASE_ONLY_STRATEGIES: tuple[str, ...] = ("dp1tp8dcp2", )
+QWEN_ALLOWED_STRATEGIES: tuple[str, ...] = (QWEN_SUPPORTED_STRATEGIES +
+                                             QWEN_CASE_ONLY_STRATEGIES)
+QWEN_STRATEGY_PROFILE_DEFAULTS: dict[str, tuple[int, float]] = {
+    "dp4tp8dcp2": (1024, DEFAULT_GPU_MEMORY_UTILIZATION),
+    "dp1tp8dcp2": (768, DEFAULT_GPU_MEMORY_UTILIZATION),
+    "dp8tp4": (768, DEFAULT_GPU_MEMORY_UTILIZATION),
+    "dp4tp8": (1024, DEFAULT_GPU_MEMORY_UTILIZATION),
+    "dp16tp2": (512, DEFAULT_GPU_MEMORY_UTILIZATION),
 }
 
 SWEEP_CLUSTER = "4node_h200"
@@ -466,10 +566,53 @@ STRATEGY_MAX_NUM_SEQS: dict[str, int] = {
     strategy_name: defaults.max_num_seqs
     for strategy_name, defaults in STRATEGY_PROFILE_DEFAULTS.items()
 }
+STRATEGY_MAX_NUM_SEQS.update({
+    strategy_name: defaults[0]
+    for strategy_name, defaults in QWEN_STRATEGY_PROFILE_DEFAULTS.items()
+})
 STRATEGY_GPU_MEMORY_UTILIZATION: dict[str, float] = {
     strategy_name: defaults.gpu_memory_utilization
     for strategy_name, defaults in STRATEGY_PROFILE_DEFAULTS.items()
 }
+STRATEGY_GPU_MEMORY_UTILIZATION.update({
+    strategy_name: defaults[1]
+    for strategy_name, defaults in QWEN_STRATEGY_PROFILE_DEFAULTS.items()
+})
+
+
+def is_qwen_model(value: str | Path) -> bool:
+    text = value.name if isinstance(value, Path) else value
+    return "qwen" in text.lower()
+
+
+def supported_strategies_for_model(model_name: str) -> tuple[str, ...]:
+    if is_qwen_model(model_name):
+        return QWEN_SUPPORTED_STRATEGIES
+    return SWEEP_STRATEGIES
+
+
+def validate_model_strategy_pair(
+    *,
+    model_name: str,
+    model_path: Path | None,
+    strategy_name: str,
+) -> None:
+    is_qwen = is_qwen_model(model_name)
+    if model_path is not None:
+        is_qwen = is_qwen or is_qwen_model(model_path)
+
+    if is_qwen:
+        if strategy_name not in QWEN_ALLOWED_STRATEGIES:
+            supported = ", ".join(QWEN_ALLOWED_STRATEGIES)
+            raise ValueError(
+                f"Qwen models only support strategies: {supported}. "
+                f"Got '{strategy_name}'."
+            )
+        return
+
+    if strategy_name in QWEN_ALLOWED_STRATEGIES:
+        raise ValueError(
+            f"Strategy '{strategy_name}' is only supported for Qwen models.")
 
 
 def bench_duration_to_max_requests(request_rate: float,
@@ -518,6 +661,7 @@ def build_experiment_matrix(
     selected_models = ordered_models(models)
     selected_datasets = ordered_datasets(datasets)
     selected_strategies = ordered_strategies(strategies)
+    use_model_default_strategies = not strategies
 
     experiments: list[ExperimentCase] = []
     for rate_phase, request_rates in rate_plan_phases:
@@ -525,7 +669,16 @@ def build_experiment_matrix(
             dataset_tag = DATASET_SHORT_NAMES.get(dataset_name, dataset_name)
             for model_name in selected_models:
                 model_tag = MODEL_SHORT_NAMES.get(model_name, model_name)
-                for strategy_name in selected_strategies:
+                if use_model_default_strategies:
+                    model_strategies = supported_strategies_for_model(model_name)
+                else:
+                    model_strategies = selected_strategies
+                for strategy_name in model_strategies:
+                    validate_model_strategy_pair(
+                        model_name=model_name,
+                        model_path=None,
+                        strategy_name=strategy_name,
+                    )
                     max_num_seqs = STRATEGY_MAX_NUM_SEQS[strategy_name]
                     gpu_memory_utilization = STRATEGY_GPU_MEMORY_UTILIZATION[
                         strategy_name]
@@ -1011,6 +1164,16 @@ def resolve_case(
         label=f"Model for case '{case.name}'",
         expect_file=False,
     )
+    try:
+        validate_model_strategy_pair(
+            model_name=case.model,
+            model_path=model_path,
+            strategy_name=case.strategy,
+        )
+    except ValueError as exc:
+        raise SystemExit(
+            f"Invalid model/strategy for case '{case.name}': {exc}"
+        ) from exc
 
     return ResolvedCase(
         case=case,
@@ -1537,6 +1700,21 @@ def describe_case(case: ExperimentCase) -> str:
     )
 
 
+def generate_case_name(
+    *,
+    model: str,
+    dataset: str,
+    strategy: str,
+    request_rate: float,
+    max_num_seqs: int | None,
+) -> str:
+    bs_tag = f"bs{max_num_seqs}" if max_num_seqs is not None else "bsauto"
+    return (
+        f"{model_short_name(model)}__{dataset_short_name(dataset)}__"
+        f"{strategy}__rate{stringify_request_rate(request_rate)}__{bs_tag}"
+    )
+
+
 def _csv_cell(row: Mapping[str, str], key: str) -> str:
     return (row.get(key) or "").strip()
 
@@ -1613,11 +1791,21 @@ def load_cases_from_csv(path: Path) -> list[ExperimentCase]:
             dataset = _csv_cell(row, "dataset")
             strategy = _csv_cell(row, "strategy")
             request_rate_raw = _csv_cell(row, "request_rate")
-            if not all(
-                    (name, cluster, model, dataset, strategy, request_rate_raw)):
+            if not all((cluster, model, dataset, strategy, request_rate_raw)):
                 raise ValueError(
                     "missing one of required columns: "
-                    "name, cluster, model, dataset, strategy, request_rate")
+                    "cluster, model, dataset, strategy, request_rate")
+
+            request_rate = float(request_rate_raw)
+            max_num_seqs = _csv_int(row, "max_num_seqs")
+            if not name:
+                name = generate_case_name(
+                    model=model,
+                    dataset=dataset,
+                    strategy=strategy,
+                    request_rate=request_rate,
+                    max_num_seqs=max_num_seqs,
+                )
 
             cases.append(
                 ExperimentCase(
@@ -1630,7 +1818,7 @@ def load_cases_from_csv(path: Path) -> list[ExperimentCase]:
                         _csv_cell(row, "dispatch_policy")
                         or DEFAULT_DISPATCH_POLICY
                     ),
-                    request_rate=float(request_rate_raw),
+                    request_rate=request_rate,
                     rate_phase=_csv_cell(row, "rate_phase") or DEFAULT_RATE_PLAN,
                     gpu_memory_utilization=_csv_float(
                         row,
@@ -1640,7 +1828,7 @@ def load_cases_from_csv(path: Path) -> list[ExperimentCase]:
                     max_requests=_csv_max_requests(row, "max_requests"),
                     warmup_requests=_csv_int(row, "warmup_requests",
                                              default=0) or 0,
-                    max_num_seqs=_csv_int(row, "max_num_seqs"),
+                    max_num_seqs=max_num_seqs,
                     max_model_len=_csv_int(row, "max_model_len"),
                     data_parallel_rpc_port=_csv_int(
                         row,
