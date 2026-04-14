@@ -31,6 +31,7 @@ from vllm.benchmarks.offline_poisson_harness import (
     split_warmup_and_measured_requests,
 )
 from vllm.benchmarks.datasets import SampleRequest
+from vllm.config import CacheConfig
 from vllm.v1.ttft_timing import RequestTTFTTrace
 
 
@@ -399,6 +400,59 @@ def test_log_frontend_phase_includes_dispatch_policy(
     )
 
     assert any("dispatch_policy=least_batch" in message for message in messages)
+
+
+@pytest.mark.benchmark
+def test_log_gpu_kv_cache_capacity_uses_single_reserved_null_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CacheConfig:
+        num_gpu_blocks = 1024
+        block_size = 64
+
+    class _VllmConfig:
+        cache_config = _CacheConfig()
+
+    class _EngineCore:
+        engine_ranks_managed = (0, 1)
+
+    class _AsyncLLM:
+        vllm_config = _VllmConfig()
+        engine_core = _EngineCore()
+
+    messages: list[str] = []
+    monkeypatch.setattr(
+        harness_mod.logger,
+        "info",
+        lambda message, *args, **_kwargs: messages.append(
+            message % args if args else message),
+    )
+
+    harness_mod._log_gpu_kv_cache_capacity(
+        _AsyncLLM(),
+        args=Namespace(
+            request_rate=40.0,
+            data_parallel_size=2,
+            data_parallel_size_local=1,
+        ),
+        output_dir=tmp_path,
+        frontend_started_at_s=0.0,
+    )
+
+    joined = "\n".join(messages)
+    assert "managed_engines=2" in joined
+    assert "reserved_null_blocks=1" in joined
+    assert "usable_gpu_blocks=1023" in joined
+    assert "block_size=64" in joined
+    assert "total_tokens=65472" in joined
+
+
+def test_cache_config_uses_block_size_64_by_default() -> None:
+    cache_config = CacheConfig()
+
+    assert cache_config.block_size == 64
+    assert cache_config.user_specified_block_size is False
 
 
 @pytest.mark.benchmark

@@ -11,6 +11,8 @@ CLUSTER="4node_h200"
 STRATEGY="dp32"
 MODEL=""
 LENS_JSON=""
+PROMPT_LEN=""
+REQUESTS_PER_DP=""
 OUTPUT_LEN=64
 WARMUP_REQUESTS=""
 MAX_REQUESTS=""
@@ -22,6 +24,8 @@ GPU_MEMORY_UTILIZATION=""
 DATA_PARALLEL_RPC_PORT=""
 PROFILE_DELAY_ITERATIONS=33
 PAUSE_BEFORE_PROFILE=0
+IGNORE_HISTORICAL_SKIPS=0
+FORCE_NO_ASYNC_SCHEDULING=1
 
 function sanitize_tag() {
   local sanitized
@@ -35,6 +39,7 @@ function usage() {
   cat <<'EOF'
 Usage:
   start_multinode_offline_profile.sh --lens-json PATH [options]
+  start_multinode_offline_profile.sh --prompt-len N --requests-per-dp N [options]
 
 Options:
   --artifact-root PATH
@@ -42,7 +47,9 @@ Options:
   --cluster NAME                    # default: 4node_h200
   --strategy NAME                   # default: dp32
   --model NAME
-  --lens-json PATH                  # required
+  --lens-json PATH
+  --prompt-len N                    # synthetic fixed prompt_len for every request
+  --requests-per-dp N               # synthetic requests per global DP replica
   --output-len N
   --warmup-requests N
   --max-requests N|csv_rows
@@ -53,18 +60,54 @@ Options:
   --gpu-memory-utilization FLOAT
   --data-parallel-rpc-port N
   --profile-delay-iterations N      # default: 33
+  --async-scheduling               # pass --async-scheduling to harnesses
   --pause-before-profile
+  --ignore-historical-skips
   -h, --help
 
-Supported strategies:
-  dp4dcp8, dp8dcp4, dp16cp2, dp32
+Strategies with built-in offline-profile defaults:
+  dp4dcp8, dp8dcp4, dp16cp2, dp32, dp4tp4
+
+Additional runner-supported strategies:
+  dp1tp8dcp2, dp4tp8dcp2, dp4tp8dcp2_ar, dp4tp8, dp8tp4, dp16tp2
 
 Notes:
-  - This entry only supports the --lens-json flow.
+  - Pass either --lens-json, or both --prompt-len and --requests-per-dp.
   - DCP strategies rely on benchmarks/manual_multinode_poisson_runner.py as the
     topology source of truth. For dcp>1 strategies, the runner injects
     --dcp-comm-backend a2a from the strategy table.
+  - For strategies without built-in defaults, pass both --max-num-seqs and
+    --gpu-memory-utilization explicitly.
+  - dp1tp8dcp2 is single-node only; pair it with --cluster 1node_h200.
+  - dp4tp4 already enables expert parallel via the runner strategy table.
 EOF
+}
+
+function strategy_total_dp() {
+  case "$1" in
+    dp1tp8dcp2)
+      print -r -- 1
+      ;;
+    dp2tp8dcp2)
+      print -r -- 2
+      ;;
+    dp4dcp8|dp4tp8dcp2|dp4tp8dcp2_ar|dp4tp8|dp4tp4)
+      print -r -- 4
+      ;;
+    dp8dcp4|dp8tp4)
+      print -r -- 8
+      ;;
+    dp16cp2|dp16tp2)
+      print -r -- 16
+      ;;
+    dp32)
+      print -r -- 32
+      ;;
+    *)
+      echo "Unsupported strategy for synthetic request generation: $1" >&2
+      exit 1
+      ;;
+  esac
 }
 
 while (( $# > 0 )); do
@@ -91,6 +134,14 @@ while (( $# > 0 )); do
       ;;
     --lens-json)
       LENS_JSON="$2"
+      shift 2
+      ;;
+    --prompt-len)
+      PROMPT_LEN="$2"
+      shift 2
+      ;;
+    --requests-per-dp)
+      REQUESTS_PER_DP="$2"
       shift 2
       ;;
     --output-len)
@@ -133,8 +184,16 @@ while (( $# > 0 )); do
       PROFILE_DELAY_ITERATIONS="$2"
       shift 2
       ;;
+    --async-scheduling)
+      FORCE_NO_ASYNC_SCHEDULING=0
+      shift 1
+      ;;
     --pause-before-profile)
       PAUSE_BEFORE_PROFILE=1
+      shift 1
+      ;;
+    --ignore-historical-skips)
+      IGNORE_HISTORICAL_SKIPS=1
       shift 1
       ;;
     -h|--help)
@@ -149,8 +208,32 @@ while (( $# > 0 )); do
   esac
 done
 
-if [[ -z "${LENS_JSON}" ]]; then
-  echo "--lens-json is required for start_multinode_offline_profile.sh" >&2
+if [[ -n "${LENS_JSON}" && -n "${PROMPT_LEN}" ]]; then
+  echo "Pass either --lens-json or --prompt-len/--requests-per-dp, not both." >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ -n "${LENS_JSON}" && -n "${REQUESTS_PER_DP}" ]]; then
+  echo "--requests-per-dp cannot be combined with --lens-json." >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ -z "${LENS_JSON}" && -z "${PROMPT_LEN}" ]]; then
+  echo "Either --lens-json or --prompt-len must be provided." >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ -n "${PROMPT_LEN}" && -z "${REQUESTS_PER_DP}" ]]; then
+  echo "--requests-per-dp is required with --prompt-len." >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ -z "${PROMPT_LEN}" && -n "${REQUESTS_PER_DP}" ]]; then
+  echo "--prompt-len is required with --requests-per-dp." >&2
   usage >&2
   exit 1
 fi
@@ -159,17 +242,32 @@ cd "${REPO_ROOT}"
 
 EFFECTIVE_DISPATCH_POLICY="${DISPATCH_POLICY:-waiting_x4_plus_running}"
 DISPATCH_TAG="dispatch_$(sanitize_tag "${EFFECTIVE_DISPATCH_POLICY}")"
-LENS_STEM="${${LENS_JSON:t}:r}"
-PREPARED_DIR="${GENERATED_INPUT_ROOT}/${LENS_STEM}/${STRATEGY}/${DISPATCH_TAG}"
+PREPARE_INPUT_ARGS=()
+if [[ -n "${LENS_JSON}" ]]; then
+  INPUT_SOURCE_TAG="${${LENS_JSON:t}:r}"
+  PREPARE_INPUT_ARGS=(
+    --lens-json "${LENS_JSON}"
+  )
+else
+  STRATEGY_DP_SIZE="$(strategy_total_dp "${STRATEGY}")"
+  TOTAL_SYNTHETIC_REQUESTS="$(( REQUESTS_PER_DP * STRATEGY_DP_SIZE ))"
+  INPUT_SOURCE_TAG="uniform_prompt${PROMPT_LEN}_perdp${REQUESTS_PER_DP}"
+  PREPARE_INPUT_ARGS=(
+    --uniform-prompt-len "${PROMPT_LEN}"
+    --repeat-count "${TOTAL_SYNTHETIC_REQUESTS}"
+  )
+fi
+
+PREPARED_DIR="${GENERATED_INPUT_ROOT}/${INPUT_SOURCE_TAG}/${STRATEGY}/${DISPATCH_TAG}"
 PREPARE_ARGS=(
   python3
   benchmarks/offline_dp_profile/prepare_custom_lens_case.py
   --base-case-csv "${CASE_CSV}"
-  --lens-json "${LENS_JSON}"
   --output-dir "${PREPARED_DIR}"
   --output-len "${OUTPUT_LEN}"
   --cluster "${CLUSTER}"
   --strategy "${STRATEGY}"
+  "${PREPARE_INPUT_ARGS[@]}"
 )
 if [[ -n "${MODEL}" ]]; then
   PREPARE_ARGS+=(--model "${MODEL}")
@@ -204,7 +302,6 @@ RUN_CASE_CSV="${PREPARED_DIR}/custom_lens.casecsv"
 
 FRONTEND_EXTRA_ARGS=(
   --frontend-extra-arg=--profile-after-warmup
-  --frontend-extra-arg=--no-async-scheduling
   --frontend-extra-arg=--profiler-config.profiler
   --frontend-extra-arg=torch
   --frontend-extra-arg=--profiler-config.torch_profiler_dir
@@ -221,15 +318,29 @@ FRONTEND_EXTRA_ARGS=(
   --frontend-extra-arg=0
 )
 
+if [[ "${FORCE_NO_ASYNC_SCHEDULING}" == "1" ]]; then
+  FRONTEND_EXTRA_ARGS=(--frontend-extra-arg=--no-async-scheduling "${FRONTEND_EXTRA_ARGS[@]}")
+  HEADLESS_ASYNC_ARG=--headless-extra-arg=--no-async-scheduling
+else
+  FRONTEND_EXTRA_ARGS=(--frontend-extra-arg=--async-scheduling "${FRONTEND_EXTRA_ARGS[@]}")
+  HEADLESS_ASYNC_ARG=--headless-extra-arg=--async-scheduling
+fi
+
 if [[ "${PAUSE_BEFORE_PROFILE}" == "1" ]]; then
   FRONTEND_EXTRA_ARGS+=(--frontend-extra-arg=--pause-before-profile)
+fi
+
+RUNNER_ARGS=()
+if [[ "${IGNORE_HISTORICAL_SKIPS}" == "1" ]]; then
+  RUNNER_ARGS+=(--ignore-historical-skips)
 fi
 
 python3 benchmarks/manual_multinode_poisson_runner.py \
   --artifact-root "${ARTIFACT_ROOT}" \
   --case-csv "${RUN_CASE_CSV}" \
+  "${RUNNER_ARGS[@]}" \
   "${FRONTEND_EXTRA_ARGS[@]}" \
-  --headless-extra-arg=--no-async-scheduling \
+  "${HEADLESS_ASYNC_ARG}" \
   --headless-extra-arg=--profiler-config.profiler \
   --headless-extra-arg=torch \
   --headless-extra-arg=--profiler-config.torch_profiler_dir \

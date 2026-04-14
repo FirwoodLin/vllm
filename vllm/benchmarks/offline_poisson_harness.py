@@ -70,6 +70,7 @@ TTFT_SEMANTICS_DECODE_BENCH_DUMMY_PREFILL = (
 FRONTEND_TEARDOWN_HEARTBEAT_SEC = 15.0
 FRONTEND_TEARDOWN_TIMEOUT_SEC = 60.0
 GPU_KV_CACHE_CAPACITY_LOG_MARKER = "poisson_gpu_kv_cache_capacity"
+DEFAULT_RESERVED_NULL_BLOCKS = 1
 MAX_REQUESTS_CSV_ROWS = "csv_rows"
 MaxRequestsArg = int | Literal["csv_rows"] | None
 
@@ -193,7 +194,7 @@ def _log_gpu_kv_cache_capacity(
     engine_ranks_managed = getattr(async_llm.engine_core, "engine_ranks_managed",
                                    ())
     managed_engine_count = max(len(engine_ranks_managed), 1)
-    reserved_null_blocks = managed_engine_count
+    reserved_null_blocks = DEFAULT_RESERVED_NULL_BLOCKS
     usable_gpu_blocks = max(num_gpu_blocks - reserved_null_blocks, 0)
     total_tokens = usable_gpu_blocks * block_size
 

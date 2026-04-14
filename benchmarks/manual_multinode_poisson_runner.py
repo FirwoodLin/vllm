@@ -32,7 +32,6 @@ if str(BENCHMARKS_DIR) not in sys.path:
 
 from offline_profile_strategy_defaults import (  # noqa: E402
     STRATEGY_PROFILE_DEFAULTS,
-    SUPPORTED_PROFILE_STRATEGIES,
 )
 
 
@@ -99,7 +98,7 @@ DEFAULT_SHARED_CLI_ARGS = (
     "--trust-remote-code",
 )
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
-DEFAULT_BENCH_TIMEOUT_SEC = 45 * 60
+DEFAULT_BENCH_TIMEOUT_SEC = 60 * 60
 DEFAULT_SWEEP_BENCH_DURATION_SEC = 600.0
 PRESTART_CLEANUP_MAX_ATTEMPTS = 3
 PRESTART_CLEANUP_WAIT_SEC = 10.0
@@ -221,7 +220,7 @@ class ClusterSpec:
 @dataclass(frozen=True)
 class StrategySpec:
     data_parallel_size: int
-    data_parallel_size_local: int
+    data_parallel_size_local: int | None
     tensor_parallel_size: int
     decode_context_parallel_size: int = 1
     data_parallel_backend: str = "mp"
@@ -395,15 +394,24 @@ DATASETS: dict[str, str] = {
 CLUSTERS: dict[str, ClusterSpec] = {
     "1node_h200":
     ClusterSpec(
-        master_addr="127.0.0.1",
+        master_addr=os.environ.get("VLLM_1NODE_H200_MASTER_ADDR", "127.0.0.1"),
         master_port=29579,
         remote_hosts=(),
     ),
     "2node_h200":
     ClusterSpec(
-        master_addr="10.102.98.166",
+        master_addr=os.environ.get("VLLM_2NODE_H200_MASTER_ADDR",
+                                   "10.102.97.179"),
+        # master_addr="10.102.248.165",
         master_port=29579,
         remote_hosts=("h200-rjob1", ),
+    ),
+    "2node-1and3":
+    ClusterSpec(
+        master_addr=os.environ.get("VLLM_2NODE_1AND3_MASTER_ADDR",
+                                   "10.102.215.76"),
+        master_port=29579,
+        remote_hosts=("h200-rjob2", ),
     ),
     # "4node_h200":
     # ClusterSpec(
@@ -413,7 +421,8 @@ CLUSTERS: dict[str, ClusterSpec] = {
     # ),
     "4node_h200":
     ClusterSpec(
-        master_addr="10.102.215.76",
+        master_addr=os.environ.get("VLLM_4NODE_H200_MASTER_ADDR",
+                                   "10.102.97.179"),
         master_port=29579,
         remote_hosts=("h200-rjob1", "h200-rjob2", "h200-rjob3"),
     ),
@@ -491,6 +500,18 @@ STRATEGIES: dict[str, StrategySpec] = {
         all2all_backend="deepep_low_latency",
         dcp_comm_backend="a2a",
     ),
+    "dp2tp8dcp2":
+    StrategySpec(
+        data_parallel_size=2,
+        data_parallel_size_local=1,
+        tensor_parallel_size=8,
+        decode_context_parallel_size=2,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASH_ATTN",
+        all2all_backend="deepep_low_latency",
+        dcp_comm_backend="a2a",
+    ),
     "dp4tp8dcp2_ar":
     StrategySpec(
         data_parallel_size=4,
@@ -508,6 +529,17 @@ STRATEGIES: dict[str, StrategySpec] = {
         data_parallel_size=4,
         data_parallel_size_local=1,
         tensor_parallel_size=8,
+        decode_context_parallel_size=1,
+        data_parallel_backend="mp",
+        enable_expert_parallel=True,
+        attention_backend="FLASH_ATTN",
+        all2all_backend="deepep_low_latency",
+    ),
+    "dp4tp4":
+    StrategySpec(
+        data_parallel_size=4,
+        data_parallel_size_local=None,
+        tensor_parallel_size=4,
         decode_context_parallel_size=1,
         data_parallel_backend="mp",
         enable_expert_parallel=True,
@@ -540,16 +572,21 @@ STRATEGIES: dict[str, StrategySpec] = {
 
 QWEN_SUPPORTED_STRATEGIES: tuple[str, ...] = (
     "dp4tp8dcp2",
+    "dp4tp4",
     "dp8tp4",
     "dp4tp8",
     "dp16tp2",
 )
-QWEN_CASE_ONLY_STRATEGIES: tuple[str, ...] = ("dp1tp8dcp2", )
+QWEN_CASE_ONLY_STRATEGIES: tuple[str, ...] = (
+    "dp1tp8dcp2",
+    "dp2tp8dcp2",
+)
 QWEN_ALLOWED_STRATEGIES: tuple[str, ...] = (QWEN_SUPPORTED_STRATEGIES +
                                              QWEN_CASE_ONLY_STRATEGIES)
 QWEN_STRATEGY_PROFILE_DEFAULTS: dict[str, tuple[int, float]] = {
     "dp4tp8dcp2": (1024, DEFAULT_GPU_MEMORY_UTILIZATION),
     "dp1tp8dcp2": (768, DEFAULT_GPU_MEMORY_UTILIZATION),
+    "dp4tp4": (384, DEFAULT_GPU_MEMORY_UTILIZATION),
     "dp8tp4": (768, DEFAULT_GPU_MEMORY_UTILIZATION),
     "dp4tp8": (1024, DEFAULT_GPU_MEMORY_UTILIZATION),
     "dp16tp2": (512, DEFAULT_GPU_MEMORY_UTILIZATION),
@@ -561,7 +598,12 @@ SWEEP_MODELS: tuple[str, ...] = (
     "kimi_k2_instruct_0905",
     "deepseek_v3_1024k",
 )
-SWEEP_STRATEGIES: tuple[str, ...] = SUPPORTED_PROFILE_STRATEGIES
+SWEEP_STRATEGIES: tuple[str, ...] = (
+    "dp4dcp8",
+    "dp8dcp4",
+    "dp16cp2",
+    "dp32",
+)
 STRATEGY_MAX_NUM_SEQS: dict[str, int] = {
     strategy_name: defaults.max_num_seqs
     for strategy_name, defaults in STRATEGY_PROFILE_DEFAULTS.items()
@@ -1142,6 +1184,21 @@ def resolve_case(
     if resolved_cluster.nnodes <= 0:
         raise SystemExit(f"Resolved cluster for case '{case.name}' has no nodes.")
 
+    if strategy.data_parallel_size_local is None:
+        if strategy.data_parallel_size % resolved_cluster.nnodes != 0:
+            raise SystemExit(
+                "Strategy / cluster mismatch for "
+                f"'{case.name}': dp={strategy.data_parallel_size}, "
+                f"nnodes={resolved_cluster.nnodes}, "
+                "cannot evenly derive dp_local from the node count."
+            )
+        effective_dp_local = (
+            strategy.data_parallel_size // resolved_cluster.nnodes
+        )
+    else:
+        effective_dp_local = strategy.data_parallel_size_local
+
+    strategy = replace(strategy, data_parallel_size_local=effective_dp_local)
     expected_dp = resolved_cluster.nnodes * strategy.data_parallel_size_local
     if strategy.data_parallel_size != expected_dp:
         raise SystemExit(

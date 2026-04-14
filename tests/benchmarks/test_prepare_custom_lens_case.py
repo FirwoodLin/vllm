@@ -214,6 +214,124 @@ def test_prepare_custom_lens_case_applies_strategy_profile_defaults(
     assert case_rows[0]["gpu_memory_utilization"] == "0.85"
 
 
+def test_prepare_custom_lens_case_applies_qwen_strategy_profile_defaults(
+        tmp_path: Path) -> None:
+    module = load_module()
+    base_case_csv = tmp_path / "base.casecsv"
+    base_case_csv.write_text(
+        (
+            "enabled,name,cluster,model,dataset,strategy,dispatch_policy,"
+            "request_rate,rate_phase,max_num_seqs,gpu_memory_utilization,"
+            "max_requests,warmup_requests,max_model_len,data_parallel_rpc_port,"
+            "reason,historical_reference\n"
+            "1,offline_profile_template,cluster_a,model_a,dataset_a,dp32,"
+            "waiting_x4_plus_running,40.0,offline_profile,,,32,32,1000000,"
+            "29550,reason,\n"
+        ),
+        encoding="utf-8",
+    )
+    lens_json = tmp_path / "issue01.json"
+    lens_json.write_text("[31, 37]\n", encoding="utf-8")
+    output_dir = tmp_path / "prepared"
+
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = [
+            str(MODULE_PATH),
+            "--base-case-csv",
+            str(base_case_csv),
+            "--lens-json",
+            str(lens_json),
+            "--output-dir",
+            str(output_dir),
+            "--strategy",
+            "dp4tp4",
+        ]
+        module.main()
+    finally:
+        sys.argv = old_argv
+
+    case_rows = read_csv_rows(output_dir / "custom_lens.casecsv")
+
+    assert len(case_rows) == 1
+    assert case_rows[0]["name"] == "offline_profile_template__dp4tp4__issue01"
+    assert case_rows[0]["strategy"] == "dp4tp4"
+    assert case_rows[0]["max_num_seqs"] == "384"
+    assert case_rows[0]["gpu_memory_utilization"] == "0.85"
+
+
+def test_prepare_custom_lens_case_supports_uniform_prompt_workloads(
+        tmp_path: Path) -> None:
+    module = load_module()
+    base_case_csv = tmp_path / "base.casecsv"
+    base_case_csv.write_text(
+        (
+            "enabled,name,cluster,model,dataset,strategy,dispatch_policy,"
+            "request_rate,rate_phase,max_num_seqs,gpu_memory_utilization,"
+            "max_requests,warmup_requests,max_model_len,data_parallel_rpc_port,"
+            "reason,historical_reference\n"
+            "1,offline_profile_template,cluster_a,model_a,dataset_a,dp32,"
+            "waiting_x4_plus_running,40.0,offline_profile,,,32,32,1000000,"
+            "29550,reason,\n"
+        ),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "prepared"
+
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = [
+            str(MODULE_PATH),
+            "--base-case-csv",
+            str(base_case_csv),
+            "--uniform-prompt-len",
+            "2048",
+            "--repeat-count",
+            "2048",
+            "--output-dir",
+            str(output_dir),
+            "--strategy",
+            "dp4tp4",
+            "--model",
+            "/mnt/nvme1n1/ml_research/models/qwen3-235B-fp8",
+            "--dispatch-policy",
+            "least_batch",
+            "--max-requests",
+            "csv_rows",
+        ]
+        module.main()
+    finally:
+        sys.argv = old_argv
+
+    length_rows = read_csv_rows(
+        output_dir / "custom_lens.dispatch_least_batch.lengths.csv")
+    case_rows = read_csv_rows(output_dir / "custom_lens.casecsv")
+
+    assert len(length_rows) == 2048
+    assert length_rows[0] == {
+        "prompt_len": "2048",
+        "output_len": "64",
+    }
+    assert length_rows[-1] == {
+        "prompt_len": "2048",
+        "output_len": "64",
+    }
+    assert len(case_rows) == 1
+    assert case_rows[0]["name"] == (
+        "offline_profile_template__dp4tp4__uniform_prompt2048_x2048"
+        "__dispatch_least_batch"
+    )
+    assert case_rows[0]["strategy"] == "dp4tp4"
+    assert case_rows[0]["model"] == (
+        "/mnt/nvme1n1/ml_research/models/qwen3-235B-fp8"
+    )
+    assert case_rows[0]["max_requests"] == "csv_rows"
+    assert case_rows[0]["max_num_seqs"] == "384"
+    assert case_rows[0]["gpu_memory_utilization"] == "0.85"
+    assert case_rows[0]["dataset"] == str(
+        (output_dir / "custom_lens.dispatch_least_batch.lengths.csv").resolve())
+
+
 def test_prepare_custom_lens_case_supports_csv_rows_max_requests(
         tmp_path: Path) -> None:
     module = load_module()

@@ -12,11 +12,13 @@ class ProfileStrategyDefaults:
     gpu_memory_utilization: float
 
 
+# Strategies with built-in defaults for prepare_custom_lens_case.py.
 SUPPORTED_PROFILE_STRATEGIES: tuple[str, ...] = (
     "dp4dcp8",
     "dp8dcp4",
     "dp16cp2",
     "dp32",
+    "dp4tp4",
 )
 
 STRATEGY_PROFILE_DEFAULTS: dict[str, ProfileStrategyDefaults] = {
@@ -36,6 +38,10 @@ STRATEGY_PROFILE_DEFAULTS: dict[str, ProfileStrategyDefaults] = {
         max_num_seqs=256,
         gpu_memory_utilization=0.87,
     ),
+    "dp4tp4": ProfileStrategyDefaults(
+        max_num_seqs=384,
+        gpu_memory_utilization=0.85,
+    ),
 }
 
 
@@ -45,6 +51,7 @@ def get_strategy_profile_defaults(strategy: str) -> ProfileStrategyDefaults:
     except KeyError as exc:
         supported = ", ".join(SUPPORTED_PROFILE_STRATEGIES)
         raise ValueError(
-            f"Unknown profile strategy '{strategy}'. Supported values: "
-            f"{supported}"
+            f"No built-in offline profile defaults for strategy '{strategy}'. "
+            f"Strategies with defaults: {supported}. Pass --max-num-seqs and "
+            "--gpu-memory-utilization explicitly for other strategies."
         ) from exc

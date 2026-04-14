@@ -15,6 +15,7 @@ DISPATCH_POLICY=""
 CASE_NAME=""
 PROFILE_DELAY_ITERATIONS=33
 PAUSE_BEFORE_PROFILE=0
+IGNORE_HISTORICAL_SKIPS=0
 
 function usage() {
   cat <<'EOF'
@@ -33,6 +34,7 @@ Options:
   --case-name NAME
   --profile-delay-iterations N   # default: 33
   --pause-before-profile
+  --ignore-historical-skips
   -h, --help
 
 When --lens-json is set, the script first converts the nested JSON input lengths
@@ -85,6 +87,10 @@ while (( $# > 0 )); do
       ;;
     --pause-before-profile)
       PAUSE_BEFORE_PROFILE=1
+      shift 1
+      ;;
+    --ignore-historical-skips)
+      IGNORE_HISTORICAL_SKIPS=1
       shift 1
       ;;
     -h|--help)
@@ -156,9 +162,15 @@ if [[ "${PAUSE_BEFORE_PROFILE}" == "1" ]]; then
   FRONTEND_EXTRA_ARGS+=(--frontend-extra-arg=--pause-before-profile)
 fi
 
+RUNNER_ARGS=()
+if [[ "${IGNORE_HISTORICAL_SKIPS}" == "1" ]]; then
+  RUNNER_ARGS+=(--ignore-historical-skips)
+fi
+
 python3 benchmarks/manual_multinode_poisson_runner.py \
   --artifact-root "${ARTIFACT_ROOT}" \
   --case-csv "${RUN_CASE_CSV}" \
+  "${RUNNER_ARGS[@]}" \
   "${FRONTEND_EXTRA_ARGS[@]}" \
   --headless-extra-arg=--no-async-scheduling \
   --headless-extra-arg=--profiler-config.profiler \

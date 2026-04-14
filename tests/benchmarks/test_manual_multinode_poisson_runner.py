@@ -14,6 +14,8 @@ MODULE_PATH = (Path(__file__).resolve().parents[2] / "benchmarks" /
                "manual_multinode_poisson_runner.py")
 PLAN_0412_DIR = (Path(__file__).resolve().parents[2] / "benchmarks" /
                  "plans-unfinished" / "0412")
+PLAN_0413_DIR = (Path(__file__).resolve().parents[2] / "benchmarks" /
+                 "plans-unfinished" / "0413")
 
 
 def load_runner_module():
@@ -190,10 +192,11 @@ def test_build_experiment_matrix_uses_qwen_strategies_by_default() -> None:
         datasets=("issue01_random", ),
     )
 
-    assert len(cases) == 36
+    assert len(cases) == 45
     assert {case.model for case in cases} == {"qwen3_235b_fp8_1024k"}
     assert {case.strategy for case in cases} == {
         "dp4tp8dcp2",
+        "dp4tp4",
         "dp8tp4",
         "dp4tp8",
         "dp16tp2",
@@ -298,6 +301,53 @@ def test_qwen_single_node_strategy_is_case_only_but_allowed(
 
 
 @pytest.mark.benchmark
+def test_qwen_two_node_strategy_is_case_only_but_allowed(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "qwen3-235B-fp8-1024k"
+    model_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+
+    assert "dp2tp8dcp2" not in runner.supported_strategies_for_model(
+        "qwen3_235b_fp8_1024k")
+
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="qwen_two_node_case",
+            cluster="2node_h200",
+            strategy="dp2tp8dcp2",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=100.0,
+            max_num_seqs=768,
+            max_model_len=1000000,
+        ),
+        clusters=runner.CLUSTERS,
+        strategies=runner.STRATEGIES,
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    frontend_argv = runner.build_frontend_argv(resolved, output_dir)
+
+    assert resolved.cluster.nnodes == 2
+    assert resolved.cluster.remote_hosts == ("h200-rjob1", )
+    assert frontend_argv[frontend_argv.index("--data-parallel-size") + 1] == "2"
+    assert frontend_argv[
+        frontend_argv.index("--data-parallel-size-local") + 1] == "1"
+    assert frontend_argv[
+        frontend_argv.index("--tensor-parallel-size") + 1] == "8"
+    assert frontend_argv[
+        frontend_argv.index("--decode-context-parallel-size") + 1] == "2"
+    assert frontend_argv[
+        frontend_argv.index("--attention-backend") + 1] == "FLASH_ATTN"
+    assert "--enable-expert-parallel" in frontend_argv
+    assert frontend_argv[frontend_argv.index("--dcp-comm-backend") + 1] == "a2a"
+
+
+@pytest.mark.benchmark
 def test_load_single_node_qwen_case_csv() -> None:
     runner = load_runner_module()
     case_csv = (PLAN_0412_DIR /
@@ -311,6 +361,22 @@ def test_load_single_node_qwen_case_csv() -> None:
     assert {case.strategy for case in cases} == {"dp1tp8dcp2"}
     assert cases[0].request_rate == pytest.approx(5.0)
     assert cases[-1].request_rate == pytest.approx(100.0)
+
+
+@pytest.mark.benchmark
+def test_load_two_node_qwen_case_csv() -> None:
+    runner = load_runner_module()
+    case_csv = (PLAN_0413_DIR /
+                "qwen3_235b_issue05random_dp2tp8dcp2_waiting_x4_plus_running_"
+                "rate10_2node.csv")
+
+    cases = runner.load_cases_from_csv(case_csv)
+
+    assert len(cases) == 1
+    assert {case.cluster for case in cases} == {"2node_h200"}
+    assert {case.strategy for case in cases} == {"dp2tp8dcp2"}
+    assert cases[0].request_rate == pytest.approx(10.0)
+    assert cases[0].max_num_seqs == 768
 
 
 @pytest.mark.benchmark
@@ -359,6 +425,90 @@ def test_qwen_dp4tp8_strategy_builds_ep_argv_without_dcp(
     assert frontend_argv[
         frontend_argv.index("--all2all-backend") + 1] == "deepep_low_latency"
     assert "--dcp-comm-backend" not in frontend_argv
+
+
+@pytest.mark.benchmark
+def test_qwen_dp4tp4_strategy_builds_ep_argv_for_2node_1and3_cluster(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "qwen3-235B-fp8-1024k"
+    model_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="qwen_dp4tp4_case",
+            cluster="2node-1and3",
+            strategy="dp4tp4",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=100.0,
+            max_num_seqs=384,
+            max_model_len=1000000,
+        ),
+        clusters=runner.CLUSTERS,
+        strategies=runner.STRATEGIES,
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    frontend_argv = runner.build_frontend_argv(resolved, output_dir)
+
+    assert resolved.cluster.nnodes == 2
+    assert resolved.cluster.remote_hosts == ("h200-rjob2", )
+    assert frontend_argv[frontend_argv.index("--data-parallel-size") + 1] == "4"
+    assert frontend_argv[
+        frontend_argv.index("--data-parallel-size-local") + 1] == "2"
+    assert frontend_argv[
+        frontend_argv.index("--tensor-parallel-size") + 1] == "4"
+    assert frontend_argv[
+        frontend_argv.index("--decode-context-parallel-size") + 1] == "1"
+    assert frontend_argv[
+        frontend_argv.index("--attention-backend") + 1] == "FLASH_ATTN"
+    assert "--enable-expert-parallel" in frontend_argv
+    assert frontend_argv[
+        frontend_argv.index("--all2all-backend") + 1] == "deepep_low_latency"
+    assert "--dcp-comm-backend" not in frontend_argv
+
+
+@pytest.mark.benchmark
+def test_qwen_dp4tp4_strategy_auto_derives_dp_local_for_4node_h200_cluster(
+        tmp_path: Path) -> None:
+    runner = load_runner_module()
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "qwen3-235B-fp8"
+    model_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="qwen_dp4tp4_case_4node",
+            cluster="4node_h200",
+            strategy="dp4tp4",
+            dataset="dataset_alias",
+            model="model_alias",
+            request_rate=100.0,
+            max_num_seqs=384,
+            max_model_len=1000000,
+        ),
+        clusters=runner.CLUSTERS,
+        strategies=runner.STRATEGIES,
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    frontend_argv = runner.build_frontend_argv(resolved, output_dir)
+
+    assert resolved.cluster.nnodes == 4
+    assert frontend_argv[frontend_argv.index("--data-parallel-size") + 1] == "4"
+    assert frontend_argv[
+        frontend_argv.index("--data-parallel-size-local") + 1] == "1"
+    assert frontend_argv[
+        frontend_argv.index("--tensor-parallel-size") + 1] == "4"
+    assert "--enable-expert-parallel" in frontend_argv
 
 
 @pytest.mark.benchmark

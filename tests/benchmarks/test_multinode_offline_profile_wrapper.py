@@ -52,6 +52,32 @@ def load_logged_calls(path: Path) -> list[list[str]]:
 
 
 @pytest.mark.benchmark
+def test_start_multinode_offline_profile_help_mentions_manual_strategy_inputs(
+        tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            "zsh",
+            str(WRAPPER_PATH),
+            "--help",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "Strategies with built-in offline-profile defaults:" in result.stdout
+    assert "Additional runner-supported strategies:" in result.stdout
+    assert "dp1tp8dcp2" in result.stdout
+    assert "dp4tp8dcp2" in result.stdout
+    assert "--max-num-seqs" in result.stdout
+    assert "--gpu-memory-utilization" in result.stdout
+    assert "--cluster 1node_h200" in result.stdout
+    assert "--prompt-len N" in result.stdout
+    assert "--requests-per-dp N" in result.stdout
+
+
+@pytest.mark.benchmark
 def test_start_multinode_offline_profile_defaults_to_dp32_for_lens_json(
         tmp_path: Path) -> None:
     lens_json = tmp_path / "short.json"
@@ -177,3 +203,147 @@ def test_start_multinode_offline_profile_isolates_lens_inputs_by_strategy(
     assert "--frontend-extra-arg=--pause-before-profile" in runner_call
     assert "--frontend-extra-arg=32" in runner_call
     assert "--headless-extra-arg=32" in runner_call
+
+
+@pytest.mark.benchmark
+def test_start_multinode_offline_profile_supports_qwen_dp4tp4_on_2node_1and3(
+        tmp_path: Path) -> None:
+    lens_json = tmp_path / "short.json"
+    lens_json.write_text("[[11, 13], [17]]\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log_path = tmp_path / "python_calls.jsonl"
+    write_fake_python(fake_bin / "python3", log_path)
+
+    generated_input_root = tmp_path / "generated_inputs"
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["GENERATED_INPUT_ROOT"] = str(generated_input_root)
+
+    subprocess.run(
+        [
+            "zsh",
+            str(WRAPPER_PATH),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--cluster",
+            "2node-1and3",
+            "--strategy",
+            "dp4tp4",
+            "--model",
+            "qwen3_235b_fp8_1024k",
+            "--lens-json",
+            str(lens_json),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    prepared_dir = (generated_input_root / "short" / "dp4tp4" /
+                    "dispatch_waiting_x4_plus_running")
+    case_rows = read_csv_rows(prepared_dir / "custom_lens.casecsv")
+
+    assert len(case_rows) == 1
+    assert case_rows[0]["cluster"] == "2node-1and3"
+    assert case_rows[0]["strategy"] == "dp4tp4"
+    assert case_rows[0]["model"] == "qwen3_235b_fp8_1024k"
+    assert case_rows[0]["max_num_seqs"] == "384"
+    assert case_rows[0]["gpu_memory_utilization"] == "0.85"
+
+    logged_calls = load_logged_calls(log_path)
+    prepare_call = next(call for call in logged_calls
+                        if call[0].endswith(
+                            "benchmarks/offline_dp_profile/prepare_custom_lens_case.py"
+                        ))
+    runner_call = next(call for call in logged_calls
+                       if call[0].endswith(
+                           "benchmarks/manual_multinode_poisson_runner.py"))
+
+    assert "--cluster" in prepare_call
+    assert "2node-1and3" in prepare_call
+    assert "--strategy" in prepare_call
+    assert "dp4tp4" in prepare_call
+    assert "--case-csv" in runner_call
+    assert str(prepared_dir / "custom_lens.casecsv") in runner_call
+
+
+@pytest.mark.benchmark
+def test_start_multinode_offline_profile_supports_uniform_qwen_dp4tp4_workload(
+        tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log_path = tmp_path / "python_calls.jsonl"
+    write_fake_python(fake_bin / "python3", log_path)
+
+    generated_input_root = tmp_path / "generated_inputs"
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["GENERATED_INPUT_ROOT"] = str(generated_input_root)
+
+    subprocess.run(
+        [
+            "zsh",
+            str(WRAPPER_PATH),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--cluster",
+            "4node_h200",
+            "--strategy",
+            "dp4tp4",
+            "--model",
+            "/mnt/nvme1n1/ml_research/models/qwen3-235B-fp8",
+            "--prompt-len",
+            "2048",
+            "--requests-per-dp",
+            "512",
+            "--dispatch-policy",
+            "least_batch",
+            "--max-requests",
+            "csv_rows",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    prepared_dir = (generated_input_root / "uniform_prompt2048_perdp512" /
+                    "dp4tp4" / "dispatch_least_batch")
+    case_rows = read_csv_rows(prepared_dir / "custom_lens.casecsv")
+    length_rows = read_csv_rows(
+        prepared_dir / "custom_lens.dispatch_least_batch.lengths.csv")
+
+    assert len(case_rows) == 1
+    assert case_rows[0]["cluster"] == "4node_h200"
+    assert case_rows[0]["strategy"] == "dp4tp4"
+    assert case_rows[0]["model"] == (
+        "/mnt/nvme1n1/ml_research/models/qwen3-235B-fp8"
+    )
+    assert case_rows[0]["max_requests"] == "csv_rows"
+    assert case_rows[0]["max_num_seqs"] == "384"
+    assert case_rows[0]["gpu_memory_utilization"] == "0.85"
+    assert len(length_rows) == 2048
+    assert length_rows[0] == {
+        "prompt_len": "2048",
+        "output_len": "64",
+    }
+    assert length_rows[-1] == {
+        "prompt_len": "2048",
+        "output_len": "64",
+    }
+
+    logged_calls = load_logged_calls(log_path)
+    prepare_call = next(call for call in logged_calls
+                        if call[0].endswith(
+                            "benchmarks/offline_dp_profile/prepare_custom_lens_case.py"
+                        ))
+    runner_call = next(call for call in logged_calls
+                       if call[0].endswith(
+                           "benchmarks/manual_multinode_poisson_runner.py"))
+
+    assert "--uniform-prompt-len" in prepare_call
+    assert "2048" in prepare_call
+    assert "--repeat-count" in prepare_call
+    assert "2048" in prepare_call
+    assert "--case-csv" in runner_call
+    assert str(prepared_dir / "custom_lens.casecsv") in runner_call

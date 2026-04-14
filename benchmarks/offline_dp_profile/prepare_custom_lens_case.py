@@ -58,18 +58,28 @@ def positive_float(value: str) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare an offline_dp_profile case from a nested input-length JSON "
-            "file by generating a prompt_len/output_len CSV and a derived casecsv."
+            "Prepare an offline_dp_profile case from either a nested "
+            "input-length JSON file or a synthetic fixed-length workload by "
+            "generating a prompt_len/output_len CSV and a derived casecsv. "
+            "Strategies with no built-in offline-profile defaults must pass "
+            "--max-num-seqs and --gpu-memory-utilization explicitly."
         ))
     parser.add_argument(
         "--base-case-csv",
         required=True,
         help="Template casecsv to copy and override.",
     )
-    parser.add_argument(
+    input_source_group = parser.add_mutually_exclusive_group(required=True)
+    input_source_group.add_argument(
         "--lens-json",
-        required=True,
+        default=None,
         help="JSON file containing integers or nested integer lists.",
+    )
+    input_source_group.add_argument(
+        "--uniform-prompt-len",
+        type=positive_int,
+        default=None,
+        help="Generate a synthetic workload with this prompt_len on every row.",
     )
     parser.add_argument(
         "--output-dir",
@@ -83,6 +93,15 @@ def parse_args() -> argparse.Namespace:
         help="output_len written to every generated CSV row.",
     )
     parser.add_argument(
+        "--repeat-count",
+        type=positive_int,
+        default=None,
+        help=(
+            "When --uniform-prompt-len is used, generate this many CSV rows "
+            "with the same prompt_len."
+        ),
+    )
+    parser.add_argument(
         "--cluster",
         default=None,
         help="Override cluster in the derived casecsv.",
@@ -90,7 +109,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         default=None,
-        help="Override strategy in the derived casecsv.",
+        help=(
+            "Override strategy in the derived casecsv. If the strategy has no "
+            "built-in offline-profile defaults, also pass --max-num-seqs and "
+            "--gpu-memory-utilization."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -123,13 +146,19 @@ def parse_args() -> argparse.Namespace:
         "--max-num-seqs",
         type=positive_int,
         default=None,
-        help="Override max_num_seqs in the derived casecsv.",
+        help=(
+            "Override max_num_seqs in the derived casecsv. Required for "
+            "strategies without built-in offline-profile defaults."
+        ),
     )
     parser.add_argument(
         "--gpu-memory-utilization",
         type=positive_float,
         default=None,
-        help="Override gpu_memory_utilization in the derived casecsv.",
+        help=(
+            "Override gpu_memory_utilization in the derived casecsv. Required "
+            "for strategies without built-in offline-profile defaults."
+        ),
     )
     parser.add_argument(
         "--data-parallel-rpc-port",
@@ -151,7 +180,14 @@ def parse_args() -> argparse.Namespace:
             "<base_name>__<strategy>__<lens_stem>[__dispatch_<policy>]."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.uniform_prompt_len is not None and args.repeat_count is None:
+        parser.error("--repeat-count is required with --uniform-prompt-len.")
+    if args.uniform_prompt_len is None and args.repeat_count is not None:
+        parser.error("--repeat-count requires --uniform-prompt-len.")
+
+    return args
 
 
 def _flatten_nested_lengths(node: object) -> list[int]:
@@ -180,6 +216,10 @@ def _flatten_nested_lengths(node: object) -> list[int]:
 def load_input_lengths(path: Path) -> list[int]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return _flatten_nested_lengths(payload)
+
+
+def build_uniform_input_lengths(prompt_len: int, repeat_count: int) -> list[int]:
+    return [prompt_len] * repeat_count
 
 
 def sanitize_tag(raw_value: str) -> str:
@@ -238,11 +278,22 @@ def write_case_csv(path: Path, fieldnames: list[str], row: dict[str, str]) -> No
 def main() -> None:
     args = parse_args()
     base_case_csv = Path(args.base_case_csv).expanduser().resolve()
-    lens_json = Path(args.lens_json).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
 
     fieldnames, base_row = read_base_case(base_case_csv)
-    input_lengths = load_input_lengths(lens_json)
+    if args.lens_json is not None:
+        lens_json = Path(args.lens_json).expanduser().resolve()
+        input_lengths = load_input_lengths(lens_json)
+        input_source_tag = lens_json.stem
+    else:
+        input_lengths = build_uniform_input_lengths(
+            args.uniform_prompt_len,
+            args.repeat_count,
+        )
+        input_source_tag = (
+            f"uniform_prompt{args.uniform_prompt_len}"
+            f"_x{args.repeat_count}"
+        )
 
     derived_row = dict(base_row)
     effective_strategy = (
@@ -263,7 +314,7 @@ def main() -> None:
     derived_case_name_parts = [base_case_name]
     if effective_strategy:
         derived_case_name_parts.append(effective_strategy)
-    derived_case_name_parts.append(lens_json.stem)
+    derived_case_name_parts.append(input_source_tag)
     if effective_dispatch_policy != DEFAULT_DISPATCH_POLICY:
         derived_case_name_parts.append(dispatch_tag)
     derived_case_name = args.case_name or "__".join(derived_case_name_parts)
@@ -303,9 +354,13 @@ def main() -> None:
     write_length_csv(length_csv_path, input_lengths, args.output_len)
     write_case_csv(case_csv_path, fieldnames, derived_row)
 
-    print("Prepared offline profile inputs from custom lens JSON")
+    print("Prepared offline profile inputs")
     print(f"  base_case_csv: {base_case_csv}")
-    print(f"  lens_json: {lens_json}")
+    if args.lens_json is not None:
+        print(f"  lens_json: {lens_json}")
+    else:
+        print(f"  uniform_prompt_len: {args.uniform_prompt_len}")
+        print(f"  repeat_count: {args.repeat_count}")
     print(f"  flattened_lengths: {len(input_lengths)}")
     print(f"  output_len: {args.output_len}")
     print(f"  length_csv: {length_csv_path}")
