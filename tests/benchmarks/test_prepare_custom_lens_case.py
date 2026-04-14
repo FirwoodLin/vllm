@@ -332,6 +332,85 @@ def test_prepare_custom_lens_case_supports_uniform_prompt_workloads(
         (output_dir / "custom_lens.dispatch_least_batch.lengths.csv").resolve())
 
 
+def test_prepare_custom_lens_case_supports_explicit_rank_replay(
+        tmp_path: Path) -> None:
+    module = load_module()
+    base_case_csv = tmp_path / "base.casecsv"
+    base_case_csv.write_text(
+        (
+            "enabled,name,cluster,model,dataset,strategy,dispatch_policy,"
+            "request_rate,rate_phase,max_num_seqs,gpu_memory_utilization,"
+            "max_requests,warmup_requests,max_model_len,data_parallel_rpc_port,"
+            "reason,historical_reference\n"
+            "1,offline_profile_template,cluster_a,model_a,dataset_a,dp32,"
+            "waiting_x4_plus_running,40.0,offline_profile,,,32,32,1000000,"
+            "29550,reason,\n"
+        ),
+        encoding="utf-8",
+    )
+    lens_json = tmp_path / "mix.json"
+    lens_json.write_text(str(([524288] * 4) + ([2048] * 16)) + "\n",
+                         encoding="utf-8")
+    output_dir = tmp_path / "prepared"
+
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = [
+            str(MODULE_PATH),
+            "--base-case-csv",
+            str(base_case_csv),
+            "--lens-json",
+            str(lens_json),
+            "--output-dir",
+            str(output_dir),
+            "--output-len",
+            "64",
+            "--strategy",
+            "dp8dcp4",
+            "--dispatch-policy",
+            "least_batch",
+            "--routing-mode",
+            "explicit_rank_replay",
+            "--data-parallel-size",
+            "8",
+            "--data-parallel-size-local",
+            "2",
+            "--warmup-short-rows",
+            "8",
+        ]
+        module.main()
+    finally:
+        sys.argv = old_argv
+
+    length_rows = read_csv_rows(
+        output_dir / "custom_lens.dispatch_least_batch.lengths.csv")
+    case_rows = read_csv_rows(output_dir / "custom_lens.casecsv")
+
+    assert len(length_rows) == 20
+    assert all(row["prompt_len"] == "2048" for row in length_rows[:8])
+    assert [row["data_parallel_rank"] for row in length_rows[:8]] == [
+        str(rank) for rank in range(8)
+    ]
+
+    per_node_longs = [0, 0, 0, 0]
+    per_node_shorts = [0, 0, 0, 0]
+    for row in length_rows:
+        rank = int(row["data_parallel_rank"])
+        node = rank // 2
+        if row["prompt_len"] == "524288":
+            per_node_longs[node] += 1
+        else:
+            per_node_shorts[node] += 1
+
+    assert per_node_longs == [1, 1, 1, 1]
+    assert per_node_shorts == [4, 4, 4, 4]
+    assert len(case_rows) == 1
+    assert case_rows[0]["name"] == (
+        "offline_profile_template__dp8dcp4__mix__dispatch_least_batch__"
+        "routing_explicit_rank_replay"
+    )
+
+
 def test_prepare_custom_lens_case_supports_csv_rows_max_requests(
         tmp_path: Path) -> None:
     module = load_module()

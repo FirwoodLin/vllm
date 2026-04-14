@@ -88,6 +88,7 @@ class SampleRequest:
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
     lora_request: LoRARequest | None = None
     request_id: str | None = None
+    data_parallel_rank: int | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -613,7 +614,7 @@ class RandomDataset(BenchmarkDataset):
             num_requests=num_requests,
             no_oversample=no_oversample,
         )
-        if any(row["prompt_len"] < prefix_len for row in csv_lengths):
+        if any((row["prompt_len"] or 0) < prefix_len for row in csv_lengths):
             raise ValueError(
                 "CSV prompt_len must be greater than or equal to "
                 "--random-prefix-len for every row."
@@ -628,23 +629,34 @@ class RandomDataset(BenchmarkDataset):
 
         requests = []
         for i, row in enumerate(csv_lengths):
+            prompt_len = row["prompt_len"]
+            output_len = row["output_len"]
+            data_parallel_rank = row["data_parallel_rank"]
+            assert prompt_len is not None
+            assert output_len is not None
             prompt_token_ids = self._generate_exact_prompt_token_ids(
                 prefix_token_ids=prefix_token_ids,
                 allowed_tokens=allowed_tokens,
-                prompt_len=row["prompt_len"],
+                prompt_len=prompt_len,
                 offset=int(offsets[i]),
                 index=i,
             )
             requests.append(
                 SampleRequest(
                     prompt=prompt_token_ids,
-                    prompt_len=row["prompt_len"],
-                    expected_output_len=row["output_len"],
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
                     request_id=request_id_prefix + str(i),
+                    data_parallel_rank=data_parallel_rank,
                 )
             )
 
         if batchsize > 1:
+            if any(request.data_parallel_rank is not None for request in requests):
+                raise ValueError(
+                    "random_csv_path with data_parallel_rank is incompatible "
+                    "with batchsize > 1."
+                )
             batch_requests = []
             for i in range(0, len(requests), batchsize):
                 batch = requests[i : i + batchsize]
@@ -660,7 +672,10 @@ class RandomDataset(BenchmarkDataset):
 
         return requests
 
-    def _load_csv_lengths(self, random_csv_path: str) -> list[dict[str, int]]:
+    def _load_csv_lengths(
+        self,
+        random_csv_path: str,
+    ) -> list[dict[str, int | None]]:
         with open(random_csv_path, encoding="utf-8", newline="") as csv_file:
             reader = csv.DictReader(csv_file)
             if reader.fieldnames is None:
@@ -700,12 +715,27 @@ class RandomDataset(BenchmarkDataset):
                         f"row {row_idx}."
                     )
 
-                csv_lengths.append(
-                    {
-                        "prompt_len": prompt_len,
-                        "output_len": output_len,
-                    }
-                )
+                raw_data_parallel_rank = (row.get("data_parallel_rank") or "").strip()
+                data_parallel_rank: int | None = None
+                if raw_data_parallel_rank:
+                    try:
+                        data_parallel_rank = int(raw_data_parallel_rank)
+                    except ValueError as exc:
+                        raise ValueError(
+                            "Random CSV values must be positive integers at "
+                            f"row {row_idx}."
+                        ) from exc
+                    if data_parallel_rank < 0:
+                        raise ValueError(
+                            "Random CSV values must be positive integers at "
+                            f"row {row_idx}."
+                        )
+
+                csv_lengths.append({
+                    "prompt_len": prompt_len,
+                    "output_len": output_len,
+                    "data_parallel_rank": data_parallel_rank,
+                })
 
         if not csv_lengths:
             raise ValueError("Random CSV file does not contain any data rows.")
@@ -725,7 +755,7 @@ class RandomDataset(BenchmarkDataset):
         self,
         num_requests: int,
         no_oversample: bool,
-    ) -> list[dict[str, int]]:
+    ) -> list[dict[str, int | None]]:
         assert self.csv_lengths is not None
 
         csv_lengths = list(self.csv_lengths)

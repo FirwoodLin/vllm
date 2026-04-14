@@ -581,6 +581,28 @@ def validate_request_lengths(
     )
 
 
+def validate_request_routing(
+    requests: list[SampleRequest],
+    routing_mode: str,
+) -> None:
+    if routing_mode != "explicit_rank_replay":
+        return
+
+    missing_rank = [
+        request.request_id
+        for request in requests
+        if request.data_parallel_rank is None
+    ]
+    if not missing_rank:
+        return
+
+    examples = ", ".join(str(request_id) for request_id in missing_rank[:3])
+    raise ValueError(
+        "explicit_rank_replay requires every CSV row to specify "
+        f"data_parallel_rank. Example request(s): {examples}"
+    )
+
+
 def _compute_pre_forward_ttft_ms(metrics: Any) -> float | None:
     if metrics is None:
         return None
@@ -645,6 +667,7 @@ def build_success_record(
 
     return {
         "request_id": request.request_id,
+        "data_parallel_rank": request.data_parallel_rank,
         "submit_ts_ns": submit_ts_ns,
         "finish_ts_ns": finish_ts_ns,
         "e2e_ms": float((finish_ts_ns - submit_ts_ns) / 1e6),
@@ -676,6 +699,7 @@ def build_error_record(
 ) -> dict[str, Any]:
     return {
         "request_id": request.request_id,
+        "data_parallel_rank": request.data_parallel_rank,
         "submit_ts_ns": submit_ts_ns,
         "finish_ts_ns": finish_ts_ns,
         "e2e_ms": float((finish_ts_ns - submit_ts_ns) / 1e6),
@@ -822,9 +846,10 @@ def _enforce_harness_observability(args: argparse.Namespace) -> None:
 def _validate_frontend_args(args: argparse.Namespace) -> None:
     if args.csv_format != "length_csv":
         raise NotImplementedError("Only --csv-format=length_csv is implemented.")
-    if args.routing_mode != "internal_dplb":
+    if args.routing_mode not in {"internal_dplb", "explicit_rank_replay"}:
         raise NotImplementedError(
-            "Only --routing-mode=internal_dplb is implemented."
+            "Unsupported --routing-mode="
+            f"{args.routing_mode!r}."
         )
     if args.pause_before_profile and not args.profile_after_warmup:
         raise ValueError(
@@ -865,7 +890,7 @@ async def _submit_one_request(
             prompt=token_inputs(prompt_token_ids=cast(list[int], request.prompt)),
             params=_build_sampling_params(request.expected_output_len),
             arrival_time=submit_ts_ns / 1e9,
-            data_parallel_rank=None,
+            data_parallel_rank=request.data_parallel_rank,
         )
     except Exception as exc:
         if recorder is None:
@@ -1280,6 +1305,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
 
         validate_request_lengths(measured_requests, async_llm.model_config.max_model_len)
         validate_request_lengths(warmup_requests, async_llm.model_config.max_model_len)
+        validate_request_routing(all_requests, args.routing_mode)
 
         connector_mode = connector_mode_from_config(args.kv_transfer_config)
         ttft_semantics = _ttft_semantics_from_config(args.kv_transfer_config)

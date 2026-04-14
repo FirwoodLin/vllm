@@ -75,6 +75,7 @@ def test_start_multinode_offline_profile_help_mentions_manual_strategy_inputs(
     assert "--cluster 1node_h200" in result.stdout
     assert "--prompt-len N" in result.stdout
     assert "--requests-per-dp N" in result.stdout
+    assert "--routing-mode internal_dplb|explicit_rank_replay" in result.stdout
 
 
 @pytest.mark.benchmark
@@ -203,6 +204,84 @@ def test_start_multinode_offline_profile_isolates_lens_inputs_by_strategy(
     assert "--frontend-extra-arg=--pause-before-profile" in runner_call
     assert "--frontend-extra-arg=32" in runner_call
     assert "--headless-extra-arg=32" in runner_call
+
+
+@pytest.mark.benchmark
+def test_start_multinode_offline_profile_supports_explicit_rank_replay(
+        tmp_path: Path) -> None:
+    lens_json = tmp_path / "mix.json"
+    lens_json.write_text(str(([524288] * 4) + ([2048] * 16)) + "\n",
+                         encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log_path = tmp_path / "python_calls.jsonl"
+    write_fake_python(fake_bin / "python3", log_path)
+
+    generated_input_root = tmp_path / "generated_inputs"
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["GENERATED_INPUT_ROOT"] = str(generated_input_root)
+
+    subprocess.run(
+        [
+            "zsh",
+            str(WRAPPER_PATH),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--strategy",
+            "dp8dcp4",
+            "--lens-json",
+            str(lens_json),
+            "--dispatch-policy",
+            "least_batch",
+            "--routing-mode",
+            "explicit_rank_replay",
+            "--warmup-requests",
+            "8",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    prepared_dir = (generated_input_root / "mix" / "dp8dcp4" /
+                    "dispatch_least_batch" / "routing_explicit_rank_replay")
+    case_rows = read_csv_rows(prepared_dir / "custom_lens.casecsv")
+    length_rows = read_csv_rows(
+        prepared_dir / "custom_lens.dispatch_least_batch.lengths.csv")
+
+    assert len(case_rows) == 1
+    assert case_rows[0]["strategy"] == "dp8dcp4"
+    assert case_rows[0]["dispatch_policy"] == "least_batch"
+    assert case_rows[0]["dataset"] == str(
+        (prepared_dir / "custom_lens.dispatch_least_batch.lengths.csv").resolve())
+    assert all(row["prompt_len"] == "2048" for row in length_rows[:8])
+
+    per_node_longs = [0, 0, 0, 0]
+    for row in length_rows:
+        if row["prompt_len"] != "524288":
+            continue
+        per_node_longs[int(row["data_parallel_rank"]) // 2] += 1
+    assert per_node_longs == [1, 1, 1, 1]
+
+    logged_calls = load_logged_calls(log_path)
+    prepare_call = next(call for call in logged_calls
+                        if call[0].endswith(
+                            "benchmarks/offline_dp_profile/prepare_custom_lens_case.py"
+                        ))
+    runner_call = next(call for call in logged_calls
+                       if call[0].endswith(
+                           "benchmarks/manual_multinode_poisson_runner.py"))
+
+    assert "--routing-mode" in prepare_call
+    assert "explicit_rank_replay" in prepare_call
+    assert "--data-parallel-size" in prepare_call
+    assert "8" in prepare_call
+    assert "--data-parallel-size-local" in prepare_call
+    assert "2" in prepare_call
+    assert "--warmup-short-rows" in prepare_call
+    assert "--frontend-extra-arg=--routing-mode" in runner_call
+    assert "--frontend-extra-arg=explicit_rank_replay" in runner_call
 
 
 @pytest.mark.benchmark

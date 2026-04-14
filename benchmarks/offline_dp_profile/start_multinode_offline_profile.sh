@@ -18,6 +18,7 @@ WARMUP_REQUESTS=""
 MAX_REQUESTS=""
 REQUEST_RATE=""
 DISPATCH_POLICY=""
+ROUTING_MODE="internal_dplb"
 CASE_NAME=""
 MAX_NUM_SEQS=""
 GPU_MEMORY_UTILIZATION=""
@@ -55,6 +56,7 @@ Options:
   --max-requests N|csv_rows
   --request-rate FLOAT
   --dispatch-policy waiting_x4_plus_running|least_cache|least_batch
+  --routing-mode internal_dplb|explicit_rank_replay
   --case-name NAME
   --max-num-seqs N
   --gpu-memory-utilization FLOAT
@@ -105,6 +107,33 @@ function strategy_total_dp() {
       ;;
     *)
       echo "Unsupported strategy for synthetic request generation: $1" >&2
+      exit 1
+      ;;
+  esac
+}
+
+function strategy_dp_local_size() {
+  case "$1" in
+    dp1tp8dcp2)
+      print -r -- 1
+      ;;
+    dp2tp8dcp2)
+      print -r -- 2
+      ;;
+    dp4dcp8|dp4tp8dcp2|dp4tp8dcp2_ar|dp4tp8|dp4tp4)
+      print -r -- 1
+      ;;
+    dp8dcp4|dp8tp4)
+      print -r -- 2
+      ;;
+    dp16cp2|dp16tp2)
+      print -r -- 4
+      ;;
+    dp32)
+      print -r -- 8
+      ;;
+    *)
+      echo "Unsupported strategy for DP-local-size lookup: $1" >&2
       exit 1
       ;;
   esac
@@ -162,6 +191,10 @@ while (( $# > 0 )); do
       ;;
     --dispatch-policy)
       DISPATCH_POLICY="$2"
+      shift 2
+      ;;
+    --routing-mode)
+      ROUTING_MODE="$2"
       shift 2
       ;;
     --case-name)
@@ -242,6 +275,10 @@ cd "${REPO_ROOT}"
 
 EFFECTIVE_DISPATCH_POLICY="${DISPATCH_POLICY:-waiting_x4_plus_running}"
 DISPATCH_TAG="dispatch_$(sanitize_tag "${EFFECTIVE_DISPATCH_POLICY}")"
+ROUTING_TAG=""
+if [[ "${ROUTING_MODE}" != "internal_dplb" ]]; then
+  ROUTING_TAG="/routing_$(sanitize_tag "${ROUTING_MODE}")"
+fi
 PREPARE_INPUT_ARGS=()
 if [[ -n "${LENS_JSON}" ]]; then
   INPUT_SOURCE_TAG="${${LENS_JSON:t}:r}"
@@ -258,7 +295,7 @@ else
   )
 fi
 
-PREPARED_DIR="${GENERATED_INPUT_ROOT}/${INPUT_SOURCE_TAG}/${STRATEGY}/${DISPATCH_TAG}"
+PREPARED_DIR="${GENERATED_INPUT_ROOT}/${INPUT_SOURCE_TAG}/${STRATEGY}/${DISPATCH_TAG}${ROUTING_TAG}"
 PREPARE_ARGS=(
   python3
   benchmarks/offline_dp_profile/prepare_custom_lens_case.py
@@ -267,8 +304,20 @@ PREPARE_ARGS=(
   --output-len "${OUTPUT_LEN}"
   --cluster "${CLUSTER}"
   --strategy "${STRATEGY}"
+  --routing-mode "${ROUTING_MODE}"
   "${PREPARE_INPUT_ARGS[@]}"
 )
+if [[ "${ROUTING_MODE}" == "explicit_rank_replay" ]]; then
+  STRATEGY_DP_SIZE="$(strategy_total_dp "${STRATEGY}")"
+  STRATEGY_DP_LOCAL_SIZE="$(strategy_dp_local_size "${STRATEGY}")"
+  PREPARE_ARGS+=(
+    --data-parallel-size "${STRATEGY_DP_SIZE}"
+    --data-parallel-size-local "${STRATEGY_DP_LOCAL_SIZE}"
+  )
+  if [[ -n "${WARMUP_REQUESTS}" ]]; then
+    PREPARE_ARGS+=(--warmup-short-rows "${WARMUP_REQUESTS}")
+  fi
+fi
 if [[ -n "${MODEL}" ]]; then
   PREPARE_ARGS+=(--model "${MODEL}")
 fi
@@ -328,6 +377,12 @@ fi
 
 if [[ "${PAUSE_BEFORE_PROFILE}" == "1" ]]; then
   FRONTEND_EXTRA_ARGS+=(--frontend-extra-arg=--pause-before-profile)
+fi
+if [[ "${ROUTING_MODE}" != "internal_dplb" ]]; then
+  FRONTEND_EXTRA_ARGS+=(
+    --frontend-extra-arg=--routing-mode
+    "--frontend-extra-arg=${ROUTING_MODE}"
+  )
 fi
 
 RUNNER_ARGS=()

@@ -112,6 +112,27 @@ def test_load_length_requests_repeats_csv_rows(
 
 
 @pytest.mark.benchmark
+def test_load_length_requests_preserves_explicit_dp_rank(
+    tmp_path: Path,
+    fake_tokenizer,
+) -> None:
+    csv_path = tmp_path / "requests.csv"
+    csv_path.write_text(
+        "prompt_len,output_len,data_parallel_rank\n4,7,3\n6,5,1\n5,9,0\n",
+        encoding="utf-8",
+    )
+
+    requests = load_length_requests(
+        csv_path=str(csv_path),
+        tokenizer=fake_tokenizer,
+        seed=123,
+        request_id_prefix="r123-",
+    )
+
+    assert [request.data_parallel_rank for request in requests] == [3, 1, 0]
+
+
+@pytest.mark.benchmark
 def test_resolve_csv_repeat_uses_warmup_plus_max_requests() -> None:
     assert resolve_csv_repeat(
         total_rows=27,
@@ -539,9 +560,11 @@ def test_submit_one_request_uses_processor_inputs() -> None:
     class _Engine:
         def __init__(self) -> None:
             self.prompt = None
+            self.data_parallel_rank = None
 
         async def add_request(self, **kwargs):
             self.prompt = kwargs["prompt"]
+            self.data_parallel_rank = kwargs["data_parallel_rank"]
             return _Collector()
 
     async def _run() -> dict:
@@ -554,17 +577,23 @@ def test_submit_one_request_uses_processor_inputs() -> None:
                 prompt_len=3,
                 expected_output_len=2,
                 request_id="r0-000000",
+                data_parallel_rank=7,
             ),
             recorder=None,
             inflight=inflight,
         )
         await asyncio.gather(*tuple(inflight))
         assert engine.prompt is not None
-        return engine.prompt
+        return {
+            "prompt": engine.prompt,
+            "data_parallel_rank": engine.data_parallel_rank,
+        }
 
-    prompt = asyncio.run(_run())
+    result = asyncio.run(_run())
+    prompt = result["prompt"]
     assert prompt["type"] == "token"
     assert prompt["prompt_token_ids"] == [11, 12, 13]
+    assert result["data_parallel_rank"] == 7
 
 
 @pytest.mark.benchmark

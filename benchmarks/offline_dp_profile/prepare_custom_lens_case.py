@@ -21,6 +21,11 @@ DISPATCH_POLICIES = (
     "least_batch",
 )
 DEFAULT_DISPATCH_POLICY = "waiting_x4_plus_running"
+ROUTING_MODES = (
+    "internal_dplb",
+    "explicit_rank_replay",
+)
+DEFAULT_ROUTING_MODE = "internal_dplb"
 DEFAULT_LENGTH_CSV_STEM = "custom_lens"
 DEFAULT_CASE_CSV_NAME = "custom_lens.casecsv"
 MAX_REQUESTS_CSV_ROWS = "csv_rows"
@@ -173,6 +178,40 @@ def parse_args() -> argparse.Namespace:
         help="Override dispatch_policy in the derived casecsv.",
     )
     parser.add_argument(
+        "--routing-mode",
+        choices=ROUTING_MODES,
+        default=DEFAULT_ROUTING_MODE,
+        help=(
+            "How the frontend should route requests. explicit_rank_replay "
+            "writes a data_parallel_rank column into the generated CSV."
+        ),
+    )
+    parser.add_argument(
+        "--data-parallel-size",
+        type=positive_int,
+        default=None,
+        help=(
+            "Global DP size used when --routing-mode=explicit_rank_replay."
+        ),
+    )
+    parser.add_argument(
+        "--data-parallel-size-local",
+        type=positive_int,
+        default=None,
+        help=(
+            "Local DP size per node used when --routing-mode=explicit_rank_replay."
+        ),
+    )
+    parser.add_argument(
+        "--warmup-short-rows",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Reserve this many leading shortest-prompt rows for warmup before "
+            "building the explicit rank replay sequence."
+        ),
+    )
+    parser.add_argument(
         "--case-name",
         default=None,
         help=(
@@ -186,6 +225,38 @@ def parse_args() -> argparse.Namespace:
         parser.error("--repeat-count is required with --uniform-prompt-len.")
     if args.uniform_prompt_len is None and args.repeat_count is not None:
         parser.error("--repeat-count requires --uniform-prompt-len.")
+    if args.routing_mode == "explicit_rank_replay":
+        if args.data_parallel_size is None:
+            parser.error(
+                "--data-parallel-size is required with "
+                "--routing-mode=explicit_rank_replay."
+            )
+        if args.data_parallel_size_local is None:
+            parser.error(
+                "--data-parallel-size-local is required with "
+                "--routing-mode=explicit_rank_replay."
+            )
+        if args.data_parallel_size % args.data_parallel_size_local != 0:
+            parser.error(
+                "--data-parallel-size must be divisible by "
+                "--data-parallel-size-local."
+            )
+    else:
+        if args.data_parallel_size is not None:
+            parser.error(
+                "--data-parallel-size requires "
+                "--routing-mode=explicit_rank_replay."
+            )
+        if args.data_parallel_size_local is not None:
+            parser.error(
+                "--data-parallel-size-local requires "
+                "--routing-mode=explicit_rank_replay."
+            )
+        if args.warmup_short_rows != 0:
+            parser.error(
+                "--warmup-short-rows requires "
+                "--routing-mode=explicit_rank_replay."
+            )
 
     return args
 
@@ -237,6 +308,130 @@ def sanitize_tag(raw_value: str) -> str:
     return "".join(output).strip("_") or "case"
 
 
+def split_counts_evenly(total_count: int, buckets: int) -> list[int]:
+    base, remainder = divmod(total_count, buckets)
+    return [base + (1 if index < remainder else 0) for index in range(buckets)]
+
+
+def evenly_insert_values(base: list[int], value: int, count: int) -> list[int]:
+    if count <= 0:
+        return list(base)
+
+    total = len(base) + count
+    positions = {(index * total) // count for index in range(count)}
+    result: list[int] = []
+    base_index = 0
+    remaining = count
+
+    for position in range(total):
+        if position in positions and remaining > 0:
+            result.append(value)
+            remaining -= 1
+            continue
+
+        result.append(base[base_index])
+        base_index += 1
+
+    return result
+
+
+def build_rank_prompt_sequence(prompt_counts: dict[int, int]) -> list[int]:
+    if not prompt_counts:
+        return []
+
+    ordered_lengths = sorted(prompt_counts)
+    shortest_prompt_len = ordered_lengths[0]
+    sequence = [shortest_prompt_len] * prompt_counts[shortest_prompt_len]
+    for prompt_len in reversed(ordered_lengths[1:]):
+        sequence = evenly_insert_values(sequence, prompt_len,
+                                        prompt_counts[prompt_len])
+    return sequence
+
+
+def build_explicit_rank_rows(
+    *,
+    input_lengths: list[int],
+    output_len: int,
+    data_parallel_size: int,
+    data_parallel_size_local: int,
+    warmup_short_rows: int,
+) -> list[dict[str, str]]:
+    if data_parallel_size <= 0:
+        raise ValueError("data_parallel_size must be >= 1.")
+    if data_parallel_size_local <= 0:
+        raise ValueError("data_parallel_size_local must be >= 1.")
+    if data_parallel_size % data_parallel_size_local != 0:
+        raise ValueError(
+            "data_parallel_size must be divisible by data_parallel_size_local."
+        )
+
+    num_nodes = data_parallel_size // data_parallel_size_local
+    prompt_counts: dict[int, int] = {}
+    for prompt_len in input_lengths:
+        prompt_counts[prompt_len] = prompt_counts.get(prompt_len, 0) + 1
+
+    per_rank_prompt_counts: list[dict[int, int]] = [
+        {} for _ in range(data_parallel_size)
+    ]
+    for prompt_len, total_count in sorted(prompt_counts.items()):
+        per_node_counts = split_counts_evenly(total_count, num_nodes)
+        for node_index, node_count in enumerate(per_node_counts):
+            per_local_rank_counts = split_counts_evenly(
+                node_count, data_parallel_size_local)
+            for local_rank, local_count in enumerate(per_local_rank_counts):
+                if local_count == 0:
+                    continue
+                global_rank = node_index * data_parallel_size_local + local_rank
+                per_rank_prompt_counts[global_rank][prompt_len] = local_count
+
+    shortest_prompt_len = min(prompt_counts)
+    rows: list[dict[str, str]] = []
+    for warmup_index in range(warmup_short_rows):
+        start_rank = warmup_index % data_parallel_size
+        assigned_rank: int | None = None
+        for offset in range(data_parallel_size):
+            rank = (start_rank + offset) % data_parallel_size
+            remaining = per_rank_prompt_counts[rank].get(shortest_prompt_len, 0)
+            if remaining <= 0:
+                continue
+            per_rank_prompt_counts[rank][shortest_prompt_len] = remaining - 1
+            if per_rank_prompt_counts[rank][shortest_prompt_len] == 0:
+                del per_rank_prompt_counts[rank][shortest_prompt_len]
+            assigned_rank = rank
+            break
+
+        if assigned_rank is None:
+            raise ValueError(
+                "warmup_short_rows exceeds the available count of shortest "
+                "requests."
+            )
+
+        rows.append({
+            "prompt_len": str(shortest_prompt_len),
+            "output_len": str(output_len),
+            "data_parallel_rank": str(assigned_rank),
+        })
+
+    per_rank_sequences = [
+        build_rank_prompt_sequence(prompt_counts)
+        for prompt_counts in per_rank_prompt_counts
+    ]
+    max_rank_sequence_len = max((len(sequence)
+                                 for sequence in per_rank_sequences),
+                                default=0)
+    for round_index in range(max_rank_sequence_len):
+        for rank, prompt_sequence in enumerate(per_rank_sequences):
+            if round_index >= len(prompt_sequence):
+                continue
+            rows.append({
+                "prompt_len": str(prompt_sequence[round_index]),
+                "output_len": str(output_len),
+                "data_parallel_rank": str(rank),
+            })
+
+    return rows
+
+
 def read_base_case(path: Path) -> tuple[list[str], dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -255,7 +450,11 @@ def read_base_case(path: Path) -> tuple[list[str], dict[str, str]]:
     return list(reader.fieldnames), dict(rows[0])
 
 
-def write_length_csv(path: Path, input_lengths: list[int], output_len: int) -> None:
+def write_length_csv(
+    path: Path,
+    input_lengths: list[int],
+    output_len: int,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=["prompt_len", "output_len"])
@@ -265,6 +464,20 @@ def write_length_csv(path: Path, input_lengths: list[int], output_len: int) -> N
                 "prompt_len": str(prompt_len),
                 "output_len": str(output_len),
             })
+
+
+def write_explicit_rank_length_csv(
+    path: Path,
+    rows: list[dict[str, str]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["prompt_len", "output_len", "data_parallel_rank"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def write_case_csv(path: Path, fieldnames: list[str], row: dict[str, str]) -> None:
@@ -305,6 +518,9 @@ def main() -> None:
         or (derived_row.get("dispatch_policy") or "").strip()
         or "unknown_dispatch"
     )
+    routing_tag = None
+    if args.routing_mode != DEFAULT_ROUTING_MODE:
+        routing_tag = f"routing_{sanitize_tag(args.routing_mode)}"
     dispatch_tag = f"dispatch_{sanitize_tag(effective_dispatch_policy)}"
     length_csv_name = f"{DEFAULT_LENGTH_CSV_STEM}.{dispatch_tag}.lengths.csv"
     length_csv_path = output_dir / length_csv_name
@@ -317,6 +533,8 @@ def main() -> None:
     derived_case_name_parts.append(input_source_tag)
     if effective_dispatch_policy != DEFAULT_DISPATCH_POLICY:
         derived_case_name_parts.append(dispatch_tag)
+    if routing_tag is not None:
+        derived_case_name_parts.append(routing_tag)
     derived_case_name = args.case_name or "__".join(derived_case_name_parts)
 
     derived_row["name"] = derived_case_name
@@ -351,7 +569,19 @@ def main() -> None:
     if args.dispatch_policy is not None:
         derived_row["dispatch_policy"] = args.dispatch_policy
 
-    write_length_csv(length_csv_path, input_lengths, args.output_len)
+    if args.routing_mode == "explicit_rank_replay":
+        assert args.data_parallel_size is not None
+        assert args.data_parallel_size_local is not None
+        explicit_rows = build_explicit_rank_rows(
+            input_lengths=input_lengths,
+            output_len=args.output_len,
+            data_parallel_size=args.data_parallel_size,
+            data_parallel_size_local=args.data_parallel_size_local,
+            warmup_short_rows=args.warmup_short_rows,
+        )
+        write_explicit_rank_length_csv(length_csv_path, explicit_rows)
+    else:
+        write_length_csv(length_csv_path, input_lengths, args.output_len)
     write_case_csv(case_csv_path, fieldnames, derived_row)
 
     print("Prepared offline profile inputs")
@@ -370,6 +600,7 @@ def main() -> None:
     print(f"  strategy: {derived_row.get('strategy', '')}")
     print(f"  model: {derived_row.get('model', '')}")
     print(f"  dispatch_policy: {derived_row.get('dispatch_policy', '')}")
+    print(f"  routing_mode: {args.routing_mode}")
     print(f"  request_rate: {derived_row.get('request_rate', '')}")
     print(f"  warmup_requests: {derived_row.get('warmup_requests', '')}")
     print(f"  max_requests: {derived_row.get('max_requests', '')}")
