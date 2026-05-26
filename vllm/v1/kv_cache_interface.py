@@ -7,6 +7,7 @@ from math import prod
 
 import torch
 from typing_extensions import Self
+from vllm.distributed.parallel_state import get_dycp_group
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -96,10 +97,11 @@ class FullAttentionSpec(AttentionSpec):
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        dycp_world_size = vllm_config.parallel_config.dp_per_domain
         # Note(hc): each dcp rank only need save
         # (max_model_len//dcp_world_size) tokens locally.
-        if dcp_world_size * pcp_world_size > 1:
-            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+        if dcp_world_size * pcp_world_size * dycp_world_size> 1:
+            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size * dycp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
     @classmethod
