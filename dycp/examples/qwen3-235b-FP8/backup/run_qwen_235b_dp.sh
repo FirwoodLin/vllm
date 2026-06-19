@@ -28,7 +28,7 @@ export VLLM_IGNORE_TENSOR_PLACEHOLDER=1
 
 export NCCL_DEBUG=WARN
 
-export MODEL_PATH=<Path to your model>
+export MODEL_PATH="<Path to your model>"
 
 export VLLM_USE_V1=1
 export COMMON_ARGS="
@@ -66,7 +66,7 @@ args=(
     --data-parallel-size 4 
     --tensor-parallel-size 4 
     --data-parallel-size-local 2 
-    --data-parallel-address=< Master IP Address> 
+    --data-parallel-address="<Master IP Address>" 
     --data-parallel-rpc-port 8400 
     --data-parallel-start-rank $((NODE_RANK * 2)) 
     --block-size 64 
