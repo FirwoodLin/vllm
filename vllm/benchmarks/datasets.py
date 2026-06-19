@@ -75,7 +75,7 @@ class SampleRequest:
     Represents a single inference request for benchmarking.
     """
 
-    prompt: str | list[str]
+    prompt: str | list[str] | list[int] | list[list[int]]
     prompt_len: int
     expected_output_len: int
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
@@ -477,6 +477,7 @@ class RandomDataset(BenchmarkDataset):
         output_len: int = DEFAULT_OUTPUT_LEN,
         batchsize: int = 1,
         use_local_json: str = None,
+        use_token_ids: bool = False,
         **kwargs,
     ) -> list[SampleRequest]:
         # validate total input tokens (prefix + sampled) is at least 1.
@@ -516,17 +517,27 @@ class RandomDataset(BenchmarkDataset):
         requests = []
         token_mismatch_total = 0
         for i in range(num_requests):
-            prompt, total_input_len, token_mismatch = self.generate_token_sequence(  # noqa: E501
-                tokenizer=tokenizer,
-                prefix_token_ids=prefix_token_ids,
-                prefix_len=prefix_len,
-                vocab_size=vocab_size,
-                input_len=int(input_lens[i]),
-                offset=int(offsets[i]),
-                index=i,
-                allowed_tokens=allowed_tokens,
-            )
-            token_mismatch_total += token_mismatch
+            if use_token_ids:
+                prompt = self.generate_token_ids(
+                    prefix_token_ids=prefix_token_ids,
+                    input_len=int(input_lens[i]),
+                    offset=int(offsets[i]),
+                    index=i,
+                    allowed_tokens=allowed_tokens,
+                )
+                total_input_len = len(prompt)
+            else:
+                prompt, total_input_len, token_mismatch = self.generate_token_sequence(  # noqa: E501
+                    tokenizer=tokenizer,
+                    prefix_token_ids=prefix_token_ids,
+                    prefix_len=prefix_len,
+                    vocab_size=vocab_size,
+                    input_len=int(input_lens[i]),
+                    offset=int(offsets[i]),
+                    index=i,
+                    allowed_tokens=allowed_tokens,
+                )
+                token_mismatch_total += token_mismatch
             requests.append(
                 SampleRequest(
                     prompt=prompt,
@@ -563,6 +574,20 @@ class RandomDataset(BenchmarkDataset):
             )
 
         return requests
+
+    def generate_token_ids(
+        self,
+        *,
+        prefix_token_ids: list[int],
+        input_len: int,
+        offset: int,
+        index: int,
+        allowed_tokens: np.ndarray,
+    ) -> list[int]:
+        inner_seq = allowed_tokens[
+            (offset + index + np.arange(input_len)) % len(allowed_tokens)
+        ].tolist()
+        return prefix_token_ids + inner_seq
 
     def get_prefix(
         self,
@@ -1508,6 +1533,15 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         help=("Use local json to direct input lens and output lens."),
     )
     random_group.add_argument(
+        "--random-use-token-ids",
+        action="store_true",
+        help=(
+            "Generate random dataset prompts as token ID lists instead of text. "
+            "This is intended for completion endpoints that accept token-id "
+            "prompts, such as --backend openai with /v1/completions."
+        ),
+    )
+    random_group.add_argument(
         "--no-reranker",
         action="store_true",
         help=(
@@ -1889,6 +1923,7 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
                 batchsize=args.random_batch_size,
                 no_oversample=args.no_oversample,
                 use_local_json=args.use_local_json,
+                use_token_ids=args.random_use_token_ids,
             ),
             "random-mm": lambda: RandomMultiModalDataset(
                 random_seed=args.seed,
@@ -1944,6 +1979,22 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
                     "Multi-modal content (images) is only supported on "
                     "'openai-chat' backend."
                 )
+            if args.random_use_token_ids:
+                if args.dataset_name != "random":
+                    raise ValueError(
+                        "--random-use-token-ids is only supported with "
+                        "--dataset-name random."
+                    )
+                if args.backend not in ("openai", "vllm"):
+                    raise ValueError(
+                        "--random-use-token-ids requires a completion backend "
+                        "such as '--backend openai' or '--backend vllm'."
+                    )
+                if "chat/completions" in getattr(args, "endpoint", ""):
+                    raise ValueError(
+                        "--random-use-token-ids requires a completions endpoint, "
+                        "for example '--endpoint /v1/completions'."
+                    )
             input_requests = dataset_mapping[args.dataset_name]()
         except KeyError as err:
             raise ValueError(f"Unknown dataset: {args.dataset_name}") from err

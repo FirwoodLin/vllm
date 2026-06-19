@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import random
 from typing import Any, NamedTuple, cast
 
@@ -35,7 +36,7 @@ def random_dataset_params() -> Params:
     )
 
 
-def _fingerprint_sample(req: SampleRequest) -> tuple[str, int, int]:
+def _fingerprint_sample(req: SampleRequest) -> tuple[Any, int, int]:
     """Project a SampleRequest into a comparable tuple."""
     return (req.prompt, req.prompt_len, req.expected_output_len)
 
@@ -48,7 +49,7 @@ def _collect_samples(
     range_ratio: float = 0.3,
     input_len: int = 50,
     output_len: int = 20,
-) -> list[tuple[str, int, int]]:
+) -> list[tuple[Any, int, int]]:
     samples = dataset.sample(
         tokenizer=tokenizer,
         num_requests=num_requests,
@@ -58,6 +59,20 @@ def _collect_samples(
         output_len=output_len,
     )
     return [_fingerprint_sample(s) for s in samples]
+
+
+class TokenIdOnlyTokenizer:
+    vocab_size = 32
+    all_special_ids = [0, 1]
+
+    def num_special_tokens_to_add(self) -> int:
+        return 0
+
+    def encode(self, *args: Any, **kwargs: Any) -> list[int]:
+        raise AssertionError("token-id random sampling should not encode text")
+
+    def decode(self, *args: Any, **kwargs: Any) -> str:
+        raise AssertionError("token-id random sampling should not decode text")
 
 
 @pytest.mark.benchmark
@@ -134,6 +149,32 @@ def test_random_dataset_different_seeds(
         output_len=p.output_len,
     )
     assert a != b
+
+
+@pytest.mark.benchmark
+def test_random_dataset_can_sample_token_id_prompts(tmp_path) -> None:
+    local_json = tmp_path / "lengths.json"
+    local_json.write_text(json.dumps([[5, 2], [7, 3]]))
+    dataset = RandomDataset(random_seed=0)
+
+    samples = dataset.sample(
+        tokenizer=TokenIdOnlyTokenizer(),
+        num_requests=2,
+        prefix_len=2,
+        use_local_json=str(local_json),
+        use_token_ids=True,
+    )
+
+    assert [sample.prompt_len for sample in samples] == [7, 9]
+    assert [sample.expected_output_len for sample in samples] == [2, 3]
+    for sample in samples:
+        assert isinstance(sample.prompt, list)
+        assert len(sample.prompt) == sample.prompt_len
+        assert all(isinstance(token_id, int) for token_id in sample.prompt)
+        assert all(
+            token_id not in TokenIdOnlyTokenizer.all_special_ids
+            for token_id in sample.prompt
+        )
 
 
 # -----------------------------
