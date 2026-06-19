@@ -1,6 +1,8 @@
 [submodule "csrc/deepep"]
 	path = csrc/deepep
 	url = https://github.com/deepseek-ai/DeepEP.git
+	ignore = untracked
 [submodule "csrc/deepgemm"]
 	path = csrc/deepgemm
 	url = https://github.com/deepseek-ai/DeepGEMM.git
+	ignore = untracked
