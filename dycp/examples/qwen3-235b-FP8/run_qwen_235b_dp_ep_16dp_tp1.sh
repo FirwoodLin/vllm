@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# Decode-only DP+EP launch for Qwen3-235B FP8 on 16 GPUs.
+# Topology: 2 nodes x 8 GPUs, global DP=16, TP=1. No DyCP/domain parallelism.
+
+set -euo pipefail
+set -x
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    echo "Usage: $0 <node_rank> [master_ip]"
+    echo "Alternatively set DATA_PARALLEL_ADDRESS=<master_ip>."
+    echo "For node 0: bash $0 0 <node0_ip>"
+    echo "For node 1: bash $0 1 <node0_ip>"
+    exit 1
+fi
+
+NODE_RANK=$1
+DATA_PARALLEL_ADDRESS=${2:-${DATA_PARALLEL_ADDRESS:-}}
+if [ -z "${DATA_PARALLEL_ADDRESS}" ]; then
+    echo "DATA_PARALLEL_ADDRESS is required. Pass [master_ip] or set it in env."
+    exit 1
+fi
+
+if [ "${NODE_RANK}" -ne 0 ]; then
+    EXTRA_PARAMS=(--headless)
+else
+    EXTRA_PARAMS=(--api-server-count 1)
+fi
+
+MODEL_PATH=${MODEL_PATH:-/mnt/nvme1n1/ml_research/models_cfs/qwen3-235B-Instruct-2507-FP8/}
+SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-auto}
+PORT=${PORT:-8400}
+DP_RPC_PORT=${DP_RPC_PORT:-$((PORT + 100))}
+KV_PORT=${KV_PORT:-20002}
+KV_PARALLEL_SIZE=${KV_PARALLEL_SIZE:-2}
+KV_RANK=${KV_RANK:-1}
+MAX_SEQS_PER_DP=${MAX_SEQS_PER_DP:-64}
+LOG_DIR=${LOG_DIR:-.}
+
+if [ "${PORT}" -eq "${DP_RPC_PORT}" ]; then
+    echo "PORT and DP_RPC_PORT must be different. Got ${PORT}." >&2
+    exit 1
+fi
+
+export VLLM_USE_V1=1
+export VLLM_VERSION=${VLLM_VERSION:-0.13.0}
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-380}
+export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}
+export VLLM_MOE_DP_CHUNK_SIZE=${VLLM_MOE_DP_CHUNK_SIZE:-${MAX_SEQS_PER_DP}}
+export VLLM_DEEPEP_BUFFER_SIZE_MB=${VLLM_DEEPEP_BUFFER_SIZE_MB:-0}
+export VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM:-1}
+export VLLM_ALL2ALL_BACKEND=${VLLM_ALL2ALL_BACKEND:-deepep_low_latency}
+export VLLM_IGNORE_TENSOR_PLACEHOLDER=${VLLM_IGNORE_TENSOR_PLACEHOLDER:-1}
+export VLLM_USE_FORCE_LOAD_BALANCE=${VLLM_USE_FORCE_LOAD_BALANCE:-1}
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
+
+COMMON_ARGS=(
+    --trust-remote-code
+    --served-model-name "${SERVED_MODEL_NAME}"
+    --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":8}'
+    --disable-log-requests
+)
+
+KV_TRANSFER_CONFIG=$(cat <<JSON
+{
+    "kv_connector": "ExampleConnector",
+    "kv_connector_module_path": "vllm.distributed.kv_transfer.kv_connector.v1.example_connector",
+    "kv_role": "kv_consumer",
+    "kv_parallel_size": ${KV_PARALLEL_SIZE},
+    "kv_port": "${KV_PORT}",
+    "engine_id": "decode-${NODE_RANK}",
+    "kv_rank": ${KV_RANK},
+    "kv_connector_extra_config": {
+        "prefill": {
+            "dp_size": 1,
+            "tp_size": 16
+        },
+        "decode": {
+            "dp_size": 16,
+            "tp_size": 1
+        }
+    }
+}
+JSON
+)
+
+args=(
+    --port "${PORT}"
+    "${EXTRA_PARAMS[@]}"
+    "${COMMON_ARGS[@]}"
+    --async-scheduling
+    --distributed-executor-backend mp
+    --hf-overrides '{"rope_parameters": {"rope_type":"yarn","factor":8.0,"original_max_position_embeddings":262144}}'
+    --max-model-len 524288
+    --max-num-batched-tokens 128
+    --gpu-memory-utilization 0.9
+    --no-enable-prefix-caching
+    --data-parallel-size 16
+    --tensor-parallel-size 1
+    --data-parallel-size-local 8
+    --data-parallel-address "${DATA_PARALLEL_ADDRESS}"
+    --data-parallel-rpc-port "${DP_RPC_PORT}"
+    --data-parallel-start-rank $((NODE_RANK * 8))
+    --block-size 64
+    --no-enforce-eager
+    --max-num-seqs "${MAX_SEQS_PER_DP}"
+    --enable-expert-parallel
+    --compilation-config '{"cudagraph_capture_sizes":[2, 4, 8, 10, 12, 16, 18, 24, 26, 32, 34, 64], "cudagraph_mode": "FULL_DECODE_ONLY"}'
+    --kv-transfer-config "${KV_TRANSFER_CONFIG}"
+)
+
+mkdir -p "${LOG_DIR}"
+vllm serve "${MODEL_PATH}" "${args[@]}" &> "${LOG_DIR}/qwen235b_dp_ep_16dp_tp1_node${NODE_RANK}.log" &
