@@ -34,7 +34,7 @@ DP_RPC_PORT=${DP_RPC_PORT:-$((PORT + 100))}
 KV_PORT=${KV_PORT:-20002}
 KV_PARALLEL_SIZE=${KV_PARALLEL_SIZE:-2}
 KV_RANK=${KV_RANK:-1}
-MAX_SEQS_PER_DP=${MAX_SEQS_PER_DP:-64}
+MAX_SEQS_PER_DP=${MAX_SEQS_PER_DP:-128}
 LOG_DIR=${LOG_DIR:-.}
 
 if [ "${PORT}" -eq "${DP_RPC_PORT}" ]; then
@@ -107,7 +107,7 @@ args=(
     --no-enforce-eager
     --max-num-seqs "${MAX_SEQS_PER_DP}"
     --enable-expert-parallel
-    --compilation-config '{"cudagraph_capture_sizes":[2, 4, 8, 10, 12, 16, 18, 24, 26, 32, 34, 64], "cudagraph_mode": "FULL_DECODE_ONLY"}'
+    --compilation-config '{"cudagraph_capture_sizes":[2, 4, 8, 10, 12, 16, 18, 24, 26, 32, 34, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128], "cudagraph_mode": "FULL_DECODE_ONLY"}'
     --kv-transfer-config "${KV_TRANSFER_CONFIG}"
 )
 
