@@ -34,7 +34,7 @@ DP_RPC_PORT=${DP_RPC_PORT:-$((PORT + 100))}
 KV_PORT=${KV_PORT:-20002}
 KV_PARALLEL_SIZE=${KV_PARALLEL_SIZE:-2}
 KV_RANK=${KV_RANK:-1}
-MAX_SEQS_PER_DP=${MAX_SEQS_PER_DP:-512}
+MAX_SEQS_PER_DP=${MAX_SEQS_PER_DP:-496}
 LOG_DIR=${LOG_DIR:-.}
 
 if [ "${PORT}" -eq "${DP_RPC_PORT}" ]; then
@@ -107,7 +107,7 @@ args=(
     --distributed-executor-backend dmp
     --hf-overrides '{"rope_parameters": {"rope_type":"yarn","factor":8.0,"original_max_position_embeddings":262144}}'
     --max-model-len 524288
-    --max-num-batched-tokens 128
+    --max-num-batched-tokens "${MAX_SEQS_PER_DP}"
     --gpu-memory-utilization 0.9
     --no-enable-prefix-caching
     --data-parallel-size 4
@@ -122,8 +122,8 @@ args=(
     --max-num-seqs "${MAX_SEQS_PER_DP}"
     --enable-expert-parallel
     --dp-per-domain 2
-    --num-cp-seqs 32
-    --compilation-config '{"cudagraph_capture_sizes":[2, 4, 8, 10, 12, 16, 18, 24, 26, 32, 34, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128], "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes_for_cp": 32}'
+    --num-cp-seqs 4
+    --compilation-config '{"cudagraph_capture_sizes":[2, 4, 8, 10, 12, 16, 18, 24, 26, 32, 34, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 196, 224, 256, 288, 320, 352, 384, 416, 448, 480, 496], "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes_for_cp": 4}'
     --kv-transfer-config "${KV_TRANSFER_CONFIG}"
 )
 

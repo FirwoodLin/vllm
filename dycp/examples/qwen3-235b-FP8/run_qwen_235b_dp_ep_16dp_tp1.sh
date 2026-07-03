@@ -34,7 +34,7 @@ DP_RPC_PORT=${DP_RPC_PORT:-$((PORT + 100))}
 KV_PORT=${KV_PORT:-20002}
 KV_PARALLEL_SIZE=${KV_PARALLEL_SIZE:-2}
 KV_RANK=${KV_RANK:-1}
-MAX_SEQS_PER_DP=${MAX_SEQS_PER_DP:-128}
+MAX_SEQS_PER_DP=${MAX_SEQS_PER_DP:-196}
 LOG_DIR=${LOG_DIR:-.}
 
 if [ "${PORT}" -eq "${DP_RPC_PORT}" ]; then
@@ -94,7 +94,7 @@ args=(
     --distributed-executor-backend mp
     --hf-overrides '{"rope_parameters": {"rope_type":"yarn","factor":8.0,"original_max_position_embeddings":262144}}'
     --max-model-len 524288
-    --max-num-batched-tokens 128
+    --max-num-batched-tokens 196
     --gpu-memory-utilization 0.9
     --no-enable-prefix-caching
     --data-parallel-size 16

@@ -29,15 +29,26 @@ fi
 
 MODEL_PATH=${MODEL_PATH:-/mnt/nvme1n1/ml_research/models_cfs/qwen3-235B-Instruct-2507-FP8/}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-auto}
+LOAD_FORMAT=${LOAD_FORMAT:-auto}
 PORT=${PORT:-8400}
 DP_RPC_PORT=${DP_RPC_PORT:-$((PORT + 100))}
 KV_PORT=${KV_PORT:-20002}
 KV_PARALLEL_SIZE=${KV_PARALLEL_SIZE:-2}
 KV_RANK=${KV_RANK:-1}
 MAX_SEQS_PER_DP=${MAX_SEQS_PER_DP:-500}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-${MAX_SEQS_PER_DP}}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 LOG_DIR=${LOG_DIR:-.}
 PROFILE_MODE=${PROFILE_MODE:-dp4tp4}
 PROFILE_BASE_DIR=${PROFILE_BASE_DIR:-/mnt/nvme1n1/ml_research/linbinbin1/vllm-dycp/dycp/profiles}
+if [ "${MAX_NUM_BATCHED_TOKENS}" -lt "${MAX_SEQS_PER_DP}" ]; then
+    DEFAULT_CUDAGRAPH_MAX_CAPTURE_SIZE=${MAX_NUM_BATCHED_TOKENS}
+else
+    DEFAULT_CUDAGRAPH_MAX_CAPTURE_SIZE=${MAX_SEQS_PER_DP}
+fi
+CUDAGRAPH_MAX_CAPTURE_SIZE=${CUDAGRAPH_MAX_CAPTURE_SIZE:-${DEFAULT_CUDAGRAPH_MAX_CAPTURE_SIZE}}
+CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-}
+CUDAGRAPH_MODE=${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}
 
 if [ "${PORT}" -eq "${DP_RPC_PORT}" ]; then
     echo "PORT and DP_RPC_PORT must be different. Got ${PORT}." >&2
@@ -89,9 +100,54 @@ ulimit -n 1048576
 COMMON_ARGS=(
     --trust-remote-code
     --served-model-name "${SERVED_MODEL_NAME}"
-    --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":8}'
+    --load-format "${LOAD_FORMAT}"
     --disable-log-requests
 )
+
+if [ "${LOAD_FORMAT}" != "dummy" ]; then
+    COMMON_ARGS+=(
+        --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":8}'
+    )
+fi
+
+DEFAULT_CUDAGRAPH_CAPTURE_SIZES=(
+    2 4 8 16 24 32 40 48 56 64 72 80 88 96 104 112 120 128
+    136 144 152 160 168 176 184 192 200 208 216 224 232 240 248
+    256 272 288 304 320 336 352 368 384 400 416 432 448 464 480
+    496 500 512
+)
+
+join_cudagraph_capture_sizes() {
+    local max_size=$1
+    local selected=()
+    local size
+
+    for size in "${DEFAULT_CUDAGRAPH_CAPTURE_SIZES[@]}"; do
+        if [ -n "${max_size}" ] && [ "${size}" -gt "${max_size}" ]; then
+            continue
+        fi
+        selected+=("${size}")
+    done
+
+    if [ "${#selected[@]}" -eq 0 ] && [ -n "${max_size}" ]; then
+        selected=("${max_size}")
+    fi
+
+    local IFS=,
+    echo "${selected[*]}"
+}
+
+if [ -z "${CUDAGRAPH_CAPTURE_SIZES}" ]; then
+    CUDAGRAPH_CAPTURE_SIZES=$(join_cudagraph_capture_sizes "${CUDAGRAPH_MAX_CAPTURE_SIZE}")
+fi
+
+if [[ "${CUDAGRAPH_CAPTURE_SIZES}" == \[* ]]; then
+    CUDAGRAPH_CAPTURE_SIZES_JSON=${CUDAGRAPH_CAPTURE_SIZES}
+else
+    CUDAGRAPH_CAPTURE_SIZES_JSON="[${CUDAGRAPH_CAPTURE_SIZES}]"
+fi
+
+COMPILATION_CONFIG=${COMPILATION_CONFIG:-"{\"cudagraph_capture_sizes\":${CUDAGRAPH_CAPTURE_SIZES_JSON},\"cudagraph_mode\":\"${CUDAGRAPH_MODE}\"}"}
 
 KV_TRANSFER_CONFIG=$(cat <<JSON
 {
@@ -124,8 +180,8 @@ args=(
     --distributed-executor-backend mp
     --hf-overrides '{"rope_parameters": {"rope_type":"yarn","factor":8.0,"original_max_position_embeddings":262144}}'
     --max-model-len 524288
-    --max-num-batched-tokens "${MAX_SEQS_PER_DP}"
-    --gpu-memory-utilization 0.9
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
     --no-enable-prefix-caching
     --data-parallel-size 4
     --tensor-parallel-size 4
@@ -137,7 +193,7 @@ args=(
     --no-enforce-eager
     --max-num-seqs "${MAX_SEQS_PER_DP}"
     --enable-expert-parallel
-    --compilation-config '{"cudagraph_capture_sizes":[2, 4, 8, 10, 12, 16, 18, 24, 26, 32, 34, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 448, 496, 500], "cudagraph_mode": "FULL_DECODE_ONLY"}'
+    --compilation-config "${COMPILATION_CONFIG}"
     --kv-transfer-config "${KV_TRANSFER_CONFIG}"
 )
 

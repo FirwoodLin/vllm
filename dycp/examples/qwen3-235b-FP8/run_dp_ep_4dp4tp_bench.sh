@@ -20,6 +20,7 @@ PORT=${PORT:-8400}
 BENCH_HOST=${BENCH_HOST:-localhost}
 MODEL_PATH=${MODEL_PATH:-/mnt/nvme1n1/ml_research/models_cfs/qwen3-235B-Instruct-2507-FP8/}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-auto}
+export LOAD_FORMAT=${LOAD_FORMAT:-dummy}
 DATASET_PATH=${DATASET_PATH:-"${REPO_ROOT}/dycp/dataset/trace_512k_4k_long1pct_10000-output1024.json"}
 RESULT_DIR=${RESULT_DIR:-"${REPO_ROOT}/dycp/results/dp4tp4"}
 NUM_PROMPTS=${NUM_PROMPTS:-4800}
@@ -50,6 +51,7 @@ Other commands:
 Common overrides:
   MASTER_IP=10.102.97.183 REMOTE_HOST=h200-rjob2 PORT=8400 ${RUNNER_NAME}
   REQUEST_RATE=16 NUM_PROMPTS=4800 MAX_CONCURRENCY=0 ${RUNNER_NAME} bench
+  LOAD_FORMAT=dummy ${RUNNER_NAME}
   LAUNCH_SCRIPT=${LAUNCH_SCRIPT} ${RUNNER_NAME}
 USAGE
 }
@@ -76,7 +78,8 @@ start_remote_server() {
         "${EXAMPLE_DIR}" \
         "${LAUNCH_SCRIPT}" \
         "${REMOTE_NODE_RANK}" \
-        "${MASTER_IP}" <<'REMOTE_START'
+        "${MASTER_IP}" \
+        "${LOAD_FORMAT}" <<'REMOTE_START'
 set -e
 
 unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy
@@ -88,6 +91,9 @@ example_dir=$2
 launch_script=$3
 node_rank=$4
 master_ip=$5
+load_format=$6
+
+export LOAD_FORMAT="${load_format}"
 
 cd "${repo_root}"
 source .venv/bin/activate
