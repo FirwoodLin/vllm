@@ -81,6 +81,7 @@ class SampleRequest:
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
     lora_request: LoRARequest | None = None
     request_id: str | None = None
+    extra_headers: dict[str, str] | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -496,15 +497,20 @@ class RandomDataset(BenchmarkDataset):
                 "* (1 - range_ratio) >= 1."
             )
 
-        
         if use_local_json:
-            input_lens, output_lens, offsets = self.get_local_json_sampling_params(
+            (
+                input_lens,
+                output_lens,
+                offsets,
+                request_headers,
+            ) = self.get_local_json_sampling_params(
                 use_local_json, tokenizer
             )
         else:
             input_lens, output_lens, offsets = self.get_sampling_params(
                 num_requests, range_ratio, input_len, output_len, tokenizer
             )
+            request_headers = [None] * num_requests
 
         vocab_size = tokenizer.vocab_size
         prohibited_tokens = tokenizer.all_special_ids
@@ -544,6 +550,7 @@ class RandomDataset(BenchmarkDataset):
                     prompt_len=total_input_len,
                     expected_output_len=int(output_lens[i]),
                     request_id=request_id_prefix + str(i),
+                    extra_headers=request_headers[i],
                 )
             )
         # only used for embeddings benchmark.
@@ -604,23 +611,36 @@ class RandomDataset(BenchmarkDataset):
             if prefix_len > 0
             else []
         )
+
     def get_local_json_sampling_params(
         self,
         use_local_json: str,
         tokenizer: TokenizerLike,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict[str, str] | None]]:
         with open(use_local_json, "r") as f:
             requests = json.load(f)
-            input_lens, output_lens = [
-                req[0] for req in requests
-            ], [req[1] for req in requests]
+            input_lens, output_lens = [req[0] for req in requests], [
+                req[1] for req in requests
+            ]
+            request_headers: list[dict[str, str] | None] = []
+            for req in requests:
+                if len(req) < 3 or req[2] is None:
+                    request_headers.append(None)
+                elif isinstance(req[2], dict):
+                    request_headers.append(
+                        {str(k): str(v) for k, v in req[2].items()}
+                    )
+                else:
+                    request_headers.append({"X-data-parallel-rank": str(req[2])})
         num_requests = len(input_lens)
         input_lens = np.array(input_lens)
         output_lens = np.array(output_lens)
         offsets = self._rng.integers(0, tokenizer.vocab_size, size=num_requests)
         print(f"input_lens: {input_lens}")
         print(f"output_lens: {output_lens}")
-        return input_lens, output_lens, offsets
+        if any(request_headers):
+            print(f"request_headers: {request_headers}")
+        return input_lens, output_lens, offsets, request_headers
     
     def get_sampling_params(
         self,

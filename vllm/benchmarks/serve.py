@@ -700,6 +700,10 @@ async def benchmark(
             request.multi_modal_data,
             request.request_id,
         )
+        request_extra_headers = extra_headers
+        if request.extra_headers:
+            request_extra_headers = dict(extra_headers or {})
+            request_extra_headers.update(request.extra_headers)
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -715,7 +719,7 @@ async def benchmark(
             logprobs=logprobs,
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
-            extra_headers=extra_headers,
+            extra_headers=request_extra_headers,
             extra_body=extra_body,
             request_id=request_id,
         )

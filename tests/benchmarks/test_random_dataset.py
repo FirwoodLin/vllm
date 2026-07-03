@@ -177,6 +177,34 @@ def test_random_dataset_can_sample_token_id_prompts(tmp_path) -> None:
         )
 
 
+@pytest.mark.benchmark
+def test_random_dataset_can_sample_per_request_headers(tmp_path) -> None:
+    local_json = tmp_path / "lengths_with_headers.json"
+    local_json.write_text(
+        json.dumps(
+            [
+                [5, 2, 0],
+                [7, 3, 1],
+                [9, 4, {"X-data-parallel-rank": 2, "X-Test-Header": "yes"}],
+            ]
+        )
+    )
+    dataset = RandomDataset(random_seed=0)
+
+    samples = dataset.sample(
+        tokenizer=TokenIdOnlyTokenizer(),
+        num_requests=3,
+        use_local_json=str(local_json),
+        use_token_ids=True,
+    )
+
+    assert [sample.extra_headers for sample in samples] == [
+        {"X-data-parallel-rank": "0"},
+        {"X-data-parallel-rank": "1"},
+        {"X-data-parallel-rank": "2", "X-Test-Header": "yes"},
+    ]
+
+
 # -----------------------------
 # RandomMultiModalDataset tests
 # -----------------------------
