@@ -646,7 +646,7 @@ class FlashAttentionImpl(AttentionImpl):
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
 
-        if has_prefill and has_decode:
+        if self.dycp_world_size > 1 and has_prefill and has_decode:
             raise NotImplementedError(
                 "Prefill and decode are not supported in the dcyp forward pass."
             )
