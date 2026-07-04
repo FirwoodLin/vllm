@@ -197,6 +197,15 @@ AGENTS.md
 # Results
 *.csv
 
+# DYCP benchmark/profile outputs
+/dycp/results/
+/dycp/profiles/
+/dycp/examples/**/results/
+/dycp/examples/**/logs/
+/dycp/examples/**/openai-*.json
+/dycp/examples/**/screenshot-*.png
+/openai-*.json
+
 # Python pickle files
 *.pkl
 
