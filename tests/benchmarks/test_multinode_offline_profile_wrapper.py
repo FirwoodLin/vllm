@@ -255,14 +255,17 @@ def test_start_multinode_offline_profile_supports_explicit_rank_replay(
     assert case_rows[0]["dispatch_policy"] == "least_batch"
     assert case_rows[0]["dataset"] == str(
         (prepared_dir / "custom_lens.dispatch_least_batch.lengths.csv").resolve())
-    assert all(row["prompt_len"] == "2048" for row in length_rows[:8])
-
-    per_node_longs = [0, 0, 0, 0]
-    for row in length_rows:
-        if row["prompt_len"] != "524288":
-            continue
-        per_node_longs[int(row["data_parallel_rank"]) // 2] += 1
-    assert per_node_longs == [1, 1, 1, 1]
+    assert length_rows[:8] == [
+        {
+            "prompt_len": "2048",
+            "output_len": "64",
+            "data_parallel_rank": str(rank),
+        }
+        for rank in range(8)
+    ]
+    assert [row["data_parallel_rank"] for row in length_rows[8:12]] == [
+        "0", "1", "2", "3"
+    ]
 
     logged_calls = load_logged_calls(log_path)
     prepare_call = next(call for call in logged_calls

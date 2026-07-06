@@ -28,6 +28,8 @@ ROUTING_MODES = (
 DEFAULT_ROUTING_MODE = "internal_dplb"
 DEFAULT_LENGTH_CSV_STEM = "custom_lens"
 DEFAULT_CASE_CSV_NAME = "custom_lens.casecsv"
+GREEDY_EXPLICIT_RANK_POLICIES = frozenset({"least_cache", "least_batch"})
+DEFAULT_KV_CACHE_TOKENS_PER_RANK = 1_050_000
 MAX_REQUESTS_CSV_ROWS = "csv_rows"
 MaxRequestsValue = int | Literal["csv_rows"]
 
@@ -212,6 +214,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--kv-cache-tokens-per-rank",
+        type=positive_int,
+        default=DEFAULT_KV_CACHE_TOKENS_PER_RANK,
+        help=(
+            "Single-rank KV cache token cap used by greedy explicit-rank "
+            "pre-allocation for least_cache/least_batch."
+        ),
+    )
+    parser.add_argument(
         "--case-name",
         default=None,
         help=(
@@ -348,7 +359,7 @@ def build_rank_prompt_sequence(prompt_counts: dict[int, int]) -> list[int]:
     return sequence
 
 
-def build_explicit_rank_rows(
+def build_legacy_explicit_rank_rows(
     *,
     input_lengths: list[int],
     output_len: int,
@@ -432,6 +443,178 @@ def build_explicit_rank_rows(
     return rows
 
 
+def extract_shortest_warmup_lengths(
+    input_lengths: list[int],
+    warmup_short_rows: int,
+) -> tuple[list[int], list[int]]:
+    if warmup_short_rows <= 0:
+        return [], list(input_lengths)
+    if warmup_short_rows > len(input_lengths):
+        raise ValueError(
+            "warmup_short_rows exceeds the available count of requests."
+        )
+
+    ranked_indices = sorted(
+        range(len(input_lengths)),
+        key=lambda index: (input_lengths[index], index),
+    )
+    warmup_indices = set(ranked_indices[:warmup_short_rows])
+    warmup_lengths = [
+        input_lengths[index]
+        for index in ranked_indices[:warmup_short_rows]
+    ]
+    remaining_lengths = [
+        prompt_len
+        for index, prompt_len in enumerate(input_lengths)
+        if index not in warmup_indices
+    ]
+    return warmup_lengths, remaining_lengths
+
+
+def preallocate_dp_ranks(
+    input_lengths: list[int],
+    *,
+    dp_size: int,
+    output_len: int,
+    dispatch_policy: str,
+    kv_cache_tokens_per_rank: int,
+    waiting_requests: list[int] | None = None,
+    waiting_tokens: list[int] | None = None,
+    free_kv_tokens: list[int] | None = None,
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    if waiting_requests is None:
+        waiting_requests = [0] * dp_size
+    else:
+        waiting_requests = waiting_requests.copy()
+    if waiting_tokens is None:
+        waiting_tokens = [0] * dp_size
+    else:
+        waiting_tokens = waiting_tokens.copy()
+    if free_kv_tokens is None:
+        free_kv_tokens = [kv_cache_tokens_per_rank] * dp_size
+    else:
+        free_kv_tokens = free_kv_tokens.copy()
+
+    assigned_ranks: list[int] = []
+    for input_len in input_lengths:
+        kv_tokens_needed = input_len + output_len
+        if dispatch_policy == "least_batch":
+            ranks_with_capacity = [
+                rank
+                for rank in range(dp_size)
+                if free_kv_tokens[rank] >= kv_tokens_needed
+            ]
+            if ranks_with_capacity:
+                dp_rank = min(
+                    ranks_with_capacity,
+                    key=lambda rank: (waiting_requests[rank], rank),
+                )
+            else:
+                dp_rank = min(
+                    range(dp_size),
+                    key=lambda rank: (
+                        kv_tokens_needed - free_kv_tokens[rank],
+                        waiting_requests[rank],
+                        rank,
+                    ),
+                )
+        elif dispatch_policy == "least_cache":
+            dp_rank = min(
+                range(dp_size),
+                key=lambda rank: (
+                    waiting_tokens[rank] - free_kv_tokens[rank],
+                    waiting_requests[rank],
+                    rank,
+                ),
+            )
+        else:
+            raise ValueError(f"Unsupported dispatch policy: {dispatch_policy}")
+
+        assigned_ranks.append(dp_rank)
+        waiting_requests[dp_rank] += 1
+        waiting_tokens[dp_rank] += input_len
+        free_kv_tokens[dp_rank] -= kv_tokens_needed
+
+    return assigned_ranks, waiting_requests, waiting_tokens, free_kv_tokens
+
+
+def build_greedy_explicit_rank_rows(
+    *,
+    input_lengths: list[int],
+    output_len: int,
+    data_parallel_size: int,
+    dispatch_policy: str,
+    kv_cache_tokens_per_rank: int,
+    warmup_short_rows: int,
+) -> list[dict[str, str]]:
+    warmup_lengths, remaining_lengths = extract_shortest_warmup_lengths(
+        input_lengths,
+        warmup_short_rows,
+    )
+    warmup_ranks, waiting_requests, waiting_tokens, free_kv_tokens = (
+        preallocate_dp_ranks(
+            warmup_lengths,
+            dp_size=data_parallel_size,
+            output_len=output_len,
+            dispatch_policy=dispatch_policy,
+            kv_cache_tokens_per_rank=kv_cache_tokens_per_rank,
+        )
+    )
+    measured_ranks, _, _, _ = preallocate_dp_ranks(
+        remaining_lengths,
+        dp_size=data_parallel_size,
+        output_len=output_len,
+        dispatch_policy=dispatch_policy,
+        kv_cache_tokens_per_rank=kv_cache_tokens_per_rank,
+        waiting_requests=waiting_requests,
+        waiting_tokens=waiting_tokens,
+        free_kv_tokens=free_kv_tokens,
+    )
+
+    rows: list[dict[str, str]] = []
+    for prompt_len, rank in zip(warmup_lengths, warmup_ranks):
+        rows.append({
+            "prompt_len": str(prompt_len),
+            "output_len": str(output_len),
+            "data_parallel_rank": str(rank),
+        })
+    for prompt_len, rank in zip(remaining_lengths, measured_ranks):
+        rows.append({
+            "prompt_len": str(prompt_len),
+            "output_len": str(output_len),
+            "data_parallel_rank": str(rank),
+        })
+    return rows
+
+
+def build_explicit_rank_rows(
+    *,
+    input_lengths: list[int],
+    output_len: int,
+    dispatch_policy: str,
+    data_parallel_size: int,
+    data_parallel_size_local: int,
+    kv_cache_tokens_per_rank: int,
+    warmup_short_rows: int,
+) -> list[dict[str, str]]:
+    if dispatch_policy in GREEDY_EXPLICIT_RANK_POLICIES:
+        return build_greedy_explicit_rank_rows(
+            input_lengths=input_lengths,
+            output_len=output_len,
+            data_parallel_size=data_parallel_size,
+            dispatch_policy=dispatch_policy,
+            kv_cache_tokens_per_rank=kv_cache_tokens_per_rank,
+            warmup_short_rows=warmup_short_rows,
+        )
+    return build_legacy_explicit_rank_rows(
+        input_lengths=input_lengths,
+        output_len=output_len,
+        data_parallel_size=data_parallel_size,
+        data_parallel_size_local=data_parallel_size_local,
+        warmup_short_rows=warmup_short_rows,
+    )
+
+
 def read_base_case(path: Path) -> tuple[list[str], dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -486,6 +669,16 @@ def write_case_csv(path: Path, fieldnames: list[str], row: dict[str, str]) -> No
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+
+def parse_non_negative_case_int(value: str) -> int:
+    stripped = value.strip()
+    if stripped == "":
+        return 0
+    parsed = int(stripped)
+    if parsed < 0:
+        raise ValueError(f"Expected a non-negative integer, got {value!r}")
+    return parsed
 
 
 def main() -> None:
@@ -572,12 +765,19 @@ def main() -> None:
     if args.routing_mode == "explicit_rank_replay":
         assert args.data_parallel_size is not None
         assert args.data_parallel_size_local is not None
+        effective_warmup_short_rows = args.warmup_short_rows
+        if effective_warmup_short_rows == 0:
+            effective_warmup_short_rows = parse_non_negative_case_int(
+                derived_row.get("warmup_requests", "")
+            )
         explicit_rows = build_explicit_rank_rows(
             input_lengths=input_lengths,
             output_len=args.output_len,
+            dispatch_policy=effective_dispatch_policy,
             data_parallel_size=args.data_parallel_size,
             data_parallel_size_local=args.data_parallel_size_local,
-            warmup_short_rows=args.warmup_short_rows,
+            kv_cache_tokens_per_rank=args.kv_cache_tokens_per_rank,
+            warmup_short_rows=effective_warmup_short_rows,
         )
         write_explicit_rank_length_csv(length_csv_path, explicit_rows)
     else:
