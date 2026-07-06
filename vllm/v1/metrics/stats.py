@@ -161,6 +161,22 @@ class KVCacheEvictionEvent:
 
 
 @dataclass
+class DPDecodeLBStats:
+    """Stats used by the front-end decode DP load balancer."""
+
+    num_running_reqs: int
+    num_waiting_reqs: int
+
+    kv_cache_usage: float
+    num_total_blocks: int
+    num_free_blocks: int
+    num_allocated_blocks: int
+
+    preemption_count_delta: int = 0
+    timestamp: float = 0.0
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -172,6 +188,7 @@ class SchedulerStats:
     current_wave: int = 0
 
     kv_cache_usage: float = 0.0
+    decode_lb_stats: DPDecodeLBStats | None = None
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None

@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
-    from vllm.v1.metrics.stats import SchedulerStats
+    from vllm.v1.metrics.stats import DPDecodeLBStats, SchedulerStats
     from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
     from vllm.v1.request import Request, RequestStatus
     from vllm.v1.structured_output import StructuredOutputManager
@@ -179,6 +179,10 @@ class SchedulerInterface(ABC):
         The SchedulerStats object is created for every scheduling step.
         """
         raise NotImplementedError
+
+    def make_decode_lb_stats(self) -> Optional["DPDecodeLBStats"]:
+        """Make stats for front-end decode DP load balancing."""
+        return None
 
     @abstractmethod
     def shutdown(self) -> None:

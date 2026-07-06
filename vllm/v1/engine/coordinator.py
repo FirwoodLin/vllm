@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import get_mp_context, set_process_title
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
+from vllm.v1.metrics.stats import DPDecodeLBStats
 from vllm.v1.serial_utils import MsgpackDecoder
 from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
 
@@ -111,6 +112,7 @@ class DPCoordinator:
 class EngineState:
     def __init__(self):
         self.request_counts = [0, 0]  # [waiting, running]
+        self.decode_lb_stats: DPDecodeLBStats | None = None
 
 
 class DPCoordinatorProc:
@@ -160,6 +162,7 @@ class DPCoordinatorProc:
         last_stats_step = -1
         last_stats_wave = -1
         last_step_counts: list[list[int]] | None = None
+        last_step_decode_lb_stats: list[DPDecodeLBStats | None] | None = None
 
         with (
             make_zmq_socket(
@@ -214,11 +217,19 @@ class DPCoordinatorProc:
                     if last_step_counts is not None:
                         engine_req_counts_list = last_step_counts
                         last_step_counts = None
+                        engine_decode_lb_stats = last_step_decode_lb_stats
+                        last_step_decode_lb_stats = None
                     else:
                         engine_req_counts_list = self._get_engine_counts()
+                        engine_decode_lb_stats = self._get_engine_decode_lb_stats()
                         stats_changed = False
 
-                    to_publish = (engine_req_counts_list, current_wave, engines_running)
+                    to_publish = (
+                        engine_req_counts_list,
+                        current_wave,
+                        engines_running,
+                        engine_decode_lb_stats,
+                    )
                     publish_front.send(msgspec.msgpack.encode(to_publish))
                     last_publish_time = int(time.time() * 1000)
                     continue
@@ -310,6 +321,9 @@ class DPCoordinatorProc:
                         ):
                             if stats_changed:
                                 last_step_counts = self._get_engine_counts(do_copy=True)
+                                last_step_decode_lb_stats = (
+                                    self._get_engine_decode_lb_stats(do_copy=True)
+                                )
                             last_stats_step = stats_step
                             last_stats_wave = stats_wave
                         elif stats_wave != last_stats_wave or (
@@ -327,6 +341,9 @@ class DPCoordinatorProc:
                             )
                         stats[0] = scheduler_stats.num_waiting_reqs
                         stats[1] = scheduler_stats.num_running_reqs
+                        self.engines[eng_index].decode_lb_stats = (
+                            scheduler_stats.decode_lb_stats
+                        )
                         stats_changed = True
 
                     if (wave := outputs.wave_complete) is not None:
@@ -359,7 +376,7 @@ class DPCoordinatorProc:
                         self._send_start_wave(publish_back, wave, eng_index)
 
                 if wave_state_changed:
-                    message = (None, current_wave, engines_running)
+                    message = (None, current_wave, engines_running, None)
                     publish_front.send(msgspec.msgpack.encode(message))
 
     @staticmethod
@@ -379,3 +396,12 @@ class DPCoordinatorProc:
         if do_copy:
             return [copy.copy(e.request_counts) for e in self.engines]
         return [e.request_counts for e in self.engines]
+
+    def _get_engine_decode_lb_stats(
+        self,
+        do_copy: bool = False,
+    ) -> list[DPDecodeLBStats | None]:
+        """Return decode DP load-balancing stats for each engine."""
+        if do_copy:
+            return [copy.copy(e.decode_lb_stats) for e in self.engines]
+        return [e.decode_lb_stats for e in self.engines]

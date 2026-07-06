@@ -44,6 +44,7 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import (
+    DPDecodeLBStats,
     PrefixCacheStats,
     SchedulerStats,
 )
@@ -1344,6 +1345,24 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
 
+    def make_decode_lb_stats(self) -> DPDecodeLBStats:
+        """Make stats for front-end decode DP load balancing."""
+        num_running_reqs, num_waiting_reqs = self.get_request_counts()
+        block_pool = self.kv_cache_manager.block_pool
+        # The block pool keeps block 0 as a null block. Exclude it from the
+        # load-balancing capacity so an empty cache reports zero allocation.
+        num_total_blocks = max(0, block_pool.num_gpu_blocks - 1)
+        num_free_blocks = block_pool.get_num_free_blocks()
+        num_allocated_blocks = max(0, num_total_blocks - num_free_blocks)
+        return DPDecodeLBStats(
+            num_running_reqs=num_running_reqs,
+            num_waiting_reqs=num_waiting_reqs,
+            kv_cache_usage=self.kv_cache_manager.usage,
+            num_total_blocks=num_total_blocks,
+            num_free_blocks=num_free_blocks,
+            num_allocated_blocks=num_allocated_blocks,
+        )
+
     def add_request(self, request: Request) -> None:
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
@@ -1504,6 +1523,7 @@ class Scheduler(SchedulerInterface):
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            decode_lb_stats=self.make_decode_lb_stats(),
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

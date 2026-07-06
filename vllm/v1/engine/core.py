@@ -58,7 +58,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.metrics.stats import DPDecodeLBStats, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -1368,6 +1368,7 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter = 0
         self.current_wave = 0
         self.last_counts = (0, 0)
+        self.last_decode_lb_stats: DPDecodeLBStats | None = None
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -1444,10 +1445,18 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Publish our request counts (if they've changed).
         counts = self.scheduler.get_request_counts()
-        if counts != self.last_counts:
+        decode_lb_stats = self.scheduler.make_decode_lb_stats()
+        if counts != self.last_counts or decode_lb_stats != self.last_decode_lb_stats:
             self.last_counts = counts
+            self.last_decode_lb_stats = decode_lb_stats
             stats = SchedulerStats(
-                *counts, step_counter=self.step_counter, current_wave=self.current_wave
+                *counts,
+                kv_cache_usage=decode_lb_stats.kv_cache_usage
+                if decode_lb_stats is not None
+                else 0.0,
+                decode_lb_stats=decode_lb_stats,
+                step_counter=self.step_counter,
+                current_wave=self.current_wave,
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 

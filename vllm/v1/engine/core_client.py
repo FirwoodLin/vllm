@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import math
 import multiprocessing
+import os
 import queue
 import sys
 import uuid
@@ -11,7 +13,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Thread
 from typing import Any, TypeAlias, TypeVar
 
@@ -48,6 +50,7 @@ from vllm.v1.engine.utils import (
     launch_domain_core_engines,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.metrics.stats import DPDecodeLBStats
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
@@ -1056,6 +1059,9 @@ class DPAsyncMPClient(AsyncMPClient):
         # List of [waiting, running] pair per engine.
         # Used only by DPLBAsyncMPClient subclass.
         self.lb_engines: list[list[int]] = [[0, 0] for _ in self.core_engines]
+        self.decode_lb_stats: list[DPDecodeLBStats | None] = [
+            None for _ in self.core_engines
+        ]
 
         self.first_req_sock_addr = get_open_zmq_inproc_path()
         self.first_req_send_socket = self.resources.first_req_send_socket = (
@@ -1150,12 +1156,18 @@ class DPAsyncMPClient(AsyncMPClient):
                         continue
 
                     # Update local load-balancing state.
-                    counts, wave, running = msgspec.msgpack.decode(buf)
+                    counts, wave, running, decode_lb_stats = (
+                        self._decode_stats_update_payload(buf)
+                    )
                     self.current_wave = wave
                     self.engines_running = running
                     if counts is not None:
                         sliced_counts = counts[count_slice]
                         self.lb_engines = sliced_counts
+                        if decode_lb_stats is None:
+                            self.decode_lb_stats = [None for _ in sliced_counts]
+                        else:
+                            self.decode_lb_stats = decode_lb_stats[count_slice]
                         logger.debug(
                             "Received counts: %s (%s)", sliced_counts, count_slice
                         )
@@ -1163,6 +1175,28 @@ class DPAsyncMPClient(AsyncMPClient):
         resources.stats_update_task = asyncio.create_task(
             run_engine_stats_update_task()
         )
+
+    @staticmethod
+    def _decode_stats_update_payload(
+        buf: bytes,
+    ) -> tuple[
+        list[list[int]] | None,
+        int,
+        bool,
+        list[DPDecodeLBStats | None] | None,
+    ]:
+        decoded_stats = msgspec.msgpack.decode(buf)
+        if len(decoded_stats) == 3:
+            counts, wave, running = decoded_stats
+            return counts, wave, running, None
+
+        counts, wave, running, decode_lb_stats = decoded_stats
+        if decode_lb_stats is not None:
+            decode_lb_stats = msgspec.convert(
+                decode_lb_stats,
+                type=list[DPDecodeLBStats | None],
+            )
+        return counts, wave, running, decode_lb_stats
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         self._ensure_stats_update_task()
@@ -1218,32 +1252,477 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
+        self.dp_lb_iqr_k = 1.5
+        self.dp_lb_min_safe_ranks = 1
+        self.dp_lb_block_size = vllm_config.cache_config.block_size or 16
+        self.dp_decode_lb_policy = os.getenv(
+            "VLLM_DP_DECODE_LB_POLICY", "iqr_lex_decode"
+        ).strip().lower()
+        self._dp_lb_logged_iqr_lex_active = False
+        self._dp_lb_logged_iqr_lex_assignment = False
+        self._dp_lb_logged_queue_fallback = False
+        self._dp_lb_logged_queue_fallback_assignment = False
+        self._pending_add_requests: list[
+            tuple[EngineCoreRequest, asyncio.Future[None]]
+        ] = []
+        self._pending_add_flush_task: asyncio.Task[None] | None = None
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        self._ensure_stats_update_task()
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+        if not hasattr(self, "_pending_add_requests"):
+            self._pending_add_requests = []
+        self._pending_add_requests.append((request, future))
+
+        flush_task = getattr(self, "_pending_add_flush_task", None)
+        if flush_task is None or flush_task.done():
+            self._pending_add_flush_task = loop.create_task(
+                self._flush_pending_add_requests()
+            )
+
+        await future
+        self._ensure_output_queue_task()
+
+    async def _flush_pending_add_requests(self) -> None:
+        await asyncio.sleep(0)
+        try:
+            while self._pending_add_requests:
+                pending = self._pending_add_requests
+                self._pending_add_requests = []
+                requests = [request for request, _ in pending]
+
+                try:
+                    for request in requests:
+                        request.current_wave = self.current_wave
+                        request.client_index = self.client_index
+
+                    chosen_engines = self.get_core_engines_for_requests(requests)
+                    send_awaitables = [
+                        self._send_input(
+                            EngineCoreRequestType.ADD,
+                            request,
+                            engine,
+                        )
+                        for request, engine in zip(requests, chosen_engines)
+                    ]
+
+                    if not self.engines_running and chosen_engines:
+                        # Notify coordinator that we're sending requests.
+                        req_msg = msgspec.msgpack.encode(
+                            ("FIRST_REQ", chosen_engines[0])
+                        )
+                        await self.first_req_send_socket.send(req_msg)
+
+                    await asyncio.gather(*send_awaitables)
+                except Exception as exc:
+                    for _, future in pending:
+                        if not future.done():
+                            future.set_exception(exc)
+                else:
+                    for _, future in pending:
+                        if not future.done():
+                            future.set_result(None)
+        finally:
+            self._pending_add_flush_task = None
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
-        # Engines are in rank order.
-        if (eng_index := request.data_parallel_rank) is None:
-            current_counts = self.lb_engines
-            # TODO use P2C alg for larger DP sizes
-            num_engines = len(current_counts)
-            min_score = sys.maxsize
-            eng_index = 0
-            for i in range(num_engines):
-                # Start from client_index to help with balancing when engines
-                # are empty.
-                idx = (self.eng_start_index + i) % num_engines
-                waiting, running = current_counts[idx]
-                score = waiting * 4 + running
-                if score < min_score:
-                    min_score = score
-                    eng_index = idx
-            # Increment local waiting count for better balancing between stats
-            # updates from the coordinator (which happen every 100ms).
-            current_counts[eng_index][0] += self.client_count
+        return self.get_core_engines_for_requests([request])[0]
 
-        chosen_engine = self.core_engines[eng_index]
-        # Record which engine is chosen for this request, to handle aborts.
-        self.reqs_in_flight[request.request_id] = chosen_engine
-        return chosen_engine
+    def get_core_engines_for_requests(
+        self,
+        requests: Sequence[EngineCoreRequest],
+    ) -> list[EngineIdentity]:
+        # Engines are in rank order.
+        if not requests:
+            return []
+
+        eng_indices: list[int | None] = [None] * len(requests)
+        auto_routed: list[tuple[int, EngineCoreRequest]] = []
+        for req_index, request in enumerate(requests):
+            if request.data_parallel_rank is None:
+                auto_routed.append((req_index, request))
+            else:
+                eng_indices[req_index] = request.data_parallel_rank
+
+        if auto_routed:
+            if self.dp_decode_lb_policy == "queue":
+                self._log_queue_policy_once(len(auto_routed))
+                self._assign_queue_count_batch(
+                    requests, auto_routed, eng_indices, "policy"
+                )
+            elif self._has_decode_lb_stats():
+                self._log_iqr_lex_active_once(len(auto_routed))
+                self._assign_iqr_lex_decode_batch(auto_routed, eng_indices)
+            else:
+                self._log_queue_fallback_once(len(auto_routed))
+                self._assign_queue_count_batch(
+                    requests, auto_routed, eng_indices, "fallback"
+                )
+
+        chosen_engines: list[EngineIdentity] = []
+        for request, eng_index in zip(requests, eng_indices):
+            assert eng_index is not None
+            chosen_engine = self.core_engines[eng_index]
+            # Record which engine is chosen for this request, to handle aborts.
+            self.reqs_in_flight[request.request_id] = chosen_engine
+            chosen_engines.append(chosen_engine)
+        return chosen_engines
+
+    def _assign_queue_count_batch(
+        self,
+        requests: Sequence[EngineCoreRequest],
+        auto_routed: list[tuple[int, EngineCoreRequest]],
+        eng_indices: list[int | None],
+        policy_reason: str,
+    ) -> None:
+        for req_index, _ in auto_routed:
+            eng_indices[req_index] = self._select_queue_count_engine(
+                self.lb_engines
+            )
+            self._log_queue_count_assignment(
+                requests[req_index],
+                req_index,
+                len(requests),
+                eng_indices[req_index],
+                policy_reason,
+            )
+
+    def _has_decode_lb_stats(self) -> bool:
+        return (
+            len(self.decode_lb_stats) == len(self.core_engines)
+            and all(stats is not None for stats in self.decode_lb_stats)
+        )
+
+    def _assign_iqr_lex_decode_batch(
+        self,
+        auto_routed: list[tuple[int, EngineCoreRequest]],
+        eng_indices: list[int | None],
+    ) -> None:
+        virtual_stats = [
+            replace(stats) if stats is not None else None
+            for stats in self.decode_lb_stats
+        ]
+        virtual_counts = [counts.copy() for counts in self.lb_engines]
+
+        for req_index, request in sorted(
+            auto_routed,
+            key=lambda item: self._estimate_total_seq_len(item[1]),
+            reverse=True,
+        ):
+            (
+                eng_index,
+                candidate_indices,
+                safe_indices,
+                iqr_threshold,
+            ) = self._select_iqr_lex_decode_engine(request, virtual_stats)
+            fallback_reason = None
+            if eng_index is None:
+                fallback_reason = "no_candidate_with_free_blocks"
+                eng_index = self._select_queue_count_engine(
+                    virtual_counts,
+                    update_counts=False,
+                )
+            selected_state = virtual_stats[eng_index]
+            assert selected_state is not None
+            virtual_pre_b = (
+                selected_state.num_running_reqs + selected_state.num_waiting_reqs
+            )
+            virtual_pre_k = selected_state.num_allocated_blocks
+            virtual_pre_free = selected_state.num_free_blocks
+            self._virtual_update_decode_lb_stats(
+                selected_state,
+                virtual_counts[eng_index],
+                request,
+            )
+            self._log_iqr_lex_assignment(
+                request=request,
+                request_index=req_index,
+                batch_size=len(auto_routed),
+                selected_engine=eng_index,
+                candidate_indices=candidate_indices,
+                safe_indices=safe_indices,
+                iqr_threshold=iqr_threshold,
+                fallback_reason=fallback_reason,
+                virtual_pre_b=virtual_pre_b,
+                virtual_pre_k=virtual_pre_k,
+                virtual_pre_free=virtual_pre_free,
+                virtual_post_b=(
+                    selected_state.num_running_reqs
+                    + selected_state.num_waiting_reqs
+                ),
+                virtual_post_k=selected_state.num_allocated_blocks,
+                virtual_post_free=selected_state.num_free_blocks,
+            )
+            eng_indices[req_index] = eng_index
+
+        self.decode_lb_stats = virtual_stats
+        self.lb_engines = virtual_counts
+
+    def _select_iqr_lex_decode_engine(
+        self,
+        request: EngineCoreRequest,
+        states: Sequence[DPDecodeLBStats | None],
+    ) -> tuple[int | None, list[int], list[int], float | None]:
+        required_blocks = self._estimate_required_blocks(request)
+        candidate_indices = [
+            idx
+            for idx, state in enumerate(states)
+            if state is not None and state.num_free_blocks >= required_blocks
+        ]
+        if not candidate_indices:
+            return None, candidate_indices, [], None
+
+        safe_indices, iqr_threshold = self._iqr_mask_decode_candidates(
+            candidate_indices,
+            states,
+        )
+
+        def sort_key(idx: int) -> tuple[int, int, int]:
+            state = states[idx]
+            assert state is not None
+            return (
+                state.num_running_reqs + state.num_waiting_reqs,
+                state.num_allocated_blocks,
+                idx,
+            )
+
+        return (
+            min(safe_indices, key=sort_key),
+            candidate_indices,
+            safe_indices,
+            iqr_threshold,
+        )
+
+    def _iqr_mask_decode_candidates(
+        self,
+        candidate_indices: list[int],
+        states: Sequence[DPDecodeLBStats | None],
+    ) -> tuple[list[int], float | None]:
+        if len(candidate_indices) < 4:
+            return candidate_indices, None
+
+        loads: list[int] = []
+        for idx in candidate_indices:
+            state = states[idx]
+            assert state is not None
+            loads.append(state.num_allocated_blocks)
+        loads.sort()
+
+        q1 = self._percentile(loads, 25)
+        q3 = self._percentile(loads, 75)
+        threshold = q3 + self.dp_lb_iqr_k * (q3 - q1)
+        safe_indices = []
+        for idx in candidate_indices:
+            state = states[idx]
+            assert state is not None
+            if state.num_allocated_blocks <= threshold:
+                safe_indices.append(idx)
+        if len(safe_indices) >= self.dp_lb_min_safe_ranks:
+            return safe_indices, threshold
+        return candidate_indices, threshold
+
+    @staticmethod
+    def _percentile(values: Sequence[int], percentile: int) -> float:
+        if len(values) == 1:
+            return float(values[0])
+        rank = (len(values) - 1) * percentile / 100
+        lower = math.floor(rank)
+        upper = math.ceil(rank)
+        if lower == upper:
+            return float(values[lower])
+        lower_value = values[lower] * (upper - rank)
+        upper_value = values[upper] * (rank - lower)
+        return float(lower_value + upper_value)
+
+    def _select_queue_count_engine(
+        self,
+        current_counts: list[list[int]],
+        update_counts: bool = True,
+    ) -> int:
+        # TODO use P2C alg for larger DP sizes
+        num_engines = len(current_counts)
+        min_score = sys.maxsize
+        eng_index = 0
+        for i in range(num_engines):
+            # Start from client_index to help with balancing when engines
+            # are empty.
+            idx = (self.eng_start_index + i) % num_engines
+            waiting, running = current_counts[idx]
+            score = waiting * 4 + running
+            if score < min_score:
+                min_score = score
+                eng_index = idx
+        # Increment local waiting count for better balancing between stats
+        # updates from the coordinator (which happen every 100ms).
+        if update_counts:
+            current_counts[eng_index][0] += self.client_count
+        return eng_index
+
+    def _virtual_update_decode_lb_stats(
+        self,
+        state: DPDecodeLBStats | None,
+        counts: list[int],
+        request: EngineCoreRequest,
+    ) -> None:
+        assert state is not None
+        estimated_blocks = self._estimate_required_blocks(request)
+        state.num_waiting_reqs += self.client_count
+        state.num_allocated_blocks += estimated_blocks
+        state.num_free_blocks = max(0, state.num_free_blocks - estimated_blocks)
+        state.kv_cache_usage = (
+            state.num_allocated_blocks / max(1, state.num_total_blocks)
+        )
+        counts[0] += self.client_count
+
+    def _log_iqr_lex_active_once(self, batch_size: int) -> None:
+        if getattr(self, "_dp_lb_logged_iqr_lex_active", False):
+            return
+        logger.info(
+            "IQR-Lex decode DP LB active: engines=%d iqr_k=%.2f "
+            "min_safe_ranks=%d block_size=%d first_batch_size=%d",
+            len(self.core_engines),
+            self.dp_lb_iqr_k,
+            self.dp_lb_min_safe_ranks,
+            self.dp_lb_block_size,
+            batch_size,
+        )
+        self._dp_lb_logged_iqr_lex_active = True
+
+    def _log_queue_fallback_once(self, batch_size: int) -> None:
+        if getattr(self, "_dp_lb_logged_queue_fallback", False):
+            return
+        logger.info(
+            "IQR-Lex decode DP LB waiting for decode LB stats; "
+            "using queue-count fallback: engines=%d first_batch_size=%d",
+            len(self.core_engines),
+            batch_size,
+        )
+        self._dp_lb_logged_queue_fallback = True
+
+    def _log_queue_policy_once(self, batch_size: int) -> None:
+        if getattr(self, "_dp_lb_logged_queue_policy", False):
+            return
+        logger.info(
+            "Queue-count DP LB policy active: engines=%d first_batch_size=%d",
+            len(self.core_engines),
+            batch_size,
+        )
+        self._dp_lb_logged_queue_policy = True
+
+    def _log_queue_count_assignment(
+        self,
+        request: EngineCoreRequest,
+        request_index: int,
+        batch_size: int,
+        selected_engine: int,
+        policy_reason: str,
+    ) -> None:
+        waiting, running = self.lb_engines[selected_engine]
+        if not getattr(self, "_dp_lb_logged_queue_fallback_assignment", False):
+            logger.info(
+                "Queue-count DP LB %s first assignment: "
+                "selected_engine=%d batch_size=%d virtual_waiting=%d "
+                "virtual_running=%d score=%d",
+                policy_reason,
+                selected_engine,
+                batch_size,
+                waiting,
+                running,
+                waiting * 4 + running,
+            )
+            self._dp_lb_logged_queue_fallback_assignment = True
+        logger.debug(
+            "Queue-count DP LB %s assignment: request_id=%s "
+            "request_index=%d batch_size=%d selected_engine=%d "
+            "virtual_waiting=%d virtual_running=%d score=%d",
+            policy_reason,
+            request.request_id,
+            request_index,
+            batch_size,
+            selected_engine,
+            waiting,
+            running,
+            waiting * 4 + running,
+        )
+
+    def _log_iqr_lex_assignment(
+        self,
+        request: EngineCoreRequest,
+        request_index: int,
+        batch_size: int,
+        selected_engine: int,
+        candidate_indices: list[int],
+        safe_indices: list[int],
+        iqr_threshold: float | None,
+        fallback_reason: str | None,
+        virtual_pre_b: int,
+        virtual_pre_k: int,
+        virtual_pre_free: int,
+        virtual_post_b: int,
+        virtual_post_k: int,
+        virtual_post_free: int,
+    ) -> None:
+        masked_engines = len(candidate_indices) - len(safe_indices)
+        if not getattr(self, "_dp_lb_logged_iqr_lex_assignment", False):
+            logger.info(
+                "IQR-Lex decode DP LB first assignment: selected_engine=%d "
+                "batch_size=%d candidate_count=%d safe_count=%d "
+                "masked_engines=%d iqr_threshold_blocks=%s "
+                "fallback_reason=%s virtual_post_b=%d virtual_post_k=%d "
+                "virtual_post_free=%d",
+                selected_engine,
+                batch_size,
+                len(candidate_indices),
+                len(safe_indices),
+                masked_engines,
+                iqr_threshold,
+                fallback_reason,
+                virtual_post_b,
+                virtual_post_k,
+                virtual_post_free,
+            )
+            self._dp_lb_logged_iqr_lex_assignment = True
+        logger.debug(
+            "IQR-Lex decode DP LB assignment: request_id=%s "
+            "request_index=%d batch_size=%d seq_len=%d required_blocks=%d "
+            "selected_engine=%d fallback_reason=%s candidate_engines=%s "
+            "safe_engines=%s iqr_threshold_blocks=%s masked_engines=%d "
+            "virtual_pre_b=%d virtual_pre_k=%d virtual_pre_free=%d "
+            "virtual_post_b=%d virtual_post_k=%d virtual_post_free=%d",
+            request.request_id,
+            request_index,
+            batch_size,
+            self._estimate_total_seq_len(request),
+            self._estimate_required_blocks(request),
+            selected_engine,
+            fallback_reason,
+            candidate_indices,
+            safe_indices,
+            iqr_threshold,
+            masked_engines,
+            virtual_pre_b,
+            virtual_pre_k,
+            virtual_pre_free,
+            virtual_post_b,
+            virtual_post_k,
+            virtual_post_free,
+        )
+
+    def _estimate_required_blocks(self, request: EngineCoreRequest) -> int:
+        total_seq_len = self._estimate_total_seq_len(request)
+        if total_seq_len <= 0:
+            return 0
+        return math.ceil(total_seq_len / self.dp_lb_block_size)
+
+    @staticmethod
+    def _estimate_total_seq_len(request: EngineCoreRequest) -> int:
+        if request.prompt_token_ids is not None:
+            return len(request.prompt_token_ids)
+        if request.prompt_embeds is not None:
+            return int(request.prompt_embeds.shape[0])
+        return 0
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
