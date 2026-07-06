@@ -422,7 +422,7 @@ CLUSTERS: dict[str, ClusterSpec] = {
     "4node_h200":
     ClusterSpec(
         master_addr=os.environ.get("VLLM_4NODE_H200_MASTER_ADDR",
-                                   "10.102.97.179"),
+                                   "10.102.252.174"),
         master_port=29579,
         remote_hosts=("h200-rjob1", "h200-rjob2", "h200-rjob3"),
     ),
