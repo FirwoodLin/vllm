@@ -21,11 +21,18 @@ rank maps to one decode EngineCore process and owns an independent KV cache.
 Implement Algorithm 3, IQR-aware lexicographical decode scheduling, as a decode
 DP load-balancing policy.
 
-For every new decode request admitted to the decode pool:
+For each decode admission round, the front-end collects the newly arrived
+auto-routed decode requests as a batch `R`. `R` excludes requests with an
+explicit `data_parallel_rank`, because those requests are already routed by the
+caller.
 
-1. Choose a target decode DP engine.
-2. Use IQR masking to avoid engines whose KV load is an outlier.
-3. Among the remaining engines, choose the lexicographically smallest state:
+For each batch `R`:
+
+1. Sort `R` by total sequence length in descending order.
+2. For each request in the sorted order, use IQR masking to avoid engines whose
+   current virtual KV load is an outlier.
+3. Among the remaining engines, choose the lexicographically smallest virtual
+   state:
 
 ```text
 <B_i, K_i>
@@ -71,12 +78,16 @@ using queue counts:
 score = waiting * 4 + running
 ```
 
-After selecting an engine, it performs a local virtual update to reduce stale-stat
-misrouting between coordinator updates.
+After selecting an engine, it performs a local virtual update to reduce
+stale-stat misrouting between coordinator updates.
 
-This is the right place to replace the current scoring policy with IQR-Lex. The
-per-rank Scheduler remains unchanged after the request reaches the selected
-decode engine.
+This is still the right architectural layer for IQR-Lex, but the policy should
+not be implemented as a pure per-request replacement for the current scoring
+function. The front-end should first collect the auto-routed decode requests that
+are ready in the current admission round, schedule that batch with Algorithm 3,
+and then dispatch the assigned requests to their decode engines. The per-rank
+Scheduler remains unchanged after the request reaches the selected decode
+engine.
 
 The current DP coordinator path is:
 
@@ -85,7 +96,7 @@ DPEngineCoreProc._maybe_publish_request_counts()
   -> EngineCoreOutputs(scheduler_stats=...)
   -> DPCoordinator
   -> DPAsyncMPClient stats update task
-  -> DPLBAsyncMPClient.get_core_engine_for_request()
+  -> DPLBAsyncMPClient decode admission batch scheduler
 ```
 
 Currently this path only carries running/waiting counts. This design extends that
@@ -173,45 +184,86 @@ Client behavior:
 - `DPLBAsyncMPClient` uses those stats for placement.
 - If richer stats are absent, fall back to the current queue-count policy.
 
-## Scheduling Policy
+## Decode Admission Batch
 
-The policy runs in `DPLBAsyncMPClient.get_core_engine_for_request()` when
+The policy runs in `DPLBAsyncMPClient` for requests whose
 `request.data_parallel_rank is None`.
 
-If `request.data_parallel_rank` is explicitly set, it should remain authoritative.
-This preserves external-router behavior and debugging workflows.
+The batch `R` is the set of newly pending auto-routed decode requests available
+at the front-end in the current admission round. The implementation should reuse
+the existing vLLM scheduling/forward cadence rather than introducing a separate
+admission cadence. If only one auto-routed request is available in a round, `R`
+has one element and the batch algorithm naturally degenerates to a single
+placement decision.
+
+Requests with an explicit `request.data_parallel_rank` bypass the policy and are
+sent to the specified engine immediately. This preserves external-router
+behavior and debugging workflows.
+
+`total_seq_len` should be computed from front-end-visible request metadata:
+
+```text
+total_seq_len = current_decode_seq_len(request)
+```
+
+For the first version:
+
+- Prefer an exact transferred-KV or externally-computed-token count if the decode
+  request carries one.
+- Otherwise use the current prompt/token length available in `EngineCoreRequest`
+  as the conservative estimate.
+- Do not include future output length by default.
+
+If long-output imbalance remains visible, add the optional
+`current_plus_expected` cost mode described below.
+
+## Scheduling Policy
+
+The policy starts from the latest per-engine decode LB stats snapshot published
+through the coordinator. At the start of each admission round, the front-end
+copies those stats into a virtual state table. Every request assignment mutates
+only the virtual table; the engine-side truth still comes from the next stats
+publication.
 
 Pseudo-code:
 
 ```python
-def choose_decode_engine(request):
-    states = latest_decode_lb_states()
+def schedule_decode_admission_batch(auto_routed_requests):
+    states = copy_latest_decode_lb_states()
+    auto_routed_requests.sort(key=estimate_total_seq_len, reverse=True)
 
-    candidates = [
-        s for s in states
-        if s.healthy
-        and not s.draining
-        and s.num_free_blocks >= estimate_required_blocks(request)
-    ]
+    assignments = []
+    for request in auto_routed_requests:
+        candidates = [
+            s for s in states
+            if s.healthy
+            and not s.draining
+            and s.num_free_blocks >= estimate_required_blocks(request)
+        ]
 
-    if not candidates:
-        return fallback_current_policy(request)
+        if not candidates:
+            target = fallback_current_policy(request, states)
+            assignments.append((request, target.engine))
+            virtual_update(target, request)
+            continue
 
-    safe = iqr_mask(candidates, key=lambda s: s.num_allocated_blocks)
-    if not safe:
-        safe = candidates
+        safe = iqr_mask(candidates, key=lambda s: s.num_allocated_blocks)
+        if not safe:
+            safe = candidates
 
-    target = min(
-        safe,
-        key=lambda s: (
-            s.num_running_reqs + s.num_waiting_reqs,
-            s.num_allocated_blocks,
-            s.engine_index,
-        ),
-    )
+        target = min(
+            safe,
+            key=lambda s: (
+                s.num_running_reqs + s.num_waiting_reqs,
+                s.num_allocated_blocks,
+                s.engine_index,
+            ),
+        )
 
-    virtual_update(target, request)
-    return target.engine
+        assignments.append((request, target.engine))
+        virtual_update(target, request)
+
+    dispatch_assigned_requests(assignments)
 ```
 
 IQR masking:
@@ -241,10 +293,12 @@ fallback_policy = current_queue_count_policy
 ## Virtual Update
 
 Virtual update is required because coordinator stats are periodic and can lag
-behind admissions.
+behind admissions. It is also what makes batch scheduling different from
+independent per-request greedy placement: later requests in the same `R` observe
+the earlier assignments through the virtual `B_i` and `K_i` values.
 
-The current implementation already increments the local waiting count for the
-chosen engine. Extend this to KV load:
+At the start of an admission round, copy the latest per-engine decode LB stats.
+For each request assigned within sorted `R`, update the copied state:
 
 ```python
 def virtual_update(state, request):
@@ -259,7 +313,8 @@ def virtual_update(state, request):
 ```
 
 For P/D decode admission, the request already represents a decode-side request.
-The first version can estimate blocks from current request sequence length:
+The first version can estimate blocks from the request's current decode sequence
+length:
 
 ```text
 estimated_blocks = ceil(current_seq_len / block_size)
@@ -290,11 +345,13 @@ The first implementation should keep failure behavior conservative.
 Fallback cases:
 
 - Missing decode LB stats: use current queue-count policy.
+- Empty admission batch: no-op.
+- Single-request admission batch: run the same batch algorithm with `|R| = 1`.
 - Fewer than 4 candidate engines: skip IQR masking and use lexicographic
   `<B_i, K_i>` selection.
 - All engines masked: use all candidates.
 - No engine has enough free KV blocks: fall back to current behavior first, then
-  evaluate whether decode admission queue backpressure is needed.
+  evaluate whether existing waiting/backpressure behavior needs to be tightened.
 - Explicit `X-data-parallel-rank` / `request.data_parallel_rank`: bypass policy.
 
 Health and draining fields can be added later. They are useful operationally but
@@ -340,7 +397,6 @@ Suggested decode LB options:
 --dp-lb-iqr-k 1.5
 --dp-lb-min-safe-ranks 1
 --dp-lb-kv-cost-mode {current,current_plus_expected}
---dp-lb-enable-virtual-update
 --dp-lb-fallback-policy queue
 ```
 
@@ -355,12 +411,19 @@ desired immediately.
    waiting, and KV block stats.
 4. Update `DPCoordinator` to store and publish the richer per-engine stats.
 5. Update `DPAsyncMPClient` to parse and keep latest decode LB stats.
-6. Implement `iqr_lex_decode` selection in `DPLBAsyncMPClient`.
-7. Preserve current queue-count policy as fallback.
-8. Add unit tests for IQR masking, lexicographic selection, explicit-rank bypass,
-   and virtual update.
-9. Add targeted integration coverage for coordinator/client stats propagation.
-10. Add metrics after the core policy is working.
+6. Add a front-end decode admission batch path in `DPLBAsyncMPClient` that
+   collects the newly pending auto-routed decode requests for the current
+   admission round.
+7. Implement `iqr_lex_decode` batch selection:
+   sort `R` by total sequence length descending, then assign each request using
+   IQR masking and lexicographic `<B_i, K_i>` over the virtual state table.
+8. Preserve current queue-count policy as fallback.
+9. Add unit tests for batch sorting, IQR masking, lexicographic selection,
+   explicit-rank bypass, and virtual update across multiple requests in one
+   batch.
+10. Add targeted integration coverage for coordinator/client stats propagation
+   and front-end batch assignment.
+11. Add metrics after the core policy is working.
 
 ## Tests
 
@@ -369,17 +432,21 @@ Unit tests:
 - IQR mask skips masking when candidate count is below 4.
 - IQR mask excludes KV outliers when enough ranks are available.
 - Empty safe set falls back to all candidates.
-- Lexicographic selection chooses smallest `<B_i, K_i>`.
+- Admission batch is sorted by total sequence length descending before
+  assignment.
+- Lexicographic selection chooses smallest virtual `<B_i, K_i>`.
 - Tie-breaker is deterministic by engine index.
 - Explicit `data_parallel_rank` bypasses IQR-Lex.
-- Virtual update changes waiting and KV block state immediately.
+- Virtual update changes waiting and KV block state immediately and affects
+  later requests in the same admission batch.
 - Missing stats falls back to current queue-count policy.
 
 Integration tests:
 
 - Engine publishes decode LB stats through `EngineCoreOutputs`.
 - Coordinator stores and republishes per-engine decode LB stats.
-- `DPLBAsyncMPClient` receives stats and selects the expected engine.
+- `DPLBAsyncMPClient` receives stats and assigns a multi-request admission batch
+  to the expected engines.
 
 ## Open Follow-ups
 
@@ -395,15 +462,18 @@ Integration tests:
 Implement Algorithm 3 as an internal decode DP load-balancing policy:
 
 ```text
-new decode request
-  -> DPLBAsyncMPClient
-  -> IQR mask engines by KV allocated blocks
-  -> select argmin <running + waiting, allocated_kv_blocks>
-  -> virtual update selected engine state
-  -> send request to selected decode EngineCore
+new auto-routed decode requests in the current admission round
+  -> DPLBAsyncMPClient forms R
+  -> sort R by total sequence length descending
+  -> for each request in R:
+       IQR mask engines by virtual KV allocated blocks
+       select argmin <virtual running + waiting, virtual allocated_kv_blocks>
+       virtual update selected engine state
+  -> send assigned requests to selected decode EngineCores
   -> existing per-engine Scheduler continues unchanged
 ```
 
 This keeps the implementation aligned with vLLM's existing DP LB architecture,
+implements Algorithm 3 as batch scheduling rather than per-request admission,
 uses running/waiting for decode request load, adds the minimum KV stats needed by
 the algorithm, and avoids touching prefill or token-level scheduling.
