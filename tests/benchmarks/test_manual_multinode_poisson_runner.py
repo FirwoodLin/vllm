@@ -146,6 +146,17 @@ def test_resolve_case_uses_overridden_remote_hosts(tmp_path: Path) -> None:
 
 
 @pytest.mark.benchmark
+def test_4node_h200_uses_rjob3_as_local_head(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_4NODE_H200_MASTER_ADDR", "10.0.0.3")
+    runner = load_runner_module()
+
+    cluster = runner.CLUSTERS["4node_h200"]
+
+    assert cluster.master_addr == "10.0.0.3"
+    assert cluster.remote_hosts == ("h200-rjob0", "h200-rjob1", "h200-rjob2")
+
+
+@pytest.mark.benchmark
 def test_build_parser_keeps_going_by_default() -> None:
     runner = load_runner_module()
     parser = runner.build_parser()
