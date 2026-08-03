@@ -174,6 +174,12 @@ def parse_args() -> argparse.Namespace:
         help="Override data_parallel_rpc_port in the derived casecsv.",
     )
     parser.add_argument(
+        "--max-model-len",
+        type=positive_int,
+        default=None,
+        help="Override max_model_len in the derived casecsv.",
+    )
+    parser.add_argument(
         "--dispatch-policy",
         choices=DISPATCH_POLICIES,
         default=None,
@@ -759,6 +765,8 @@ def main() -> None:
         )
     if args.data_parallel_rpc_port is not None:
         derived_row["data_parallel_rpc_port"] = str(args.data_parallel_rpc_port)
+    if args.max_model_len is not None:
+        derived_row["max_model_len"] = str(args.max_model_len)
     if args.dispatch_policy is not None:
         derived_row["dispatch_policy"] = args.dispatch_policy
 

@@ -72,6 +72,8 @@ def test_start_multinode_offline_profile_help_mentions_manual_strategy_inputs(
     assert "dp4tp8dcp2" in result.stdout
     assert "--max-num-seqs" in result.stdout
     assert "--gpu-memory-utilization" in result.stdout
+    assert "--max-model-len N" in result.stdout
+    assert "--cudagraph-capture-sizes CSV" in result.stdout
     assert "--cluster 1node_h200" in result.stdout
     assert "--prompt-len N" in result.stdout
     assert "--requests-per-dp N" in result.stdout
@@ -164,6 +166,10 @@ def test_start_multinode_offline_profile_isolates_lens_inputs_by_strategy(
             "least_cache",
             "--max-requests",
             "csv_rows",
+            "--max-model-len",
+            "1048576",
+            "--cudagraph-capture-sizes",
+            "1,2,4,8,112,120,128,132",
             "--profile-delay-iterations",
             "32",
             "--pause-before-profile",
@@ -183,6 +189,7 @@ def test_start_multinode_offline_profile_isolates_lens_inputs_by_strategy(
     assert case_rows[0]["model"] == "deepseek_v3_1024k"
     assert case_rows[0]["dispatch_policy"] == "least_cache"
     assert case_rows[0]["max_requests"] == "csv_rows"
+    assert case_rows[0]["max_model_len"] == "1048576"
     assert case_rows[0]["max_num_seqs"] == "1024"
     assert case_rows[0]["gpu_memory_utilization"] == "0.85"
 
@@ -204,6 +211,12 @@ def test_start_multinode_offline_profile_isolates_lens_inputs_by_strategy(
     assert "--frontend-extra-arg=--pause-before-profile" in runner_call
     assert "--frontend-extra-arg=32" in runner_call
     assert "--headless-extra-arg=32" in runner_call
+    assert "--frontend-extra-arg=--cudagraph-capture-sizes" in runner_call
+    assert "--frontend-extra-arg=112" in runner_call
+    assert "--frontend-extra-arg=132" in runner_call
+    assert "--headless-extra-arg=--cudagraph-capture-sizes" in runner_call
+    assert "--headless-extra-arg=112" in runner_call
+    assert "--headless-extra-arg=132" in runner_call
 
 
 @pytest.mark.benchmark

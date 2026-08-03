@@ -23,6 +23,8 @@ CASE_NAME=""
 MAX_NUM_SEQS=""
 GPU_MEMORY_UTILIZATION=""
 DATA_PARALLEL_RPC_PORT=""
+MAX_MODEL_LEN=""
+CUDAGRAPH_CAPTURE_SIZES=""
 PROFILE_DELAY_ITERATIONS=33
 PAUSE_BEFORE_PROFILE=0
 IGNORE_HISTORICAL_SKIPS=0
@@ -61,6 +63,8 @@ Options:
   --max-num-seqs N
   --gpu-memory-utilization FLOAT
   --data-parallel-rpc-port N
+  --max-model-len N
+  --cudagraph-capture-sizes CSV  # e.g. 1,2,4,8,240,248,256,260
   --profile-delay-iterations N      # default: 33
   --async-scheduling               # pass --async-scheduling to harnesses
   --pause-before-profile
@@ -213,6 +217,14 @@ while (( $# > 0 )); do
       DATA_PARALLEL_RPC_PORT="$2"
       shift 2
       ;;
+    --max-model-len)
+      MAX_MODEL_LEN="$2"
+      shift 2
+      ;;
+    --cudagraph-capture-sizes)
+      CUDAGRAPH_CAPTURE_SIZES="$2"
+      shift 2
+      ;;
     --profile-delay-iterations)
       PROFILE_DELAY_ITERATIONS="$2"
       shift 2
@@ -345,9 +357,23 @@ fi
 if [[ -n "${DATA_PARALLEL_RPC_PORT}" ]]; then
   PREPARE_ARGS+=(--data-parallel-rpc-port "${DATA_PARALLEL_RPC_PORT}")
 fi
+if [[ -n "${MAX_MODEL_LEN}" ]]; then
+  PREPARE_ARGS+=(--max-model-len "${MAX_MODEL_LEN}")
+fi
 
 "${PREPARE_ARGS[@]}"
 RUN_CASE_CSV="${PREPARED_DIR}/custom_lens.casecsv"
+
+CUDAGRAPH_CAPTURE_SIZE_VALUES=()
+if [[ -n "${CUDAGRAPH_CAPTURE_SIZES}" ]]; then
+  CUDAGRAPH_CAPTURE_SIZE_VALUES=("${(@s:,:)CUDAGRAPH_CAPTURE_SIZES}")
+  for capture_size in "${CUDAGRAPH_CAPTURE_SIZE_VALUES[@]}"; do
+    if ! [[ "${capture_size}" == <-> ]] || (( capture_size <= 0 )); then
+      echo "--cudagraph-capture-sizes must contain positive integers, got: ${CUDAGRAPH_CAPTURE_SIZES}" >&2
+      exit 1
+    fi
+  done
+fi
 
 FRONTEND_EXTRA_ARGS=(
   --frontend-extra-arg=--profile-after-warmup
@@ -384,6 +410,15 @@ if [[ "${ROUTING_MODE}" != "internal_dplb" ]]; then
     "--frontend-extra-arg=${ROUTING_MODE}"
   )
 fi
+HEADLESS_EXTRA_ARGS=()
+if (( ${#CUDAGRAPH_CAPTURE_SIZE_VALUES[@]} > 0 )); then
+  FRONTEND_EXTRA_ARGS+=(--frontend-extra-arg=--cudagraph-capture-sizes)
+  HEADLESS_EXTRA_ARGS+=(--headless-extra-arg=--cudagraph-capture-sizes)
+  for capture_size in "${CUDAGRAPH_CAPTURE_SIZE_VALUES[@]}"; do
+    FRONTEND_EXTRA_ARGS+=("--frontend-extra-arg=${capture_size}")
+    HEADLESS_EXTRA_ARGS+=("--headless-extra-arg=${capture_size}")
+  done
+fi
 
 RUNNER_ARGS=()
 if [[ "${IGNORE_HISTORICAL_SKIPS}" == "1" ]]; then
@@ -396,6 +431,7 @@ python3 benchmarks/manual_multinode_poisson_runner.py \
   "${RUNNER_ARGS[@]}" \
   "${FRONTEND_EXTRA_ARGS[@]}" \
   "${HEADLESS_ASYNC_ARG}" \
+  "${HEADLESS_EXTRA_ARGS[@]}" \
   --headless-extra-arg=--profiler-config.profiler \
   --headless-extra-arg=torch \
   --headless-extra-arg=--profiler-config.torch_profiler_dir \

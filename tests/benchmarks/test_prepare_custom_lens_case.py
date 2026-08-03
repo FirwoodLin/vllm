@@ -81,6 +81,8 @@ def test_prepare_custom_lens_case_writes_length_csv_and_casecsv(
             "0.91",
             "--data-parallel-rpc-port",
             "29600",
+            "--max-model-len",
+            "1048576",
             "--case-name",
             "custom_issue01_case",
         ]
@@ -118,6 +120,7 @@ def test_prepare_custom_lens_case_writes_length_csv_and_casecsv(
     assert case_rows[0]["max_num_seqs"] == "2048"
     assert case_rows[0]["gpu_memory_utilization"] == "0.91"
     assert case_rows[0]["data_parallel_rpc_port"] == "29600"
+    assert case_rows[0]["max_model_len"] == "1048576"
     assert case_rows[0]["dataset"] == str(
         (output_dir / "custom_lens.dispatch_least_batch.lengths.csv").resolve())
 
