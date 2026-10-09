@@ -559,6 +559,7 @@ class FusedMoE(CustomOp):
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,
             is_lora_enabled=vllm_config.lora_config is not None,
+            layer_name=prefix,
             activation=self.activation,
             device=vllm_config.device_config.device,
             routing_method=self.routing_method_type,

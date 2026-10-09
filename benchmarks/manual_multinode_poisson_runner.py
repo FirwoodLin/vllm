@@ -353,7 +353,7 @@ class BenchTimeoutError(TimeoutError):
 
 MODELS: dict[str, str] = {
     "deepseek_v3_1024k":
-    "/mnt/nvme1n1/ml_research/models/deepseek-v3-1024k/",
+    "/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3/",
     "kimi_k2_instruct_0905":
     "/mnt/nvme1n1/ml_research/models/models--moonshotai--Kimi-K2-Instruct-0905/"
     "snapshots/7152993552508c9f22042b3bb93b5e6acd06ce73",
@@ -424,7 +424,9 @@ CLUSTERS: dict[str, ClusterSpec] = {
         master_addr=os.environ.get("VLLM_4NODE_H200_MASTER_ADDR",
                                    "10.102.252.174"),
         master_port=29579,
-        remote_hosts=("h200-rjob0", "h200-rjob1", "h200-rjob2"),
+        remote_hosts=("h200-rjob1", "h200-rjob2", "h200-rjob3"),
+        local_env_script="/root/.zshrc",
+        remote_env_script="/root/.zshrc",
     ),
 }
 
@@ -1440,12 +1442,18 @@ def build_headless_argv(
     return argv
 
 
-def collect_role_env(resolved: ResolvedCase, *, role: str) -> dict[str, str]:
+def collect_role_env(
+    resolved: ResolvedCase,
+    *,
+    role: str,
+    forward_process_env: bool = True,
+) -> dict[str, str]:
     forwarded: dict[str, str] = {}
-    for key in FORWARDED_ENV_KEYS:
-        value = os.environ.get(key)
-        if value:
-            forwarded[key] = value
+    if forward_process_env:
+        for key in FORWARDED_ENV_KEYS:
+            value = os.environ.get(key)
+            if value:
+                forwarded[key] = value
     forwarded.update(DEFAULT_ENV_OVERRIDES)
     forwarded["CUDA_VISIBLE_DEVICES"] = resolved.case.cuda_visible_devices
     forwarded.update({key: str(value) for key, value in resolved.case.env.items()})
@@ -1585,7 +1593,11 @@ def build_local_launch_command(resolved: ResolvedCase, artifacts: ArtifactPaths,
     return build_runtime_shell_command(
         cwd=resolved.cluster.workdir,
         argv=frontend_argv,
-        env=collect_role_env(resolved, role="frontend"),
+        env=collect_role_env(
+            resolved,
+            role="frontend",
+            forward_process_env=resolved.cluster.local_env_script is None,
+        ),
         env_script=resolved.cluster.local_env_script,
         log_path=artifacts.frontend_log_path,
         pid_path=artifacts.frontend_pid_path,
@@ -1606,7 +1618,13 @@ def build_remote_launch_command(
             node_rank,
             benchmark_dir=artifacts.benchmark_dir,
         ),
-        env=collect_role_env(resolved, role="headless-engine"),
+        # The remote shell sources its own environment script. Do not copy the
+        # head node's PATH, LD_LIBRARY_PATH, NCCL, or NVSHMEM settings over it.
+        env=collect_role_env(
+            resolved,
+            role="headless-engine",
+            forward_process_env=resolved.cluster.remote_env_script is None,
+        ),
         env_script=resolved.cluster.remote_env_script,
         log_path=artifacts.rank_log_paths[node_rank],
         pid_path=artifacts.rank_pid_paths[node_rank],

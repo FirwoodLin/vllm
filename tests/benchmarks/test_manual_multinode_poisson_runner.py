@@ -154,6 +154,78 @@ def test_4node_h200_uses_rjob3_as_local_head(monkeypatch) -> None:
 
     assert cluster.master_addr == "10.0.0.3"
     assert cluster.remote_hosts == ("h200-rjob0", "h200-rjob1", "h200-rjob2")
+    assert cluster.local_env_script == "/root/.zshrc"
+    assert cluster.remote_env_script == "/root/.zshrc"
+
+
+@pytest.mark.benchmark
+def test_remote_role_uses_case_env_without_forwarding_head_env(
+        monkeypatch, tmp_path: Path) -> None:
+    runner = load_runner_module()
+    monkeypatch.setenv("PATH", "/head/bin")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/head/lib")
+    monkeypatch.setenv("NCCL_SOCKET_IFNAME", "head0")
+
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("prompt_len,output_len\n4,7\n", encoding="utf-8")
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    resolved = runner.resolve_case(
+        runner.ExperimentCase(
+            name="case_a",
+            cluster="cluster_a",
+            strategy="strategy_a",
+            dataset="dataset_alias",
+            model="model_alias",
+            env={"SHARED_CASE_ENV": "shared"},
+            headless_env={"HEADLESS_CASE_ENV": "headless"},
+        ),
+        clusters={
+            "cluster_a": runner.ClusterSpec(
+                master_addr="10.0.0.1",
+                master_port=29579,
+                remote_hosts=("node-a", ),
+                remote_env_script="/root/.zshrc",
+            ),
+        },
+        strategies={
+            "strategy_a": runner.StrategySpec(
+                data_parallel_size=2,
+                data_parallel_size_local=1,
+                tensor_parallel_size=1,
+            ),
+        },
+        datasets={"dataset_alias": str(dataset_path)},
+        models={"model_alias": str(model_dir)},
+    )
+
+    env = runner.collect_role_env(
+        resolved,
+        role="headless-engine",
+        forward_process_env=False,
+    )
+
+    assert "PATH" not in env
+    assert "LD_LIBRARY_PATH" not in env
+    assert "NCCL_SOCKET_IFNAME" not in env
+    assert env["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+    assert env["SHARED_CASE_ENV"] == "shared"
+    assert env["HEADLESS_CASE_ENV"] == "headless"
+
+    artifacts = runner.prepare_artifact_paths(
+        tmp_path / "run",
+        resolved.cluster.remote_hosts,
+        run_tag=resolved.case.name,
+    )
+    command = runner.build_remote_launch_command(
+        resolved,
+        artifacts,
+        node_rank=1,
+    )
+    assert "source /root/.zshrc" in command
+    assert "PATH=" not in command
+    assert "LD_LIBRARY_PATH=" not in command
+    assert "NCCL_SOCKET_IFNAME=" not in command
 
 
 @pytest.mark.benchmark

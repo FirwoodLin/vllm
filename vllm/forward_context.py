@@ -213,6 +213,15 @@ class ForwardContext:
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
 
+    # True for memory profiling, warmup, and CUDA Graph capture forwards that
+    # do not execute a scheduler-provided user batch.
+    is_dummy_run: bool = False
+
+    # True when every request in the scheduler-provided batch is executing the
+    # decode query length. Keep this separate from BatchDescriptor.uniform:
+    # eager dispatch intentionally returns a generic BatchDescriptor.
+    is_uniform_decode: bool = False
+
     # For torch.compile cold start times, we need to avoid hard-coding
     # any strings into the graph. Right now, the vllm.moe_forward
     # and vllm.moe_forward_shared custom operators hard-code strings into
@@ -276,6 +285,8 @@ def create_forward_context(
     graph_timing_context: GraphTimingContext | None = None,
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
+    is_dummy_run: bool = False,
+    is_uniform_decode: bool = False,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -294,6 +305,8 @@ def create_forward_context(
         ubatch_slices=ubatch_slices,
         graph_timing_context=graph_timing_context,
         skip_compiled=skip_compiled,
+        is_dummy_run=is_dummy_run,
+        is_uniform_decode=is_uniform_decode,
         additional_kwargs=additional_kwargs or {},
     )
 
@@ -326,6 +339,8 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     graph_timing_context: GraphTimingContext | None = None,
     skip_compiled: bool = False,
+    is_dummy_run: bool = False,
+    is_uniform_decode: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -377,17 +392,19 @@ def set_forward_context(
     )
 
     forward_context = create_forward_context(
-        attn_metadata,
-        vllm_config,
-        virtual_engine,
-        dp_metadata,
-        cudagraph_runtime_mode,
-        batch_descriptor,
-        ubatch_slices,
-        slot_mapping,
-        graph_timing_context,
-        additional_kwargs,
-        skip_compiled,
+        attn_metadata=attn_metadata,
+        vllm_config=vllm_config,
+        virtual_engine=virtual_engine,
+        dp_metadata=dp_metadata,
+        cudagraph_runtime_mode=cudagraph_runtime_mode,
+        batch_descriptor=batch_descriptor,
+        ubatch_slices=ubatch_slices,
+        slot_mapping=slot_mapping,
+        graph_timing_context=graph_timing_context,
+        additional_kwargs=additional_kwargs,
+        skip_compiled=skip_compiled,
+        is_dummy_run=is_dummy_run,
+        is_uniform_decode=is_uniform_decode,
     )
 
     try:

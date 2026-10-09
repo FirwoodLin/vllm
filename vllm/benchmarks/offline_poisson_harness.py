@@ -1230,7 +1230,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
     async_llm: Any | None = None
     measured_requests_count: int | None = None
     active_profile_prefix: str | None = None
-    generation_paused_for_profile = False
+    generation_paused = False
     summary_written = False
     parquet_written = False
     recorder = RunRecorder(
@@ -1328,6 +1328,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
             "request_rate": args.request_rate,
             "arrival_process": args.arrival_process,
             "pause_before_profile": bool(args.pause_before_profile),
+            "pause_before_measured": bool(args.pause_before_measured),
             "seed": args.seed,
             "ttft_definition": _ttft_definition_from_config(
                 args.kv_transfer_config
@@ -1354,9 +1355,17 @@ async def run_frontend(args: argparse.Namespace) -> None:
             extra_fields={"warmup_requests": len(warmup_requests)},
         )
         inflight: set[asyncio.Task[None]] = set()
-        if args.pause_before_profile:
+        pause_before_measured = (
+            args.pause_before_profile or args.pause_before_measured
+        )
+        if pause_before_measured:
+            pause_phase = (
+                "pause_before_profile"
+                if args.pause_before_profile
+                else "pause_before_measured"
+            )
             _log_frontend_phase(
-                "pause_before_profile_start",
+                f"{pause_phase}_start",
                 args=args,
                 output_dir=output_dir,
                 frontend_started_at_s=frontend_started_at_s,
@@ -1366,9 +1375,9 @@ async def run_frontend(args: argparse.Namespace) -> None:
                 "Pausing generation with mode=keep before measured submission."
             )
             await async_llm.pause_generation(mode="keep", clear_cache=False)
-            generation_paused_for_profile = True
+            generation_paused = True
             _log_frontend_phase(
-                "pause_before_profile_done",
+                f"{pause_phase}_done",
                 args=args,
                 output_dir=output_dir,
                 frontend_started_at_s=frontend_started_at_s,
@@ -1402,16 +1411,26 @@ async def run_frontend(args: argparse.Namespace) -> None:
                 frontend_started_at_s=frontend_started_at_s,
                 measured_requests=measured_requests_count,
             )
+            resume_phase = (
+                "resume_after_profile_start"
+                if args.pause_before_profile
+                else "resume_after_measured_submission"
+            )
             _log_frontend_phase(
-                "resume_after_profile_start",
+                resume_phase,
                 args=args,
                 output_dir=output_dir,
                 frontend_started_at_s=frontend_started_at_s,
                 measured_requests=measured_requests_count,
             )
-            logger.info("Resuming generation after profiler start.")
+            resume_reason = (
+                "profiler start"
+                if args.pause_before_profile
+                else "measured submission"
+            )
+            logger.info("Resuming generation after %s.", resume_reason)
             await async_llm.resume_generation()
-            generation_paused_for_profile = False
+            generation_paused = False
         else:
             active_profile_prefix = await _start_frontend_profile_if_requested(
                 async_llm,
@@ -1521,7 +1540,7 @@ async def run_frontend(args: argparse.Namespace) -> None:
             parquet_written=parquet_written,
             exception=active_exception,
         )
-        if async_llm is not None and generation_paused_for_profile:
+        if async_llm is not None and generation_paused:
             try:
                 logger.info("Resuming generation during teardown cleanup.")
                 await async_llm.resume_generation()
@@ -1773,6 +1792,16 @@ def build_parser() -> FlexibleArgumentParser:
             "requests into the engine queue, start profiling, then resume "
             "generation. This changes request latency/queue-time statistics and "
             "is intended for trace capture rather than throughput comparison."
+        ),
+    )
+    frontend.add_argument(
+        "--pause-before-measured",
+        action="store_true",
+        help=(
+            "After warmup, pause generation with mode=keep, submit all measured "
+            "requests into the engine queue, then resume generation without "
+            "starting a profiler. This provides the same burst batch setup as "
+            "--pause-before-profile for eager debugging."
         ),
     )
     frontend.add_argument(

@@ -3664,6 +3664,13 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            is_uniform_decode = self._is_uniform_decode(
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                uniform_decode_query_len=self.uniform_decode_query_len,
+                num_tokens=num_tokens_unpadded,
+                num_reqs=num_reqs,
+            )
+
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -3827,6 +3834,7 @@ class GPUModelRunner(
                 slot_mapping=slot_mappings,
                 graph_timing_context=graph_timing_context,
                 skip_compiled=has_encoder_input,
+                is_uniform_decode=is_uniform_decode,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -5265,6 +5273,7 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    is_dummy_run=True,
                 ),
             ):
                 outputs = self.model(

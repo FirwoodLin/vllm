@@ -1031,6 +1031,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
+                is_dummy_run=dummy_run,
+                is_uniform_decode=(
+                    batch_desc.uniform_token_count == self.decode_query_len
+                ),
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)

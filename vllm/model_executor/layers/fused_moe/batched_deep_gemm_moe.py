@@ -2,9 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import json
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
+from vllm.distributed import (
+    get_dcp_group,
+    get_dp_group,
+    get_ep_group,
+    get_tp_group,
+    get_world_group,
+)
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -34,6 +44,58 @@ from vllm.utils.deep_gemm import (
 from vllm.utils.math_utils import cdiv, round_up
 
 logger = init_logger(__name__)
+
+MOE_GEMM_DEBUG_LOG_MARKER = "[VLLM_MOE_GEMM_INPUT]"
+
+
+def _tensor_debug_metadata(
+    tensor: torch.Tensor | None,
+) -> dict[str, object] | None:
+    if tensor is None:
+        return None
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "stride": list(tensor.stride()),
+        "storage_offset": tensor.storage_offset(),
+        "is_contiguous": tensor.is_contiguous(),
+        "numel": tensor.numel(),
+        "data_ptr": tensor.data_ptr(),
+    }
+
+
+def _parallel_rank_metadata() -> dict[str, int]:
+    try:
+        world = get_world_group()
+        return {
+            "global_rank": world.rank,
+            "local_rank": world.local_rank,
+            "dp_rank": get_dp_group().rank_in_group,
+            "tp_rank": get_tp_group().rank_in_group,
+            "dcp_rank": get_dcp_group().rank_in_group,
+            "ep_rank": get_ep_group().rank_in_group,
+        }
+    except (AssertionError, RuntimeError):
+        # Keep the helper usable in unit tests without initialized process groups.
+        return {
+            "global_rank": -1,
+            "local_rank": -1,
+            "dp_rank": -1,
+            "tp_rank": -1,
+            "dcp_rank": -1,
+            "ep_rank": -1,
+        }
+
+
+def _layer_index(layer_name: str) -> int | None:
+    indices: list[int] = []
+    for component in layer_name.split("."):
+        try:
+            indices.append(int(component))
+        except ValueError:
+            continue
+    return indices[0] if len(indices) == 1 else None
 
 
 def scales_shape_stride_dtype(
@@ -282,6 +344,91 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         )
         assert self.block_shape == get_mk_alignment_for_contiguous_layout()
         assert self.quant_config.use_fp8_w8a8
+        self._gemm_debug_call_count = 0
+
+    def _maybe_log_gate_up_gemm_inputs(
+        self,
+        input_tuple: tuple[torch.Tensor, torch.Tensor | None],
+        weight_tuple: tuple[torch.Tensor, torch.Tensor | None],
+        output: torch.Tensor,
+        masked_m: torch.Tensor,
+        expected_m: int,
+    ) -> None:
+        if not envs.VLLM_MOE_GEMM_DEBUG:
+            return
+
+        forward_context = (
+            get_forward_context() if is_forward_context_available() else None
+        )
+        if (
+            envs.VLLM_MOE_GEMM_DEBUG_SKIP_DUMMY
+            and forward_context is not None
+            and forward_context.is_dummy_run
+        ):
+            return
+
+        if envs.VLLM_MOE_GEMM_DEBUG_DECODE_ONLY and (
+            forward_context is None or not forward_context.is_uniform_decode
+        ):
+            return
+
+        expected_m_filter = envs.VLLM_MOE_GEMM_DEBUG_EXPECTED_M
+        if expected_m_filter > 0 and expected_m != expected_m_filter:
+            return
+
+        call_index = self._gemm_debug_call_count
+        self._gemm_debug_call_count += 1
+
+        skip_calls = max(0, envs.VLLM_MOE_GEMM_DEBUG_SKIP_CALLS)
+        if call_index < skip_calls:
+            return
+
+        max_calls = envs.VLLM_MOE_GEMM_DEBUG_MAX_CALLS
+        logged_call_index = call_index - skip_calls
+        if max_calls > 0 and logged_call_index >= max_calls:
+            return
+
+        if torch.cuda.is_current_stream_capturing():
+            logger.warning_once(
+                "%s is eager-only; skipping a CUDA Graph capture call.",
+                MOE_GEMM_DEBUG_LOG_MARKER,
+                scope="local",
+            )
+            return
+
+        input_tensor, input_scale = input_tuple
+        weight, weight_scale = weight_tuple
+        masked_m_values = (
+            masked_m.detach().to(device="cpu", dtype=torch.int64).tolist()
+        )
+        layer_name = self.moe_config.layer_name
+        payload: dict[str, object] = {
+            "event": "post_dispatch_pre_gemm",
+            "backend": self.__class__.__name__,
+            "gemm": "gate_up",
+            "layer_name": layer_name,
+            "layer_index": _layer_index(layer_name),
+            "call_index": call_index,
+            "logged_call_index": logged_call_index,
+            "groups": input_tensor.shape[0],
+            "m": input_tensor.shape[1],
+            "n": weight.shape[1],
+            "k": input_tensor.shape[2],
+            "expected_m": int(expected_m),
+            "masked_m": masked_m_values,
+            "masked_m_sum": sum(masked_m_values),
+            "input": _tensor_debug_metadata(input_tensor),
+            "input_scale": _tensor_debug_metadata(input_scale),
+            "weight": _tensor_debug_metadata(weight),
+            "weight_scale": _tensor_debug_metadata(weight_scale),
+            "output": _tensor_debug_metadata(output),
+        }
+        payload.update(_parallel_rank_metadata())
+        logger.info(
+            "%s %s",
+            MOE_GEMM_DEBUG_LOG_MARKER,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -420,6 +567,13 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             topk=topk_ids.size(-1),
         )
 
+        self._maybe_log_gate_up_gemm_inputs(
+            (a1q, a1q_scale),
+            (w1, self.w1_scale),
+            workspace1,
+            expert_num_tokens,
+            expected_m,
+        )
         fp8_m_grouped_gemm_nt_masked(
             (a1q, a1q_scale),
             (w1, self.w1_scale),

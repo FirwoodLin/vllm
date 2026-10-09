@@ -154,6 +154,12 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_MOE_GEMM_DEBUG: bool = False
+    VLLM_MOE_GEMM_DEBUG_SKIP_DUMMY: bool = True
+    VLLM_MOE_GEMM_DEBUG_DECODE_ONLY: bool = False
+    VLLM_MOE_GEMM_DEBUG_EXPECTED_M: int = 0
+    VLLM_MOE_GEMM_DEBUG_SKIP_CALLS: int = 0
+    VLLM_MOE_GEMM_DEBUG_MAX_CALLS: int = 1
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1183,6 +1189,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
     ),
+    # Print the inputs to the first masked MoE GEMM after DeepEP dispatch.
+    # This is an eager-only diagnostic and introduces a device synchronization.
+    "VLLM_MOE_GEMM_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_MOE_GEMM_DEBUG", "0"))
+    ),
+    # Skip memory profiling, warmup, and CUDA Graph capture forwards.
+    "VLLM_MOE_GEMM_DEBUG_SKIP_DUMMY": lambda: bool(
+        int(os.getenv("VLLM_MOE_GEMM_DEBUG_SKIP_DUMMY", "1"))
+    ),
+    # Only log uniform decode batches, excluding prefill and mixed batches.
+    "VLLM_MOE_GEMM_DEBUG_DECODE_ONLY": lambda: bool(
+        int(os.getenv("VLLM_MOE_GEMM_DEBUG_DECODE_ONLY", "0"))
+    ),
+    # Only log calls with this DeepGEMM expected_m value. A non-positive value
+    # disables the filter.
+    "VLLM_MOE_GEMM_DEBUG_EXPECTED_M": lambda: int(
+        os.getenv("VLLM_MOE_GEMM_DEBUG_EXPECTED_M", "0")
+    ),
+    # Number of BatchedDeepGemmExperts calls to skip per MoE layer before logging.
+    "VLLM_MOE_GEMM_DEBUG_SKIP_CALLS": lambda: int(
+        os.getenv("VLLM_MOE_GEMM_DEBUG_SKIP_CALLS", "0")
+    ),
+    # Number of calls to log per MoE layer after the skipped calls. A non-positive
+    # value removes the limit.
+    "VLLM_MOE_GEMM_DEBUG_MAX_CALLS": lambda: int(
+        os.getenv("VLLM_MOE_GEMM_DEBUG_MAX_CALLS", "1")
+    ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -1753,6 +1786,12 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
+        "VLLM_MOE_GEMM_DEBUG",
+        "VLLM_MOE_GEMM_DEBUG_SKIP_DUMMY",
+        "VLLM_MOE_GEMM_DEBUG_DECODE_ONLY",
+        "VLLM_MOE_GEMM_DEBUG_EXPECTED_M",
+        "VLLM_MOE_GEMM_DEBUG_SKIP_CALLS",
+        "VLLM_MOE_GEMM_DEBUG_MAX_CALLS",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
